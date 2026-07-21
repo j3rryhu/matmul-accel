@@ -1,0 +1,40 @@
+addrmap ctrl_rf {
+    // Control Register (0x00)
+    reg {
+        field {
+            singlepulse = true; // Single pulse mode
+            reset = 0;
+            sw = w;    // Read-write
+            hw = r;    // No hardware feedback
+        } start;     // Bit 0: start compute
+        
+        field {
+            singlepulse = true; // Single pulse mode
+            reset = 0;
+            sw = w;    // Read-write
+            hw = r;    // No hardware feedback
+        } input_ready;
+
+        field {
+            singlepulse = true; // Single pulse mode
+            reset = 0;
+            sw = w;    // Read-write
+            hw = r;    // No hardware feedback
+        } weight_ready;
+        
+    } CONTROL;
+
+
+    reg {
+        field {
+            sw = r;    // Read-write
+            hw = w;    // No hardware feedback
+        } out_ready;
+
+        field {
+            sw = r;
+            hw = w;
+        } out_count [16:1];
+
+    } STATUS;
+};
