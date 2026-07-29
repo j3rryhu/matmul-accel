@@ -4,9 +4,10 @@
 // a_en/b_en are broadcast per row/column (not per PE) since the array is a
 // synchronous shift chain - a per-PE enable would need its own delay chain
 // to stay aligned with data already in flight.
-// weights are per-PE (w_in/w_en flattened, indexed by row*ARRAY_COLS+col);
-// w_load is a single global pulse that commits every PE's prefetched
-// weight into its active weight register on the same cycle.
+// weight prefetch is a single regfile-style write port: one PE's prefetch
+// register is written per cycle, selected by w_addr (row*ARRAY_COLS+col)
+// while w_en is high. w_load is a single global pulse that commits every
+// PE's prefetched weight into its active weight register on the same cycle.
 `timescale 1ps/1ps
 
 module pe_array #(
@@ -25,9 +26,10 @@ module pe_array #(
     // the array always starts accumulation fresh, no external cascade-in)
     input  [ARRAY_COLS-1:0]                         b_en,
 
-    // per-PE weight prefetch load, indexed by row*ARRAY_COLS+col
-    input  [ARRAY_ROWS*ARRAY_COLS*DATA_WIDTH-1:0]   w_in,
-    input  [ARRAY_ROWS*ARRAY_COLS-1:0]              w_en,
+    // weight prefetch write port, regfile-style: one PE per cycle
+    input  [$clog2(ARRAY_ROWS*ARRAY_COLS)-1:0]      w_addr,  // row*ARRAY_COLS+col
+    input  [DATA_WIDTH-1:0]                         w_data,
+    input                                            w_en,
     input                                            w_load,
 
     // activation output, right edge - one lane per row (for tile cascading)
@@ -48,6 +50,10 @@ module pe_array #(
                 wire [DATA_WIDTH-1:0] pe_a_out;
                 wire [DATA_WIDTH-1:0] pe_p_out;
 
+                // this PE's prefetch reg is written when the incoming
+                // address matches its flat index and w_en is asserted
+                wire pe_w_en = w_en && (w_addr == (r*ARRAY_COLS+c));
+
                 if (c == 0)
                     assign pe_a_in = a_in[(r+1)*DATA_WIDTH-1 -: DATA_WIDTH];
                 else
@@ -67,8 +73,8 @@ module pe_array #(
                     .a_en    (a_en[r]),
                     .b_in    (pe_b_in),
                     .b_en    (b_en[c]),
-                    .w_in    (w_in[(r*ARRAY_COLS+c+1)*DATA_WIDTH-1 -: DATA_WIDTH]),
-                    .w_en    (w_en[r*ARRAY_COLS+c]),
+                    .w_in    (w_data),
+                    .w_en    (pe_w_en),
                     .w_load  (w_load),
                     .p_out   (pe_p_out),
                     .a_out   (pe_a_out)

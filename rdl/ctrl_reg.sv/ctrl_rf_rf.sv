@@ -9,13 +9,26 @@ module ctrl_rf_rf #(
     input logic                              resetn,  //! Default reset
 
     // Register CONTROL
-    output logic                     [ 0: 0] CONTROL_start_q,              //! Current field value
-    output logic                     [ 0: 0] CONTROL_input_ready_q,              //! Current field value
-    output logic                     [ 0: 0] CONTROL_weight_ready_q,              //! Current field value
+    output logic                     [ 0: 0] CONTROL_matmul_start_q,              //! Current field value
+
+    // Register WEIGHT_ROWS
+    output logic                     [15: 0] WEIGHT_ROWS_value_q,              //! Current field value
+
+    // Register WEIGHT_COLS
+    output logic                     [15: 0] WEIGHT_COLS_value_q,              //! Current field value
+
+    // Register INPUT_MAX_ADDR
+    output logic                     [ 9: 0] INPUT_MAX_ADDR_value_q,              //! Current field value
+
+    // Register INPUT_COLS
+    output logic                     [15: 0] INPUT_COLS_value_q,              //! Current field value
 
     // Register STATUS
     input  logic                     [ 0: 0] STATUS_out_ready_wdata,          //! HW write data
     input  logic                     [15: 0] STATUS_out_count_wdata,          //! HW write data
+    input  logic                     [ 0: 0] STATUS_weight_tile_ready_wdata,          //! HW write data
+    input  logic                     [ 0: 0] STATUS_busy_wdata,          //! HW write data
+    input  logic                     [ 0: 0] STATUS_done_wdata,          //! HW write data
 
     // Register Bus
     input  logic                             valid,    //! Active high valid
@@ -31,18 +44,26 @@ module ctrl_rf_rf #(
 /* verilator lint_off UNUSED */
     // local output signals for fields (unless block outputs)
     // these can be used as references in other fields
-    logic                           [ 0: 0] CONTROL_start_next;
-    logic                             CONTROL_start_anded;
-    logic                             CONTROL_start_ored;
-    logic                             CONTROL_start_xored;
-    logic                           [ 0: 0] CONTROL_input_ready_next;
-    logic                             CONTROL_input_ready_anded;
-    logic                             CONTROL_input_ready_ored;
-    logic                             CONTROL_input_ready_xored;
-    logic                           [ 0: 0] CONTROL_weight_ready_next;
-    logic                             CONTROL_weight_ready_anded;
-    logic                             CONTROL_weight_ready_ored;
-    logic                             CONTROL_weight_ready_xored;
+    logic                           [ 0: 0] CONTROL_matmul_start_next;
+    logic                             CONTROL_matmul_start_anded;
+    logic                             CONTROL_matmul_start_ored;
+    logic                             CONTROL_matmul_start_xored;
+    logic                           [15: 0] WEIGHT_ROWS_value_next;
+    logic                             WEIGHT_ROWS_value_anded;
+    logic                             WEIGHT_ROWS_value_ored;
+    logic                             WEIGHT_ROWS_value_xored;
+    logic                           [15: 0] WEIGHT_COLS_value_next;
+    logic                             WEIGHT_COLS_value_anded;
+    logic                             WEIGHT_COLS_value_ored;
+    logic                             WEIGHT_COLS_value_xored;
+    logic                           [ 9: 0] INPUT_MAX_ADDR_value_next;
+    logic                             INPUT_MAX_ADDR_value_anded;
+    logic                             INPUT_MAX_ADDR_value_ored;
+    logic                             INPUT_MAX_ADDR_value_xored;
+    logic                           [15: 0] INPUT_COLS_value_next;
+    logic                             INPUT_COLS_value_anded;
+    logic                             INPUT_COLS_value_ored;
+    logic                             INPUT_COLS_value_xored;
     logic                           [ 0: 0] STATUS_out_ready_q;
     logic                           [ 0: 0] STATUS_out_ready_next;
     logic                             STATUS_out_ready_anded;
@@ -53,6 +74,21 @@ module ctrl_rf_rf #(
     logic                             STATUS_out_count_anded;
     logic                             STATUS_out_count_ored;
     logic                             STATUS_out_count_xored;
+    logic                           [ 0: 0] STATUS_weight_tile_ready_q;
+    logic                           [ 0: 0] STATUS_weight_tile_ready_next;
+    logic                             STATUS_weight_tile_ready_anded;
+    logic                             STATUS_weight_tile_ready_ored;
+    logic                             STATUS_weight_tile_ready_xored;
+    logic                           [ 0: 0] STATUS_busy_q;
+    logic                           [ 0: 0] STATUS_busy_next;
+    logic                             STATUS_busy_anded;
+    logic                             STATUS_busy_ored;
+    logic                             STATUS_busy_xored;
+    logic                           [ 0: 0] STATUS_done_q;
+    logic                           [ 0: 0] STATUS_done_next;
+    logic                             STATUS_done_anded;
+    logic                             STATUS_done_ored;
+    logic                             STATUS_done_xored;
 /* verilator lint_on UNUSED */
 
     // ============================================================
@@ -84,18 +120,24 @@ module ctrl_rf_rf #(
     // helpful masked version of data
     assign sw_masked_data = sw_wdata & sw_mask;
     logic                     [DATA_WIDTH-1:0] CONTROL_rdata;
+    logic                     [DATA_WIDTH-1:0] WEIGHT_ROWS_rdata;
+    logic                     [DATA_WIDTH-1:0] WEIGHT_COLS_rdata;
+    logic                     [DATA_WIDTH-1:0] INPUT_MAX_ADDR_rdata;
+    logic                     [DATA_WIDTH-1:0] INPUT_COLS_rdata;
     logic                     [DATA_WIDTH-1:0] STATUS_rdata;
 
     assign sw_rdata = // or of each register return (masked)
                    CONTROL_rdata | 
+                   WEIGHT_ROWS_rdata | 
+                   WEIGHT_COLS_rdata | 
+                   INPUT_MAX_ADDR_rdata | 
+                   INPUT_COLS_rdata | 
                    STATUS_rdata;
             
         
     // ============================================================
     // Register: CONTROL
-    //    [ 0: 0]                start: hw=r     sw=w     reset=0x0
-    //    [ 1: 1]          input_ready: hw=r     sw=w     reset=0x0
-    //    [ 2: 2]         weight_ready: hw=r     sw=w     reset=0x0
+    //    [ 0: 0]         matmul_start: hw=r     sw=w     reset=0x0
     // ============================================================
     logic                  CONTROL_decode;
     logic                  CONTROL_sw_wr;
@@ -108,77 +150,199 @@ module ctrl_rf_rf #(
 
     always_comb begin
         CONTROL_q = '0;
-        CONTROL_q[ 0: 0] = CONTROL_start_q;
-        CONTROL_q[ 1: 1] = CONTROL_input_ready_q;
-        CONTROL_q[ 2: 2] = CONTROL_weight_ready_q;
+        CONTROL_q[ 0: 0] = CONTROL_matmul_start_q;
     end
 
     // masked version of return data
     assign CONTROL_rdata = CONTROL_sw_rd ? CONTROL_q : 'b0;
 
     // ------------------------------------------------------------
-    // Field: start
+    // Field: matmul_start
     // ------------------------------------------------------------
-    assign CONTROL_start_anded = & CONTROL_start_q;
-    assign CONTROL_start_ored  = | CONTROL_start_q;
-    assign CONTROL_start_xored = ^ CONTROL_start_q;
+    assign CONTROL_matmul_start_anded = & CONTROL_matmul_start_q;
+    assign CONTROL_matmul_start_ored  = | CONTROL_matmul_start_q;
+    assign CONTROL_matmul_start_xored = ^ CONTROL_matmul_start_q;
 
     // next hardware value
 
     //! main storage
     always_ff @ (posedge clk, negedge resetn)
     if (~resetn) begin
-        CONTROL_start_q <= 0;
+        CONTROL_matmul_start_q <= 0;
     end else begin
         // Defined as single pulse, clear value from last cycle
-        CONTROL_start_q <= '0;
+        CONTROL_matmul_start_q <= '0;
         // Software write
         if (CONTROL_sw_wr) begin
-            CONTROL_start_q <=  sw_masked_data[ 0: 0] | (CONTROL_start_q & ~sw_mask[ 0: 0]);
+            CONTROL_matmul_start_q <=  sw_masked_data[ 0: 0] | (CONTROL_matmul_start_q & ~sw_mask[ 0: 0]);
         end
     end
+            
+        
+    // ============================================================
+    // Register: WEIGHT_ROWS
+    //    [15: 0]                value: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  WEIGHT_ROWS_decode;
+    logic                  WEIGHT_ROWS_sw_wr;
+    logic                  WEIGHT_ROWS_sw_rd;
+    logic [DATA_WIDTH-1:0] WEIGHT_ROWS_q;
 
-    // ------------------------------------------------------------
-    // Field: input_ready
-    // ------------------------------------------------------------
-    assign CONTROL_input_ready_anded = & CONTROL_input_ready_q;
-    assign CONTROL_input_ready_ored  = | CONTROL_input_ready_q;
-    assign CONTROL_input_ready_xored = ^ CONTROL_input_ready_q;
+    assign WEIGHT_ROWS_decode = (addr == (ADDR_OFFSET+'h0+'h4));
+    assign WEIGHT_ROWS_sw_wr = sw_wr && WEIGHT_ROWS_decode;
+    assign WEIGHT_ROWS_sw_rd = sw_rd && WEIGHT_ROWS_decode;
 
-    // next hardware value
-
-    //! main storage
-    always_ff @ (posedge clk, negedge resetn)
-    if (~resetn) begin
-        CONTROL_input_ready_q <= 0;
-    end else begin
-        // Defined as single pulse, clear value from last cycle
-        CONTROL_input_ready_q <= '0;
-        // Software write
-        if (CONTROL_sw_wr) begin
-            CONTROL_input_ready_q <=  sw_masked_data[ 1: 1] | (CONTROL_input_ready_q & ~sw_mask[ 1: 1]);
-        end
+    always_comb begin
+        WEIGHT_ROWS_q = '0;
+        WEIGHT_ROWS_q[15: 0] = WEIGHT_ROWS_value_q;
     end
 
+    // masked version of return data
+    assign WEIGHT_ROWS_rdata = WEIGHT_ROWS_sw_rd ? WEIGHT_ROWS_q : 'b0;
+
     // ------------------------------------------------------------
-    // Field: weight_ready
+    // Field: value
     // ------------------------------------------------------------
-    assign CONTROL_weight_ready_anded = & CONTROL_weight_ready_q;
-    assign CONTROL_weight_ready_ored  = | CONTROL_weight_ready_q;
-    assign CONTROL_weight_ready_xored = ^ CONTROL_weight_ready_q;
+    assign WEIGHT_ROWS_value_anded = & WEIGHT_ROWS_value_q;
+    assign WEIGHT_ROWS_value_ored  = | WEIGHT_ROWS_value_q;
+    assign WEIGHT_ROWS_value_xored = ^ WEIGHT_ROWS_value_q;
 
     // next hardware value
 
     //! main storage
     always_ff @ (posedge clk, negedge resetn)
     if (~resetn) begin
-        CONTROL_weight_ready_q <= 0;
+        WEIGHT_ROWS_value_q <= 0;
     end else begin
-        // Defined as single pulse, clear value from last cycle
-        CONTROL_weight_ready_q <= '0;
         // Software write
-        if (CONTROL_sw_wr) begin
-            CONTROL_weight_ready_q <=  sw_masked_data[ 2: 2] | (CONTROL_weight_ready_q & ~sw_mask[ 2: 2]);
+        if (WEIGHT_ROWS_sw_wr) begin
+            WEIGHT_ROWS_value_q <=  sw_masked_data[15: 0] | (WEIGHT_ROWS_value_q & ~sw_mask[15: 0]);
+        end
+    end
+            
+        
+    // ============================================================
+    // Register: WEIGHT_COLS
+    //    [15: 0]                value: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  WEIGHT_COLS_decode;
+    logic                  WEIGHT_COLS_sw_wr;
+    logic                  WEIGHT_COLS_sw_rd;
+    logic [DATA_WIDTH-1:0] WEIGHT_COLS_q;
+
+    assign WEIGHT_COLS_decode = (addr == (ADDR_OFFSET+'h0+'h8));
+    assign WEIGHT_COLS_sw_wr = sw_wr && WEIGHT_COLS_decode;
+    assign WEIGHT_COLS_sw_rd = sw_rd && WEIGHT_COLS_decode;
+
+    always_comb begin
+        WEIGHT_COLS_q = '0;
+        WEIGHT_COLS_q[15: 0] = WEIGHT_COLS_value_q;
+    end
+
+    // masked version of return data
+    assign WEIGHT_COLS_rdata = WEIGHT_COLS_sw_rd ? WEIGHT_COLS_q : 'b0;
+
+    // ------------------------------------------------------------
+    // Field: value
+    // ------------------------------------------------------------
+    assign WEIGHT_COLS_value_anded = & WEIGHT_COLS_value_q;
+    assign WEIGHT_COLS_value_ored  = | WEIGHT_COLS_value_q;
+    assign WEIGHT_COLS_value_xored = ^ WEIGHT_COLS_value_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        WEIGHT_COLS_value_q <= 0;
+    end else begin
+        // Software write
+        if (WEIGHT_COLS_sw_wr) begin
+            WEIGHT_COLS_value_q <=  sw_masked_data[15: 0] | (WEIGHT_COLS_value_q & ~sw_mask[15: 0]);
+        end
+    end
+            
+        
+    // ============================================================
+    // Register: INPUT_MAX_ADDR
+    //    [ 9: 0]                value: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  INPUT_MAX_ADDR_decode;
+    logic                  INPUT_MAX_ADDR_sw_wr;
+    logic                  INPUT_MAX_ADDR_sw_rd;
+    logic [DATA_WIDTH-1:0] INPUT_MAX_ADDR_q;
+
+    assign INPUT_MAX_ADDR_decode = (addr == (ADDR_OFFSET+'h0+'hc));
+    assign INPUT_MAX_ADDR_sw_wr = sw_wr && INPUT_MAX_ADDR_decode;
+    assign INPUT_MAX_ADDR_sw_rd = sw_rd && INPUT_MAX_ADDR_decode;
+
+    always_comb begin
+        INPUT_MAX_ADDR_q = '0;
+        INPUT_MAX_ADDR_q[ 9: 0] = INPUT_MAX_ADDR_value_q;
+    end
+
+    // masked version of return data
+    assign INPUT_MAX_ADDR_rdata = INPUT_MAX_ADDR_sw_rd ? INPUT_MAX_ADDR_q : 'b0;
+
+    // ------------------------------------------------------------
+    // Field: value
+    // ------------------------------------------------------------
+    assign INPUT_MAX_ADDR_value_anded = & INPUT_MAX_ADDR_value_q;
+    assign INPUT_MAX_ADDR_value_ored  = | INPUT_MAX_ADDR_value_q;
+    assign INPUT_MAX_ADDR_value_xored = ^ INPUT_MAX_ADDR_value_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        INPUT_MAX_ADDR_value_q <= 0;
+    end else begin
+        // Software write
+        if (INPUT_MAX_ADDR_sw_wr) begin
+            INPUT_MAX_ADDR_value_q <=  sw_masked_data[ 9: 0] | (INPUT_MAX_ADDR_value_q & ~sw_mask[ 9: 0]);
+        end
+    end
+            
+        
+    // ============================================================
+    // Register: INPUT_COLS
+    //    [15: 0]                value: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  INPUT_COLS_decode;
+    logic                  INPUT_COLS_sw_wr;
+    logic                  INPUT_COLS_sw_rd;
+    logic [DATA_WIDTH-1:0] INPUT_COLS_q;
+
+    assign INPUT_COLS_decode = (addr == (ADDR_OFFSET+'h0+'h10));
+    assign INPUT_COLS_sw_wr = sw_wr && INPUT_COLS_decode;
+    assign INPUT_COLS_sw_rd = sw_rd && INPUT_COLS_decode;
+
+    always_comb begin
+        INPUT_COLS_q = '0;
+        INPUT_COLS_q[15: 0] = INPUT_COLS_value_q;
+    end
+
+    // masked version of return data
+    assign INPUT_COLS_rdata = INPUT_COLS_sw_rd ? INPUT_COLS_q : 'b0;
+
+    // ------------------------------------------------------------
+    // Field: value
+    // ------------------------------------------------------------
+    assign INPUT_COLS_value_anded = & INPUT_COLS_value_q;
+    assign INPUT_COLS_value_ored  = | INPUT_COLS_value_q;
+    assign INPUT_COLS_value_xored = ^ INPUT_COLS_value_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        INPUT_COLS_value_q <= 0;
+    end else begin
+        // Software write
+        if (INPUT_COLS_sw_wr) begin
+            INPUT_COLS_value_q <=  sw_masked_data[15: 0] | (INPUT_COLS_value_q & ~sw_mask[15: 0]);
         end
     end
             
@@ -187,13 +351,16 @@ module ctrl_rf_rf #(
     // Register: STATUS
     //    [ 0: 0]            out_ready: hw=w     sw=r     reset=0x0
     //    [16: 1]            out_count: hw=w     sw=r     reset=0x0
+    //    [17:17]    weight_tile_ready: hw=w     sw=r     reset=0x0
+    //    [18:18]                 busy: hw=w     sw=r     reset=0x0
+    //    [19:19]                 done: hw=w     sw=r     reset=0x0
     // ============================================================
     logic                  STATUS_decode;
     logic                  STATUS_sw_wr;
     logic                  STATUS_sw_rd;
     logic [DATA_WIDTH-1:0] STATUS_q;
 
-    assign STATUS_decode = (addr == (ADDR_OFFSET+'h0+'h4));
+    assign STATUS_decode = (addr == (ADDR_OFFSET+'h0+'h14));
     assign STATUS_sw_wr = sw_wr && STATUS_decode;
     assign STATUS_sw_rd = sw_rd && STATUS_decode;
 
@@ -201,6 +368,9 @@ module ctrl_rf_rf #(
         STATUS_q = '0;
         STATUS_q[ 0: 0] = STATUS_out_ready_q;
         STATUS_q[16: 1] = STATUS_out_count_q;
+        STATUS_q[17:17] = STATUS_weight_tile_ready_q;
+        STATUS_q[18:18] = STATUS_busy_q;
+        STATUS_q[19:19] = STATUS_done_q;
     end
 
     // masked version of return data
@@ -227,5 +397,38 @@ module ctrl_rf_rf #(
     // next hardware value
     assign STATUS_out_count_next = STATUS_out_count_wdata;
     assign STATUS_out_count_q = STATUS_out_count_next;
+
+    // ------------------------------------------------------------
+    // Field: weight_tile_ready (wire)
+    // ------------------------------------------------------------
+    assign STATUS_weight_tile_ready_anded = & STATUS_weight_tile_ready_q;
+    assign STATUS_weight_tile_ready_ored  = | STATUS_weight_tile_ready_q;
+    assign STATUS_weight_tile_ready_xored = ^ STATUS_weight_tile_ready_q;
+
+    // next hardware value
+    assign STATUS_weight_tile_ready_next = STATUS_weight_tile_ready_wdata;
+    assign STATUS_weight_tile_ready_q = STATUS_weight_tile_ready_next;
+
+    // ------------------------------------------------------------
+    // Field: busy (wire)
+    // ------------------------------------------------------------
+    assign STATUS_busy_anded = & STATUS_busy_q;
+    assign STATUS_busy_ored  = | STATUS_busy_q;
+    assign STATUS_busy_xored = ^ STATUS_busy_q;
+
+    // next hardware value
+    assign STATUS_busy_next = STATUS_busy_wdata;
+    assign STATUS_busy_q = STATUS_busy_next;
+
+    // ------------------------------------------------------------
+    // Field: done (wire)
+    // ------------------------------------------------------------
+    assign STATUS_done_anded = & STATUS_done_q;
+    assign STATUS_done_ored  = | STATUS_done_q;
+    assign STATUS_done_xored = ^ STATUS_done_q;
+
+    // next hardware value
+    assign STATUS_done_next = STATUS_done_wdata;
+    assign STATUS_done_q = STATUS_done_next;
 
 endmodule: ctrl_rf_rf

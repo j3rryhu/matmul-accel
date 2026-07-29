@@ -1,0 +1,6 @@
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <property name="random_seed" value="1785294097" />
+    <testcase classname="test_accel_top" file="D:\TinyViT_ws\matmul-accel\tb\test_accel_top.py" lineno="142" name="test_min_32x32_matmul" ratio_time="5443.3365366309645" sim_time_ns="20610.001" time="3.786280870437622" />
+  </testsuite>
+</testsuites>

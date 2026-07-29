@@ -6,7 +6,7 @@ module input_buffer_8_bank (
     input       [12:0]          wraddress,
     input                       wren,
 
-    output wire [7 * 8 - 1:0]   q
+    output wire [8 * 8 - 1:0]   q
 
 );
 
@@ -14,13 +14,13 @@ module input_buffer_8_bank (
     generate
         for(i = 0; i < 8; i++) begin
             input_buffer u_input_buffer (
-                .clock     (clk),
-                .data      (ibuf_wdata),
-                .rdaddress (rdaddress),   // TODO: drive from compute datapath
-                .rden      (rden),    // TODO: drive from compute datapath
-                .wraddress (ibuf_wraddress[9:0]),
-                .wren      (ibuf_wren & ibuf_wraddress[12:10] == i),
-                .q         (out_rdata[i * 8 +: 8])         // unused until compute datapath is wired up
+                .clock     (clock),
+                .data      (data),
+                .rdaddress (rdaddress),
+                .rden      (rden),
+                .wraddress (wraddress[9:0]),
+                .wren      (wren & (wraddress[12:10] == i)),
+                .q         (q[i * 8 +: 8])
             );
         end
     endgenerate

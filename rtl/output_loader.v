@@ -1,0 +1,208 @@
+// output_loader : accumulates pe_array's partial sums into output_buffer,
+// which is banked one bank per array column (ARRAY_COLS banks total) -
+// mirrors input_buffer_8_bank's banking pattern on the input side, scaled
+// to ARRAY_COLS so every column that's currently producing a real result
+// can be read-modify-written the same cycle it arrives, with no elastic
+// buffering or backpressure required.
+//
+// "row"/"column" below mean the *final written-out output matrix's* row
+// and column (as you'd write y out on paper), not weight_ctrl's block
+// indices. Bank c always holds output row (n_blk_idx*ARRAY_COLS+c) for
+// whichever n_blk_idx is currently committed - i.e. each bank is reused
+// across every n_blk_idx pass, and within a bank the per-n_blk_idx
+// segments (each total_rows elements, one per output column m) are simply
+// appended head-to-tail: bank c's internal address = n_blk_idx*total_rows
+// + m. That makes the layout row-major *within* a bank, but NOT globally
+// row-major across the whole output_buffer (row n's data isn't one
+// contiguous run - it's split one-32nd-per-bank).
+//
+// Since the contraction dimension may need more than one 32-block pass
+// (k_blk_idx = 0..num_k_blocks-1) to fully sum, every block's psums must
+// be added to whatever's already at that output position - except the
+// very first k-block for a given n_blk_idx, whose target position is
+// otherwise stale/uninitialized and gets written directly instead.
+// weight_ctrl's committed_n_blk_idx/committed_first_k_blk (latched at
+// commit, valid for that block's whole compute+drain window) tell us
+// which case we're in; this module samples them once, at its own a_en0
+// start edge, and holds them for the rest of that block's drain - by
+// construction weight_ctrl's *next* commit (which would advance those
+// signals) can't happen until this block's input band has finished
+// draining, which is always after this block's a_en0 has already risen,
+// so the sampled copies are never overwritten out from under an
+// in-progress drain.
+//
+// Read-modify-write per column: output_buffer is a synchronous on-chip
+// RAM (q valid one cycle after rdaddress/rden), so the read for a
+// position is issued one cycle *before* p_in[c] holds the psum for that
+// same position - by the cycle the psum actually arrives, the old value
+// is already sitting in obuf_q[c], ready to add and write back that same
+// cycle.
+//
+// Timing model (from pe.v/pe_array.v):
+//   - a_buf/b_buf only update when a_en/b_en pulse; p_out is recomputed
+//     every cycle from whatever a_buf/b_buf currently hold. b_en must
+//     therefore stay high for the *entire* compute+drain window once
+//     started - gapping it would freeze that column's cascade mid-flight
+//     and misalign every row still in transit. b_en is one signal
+//     broadcast to all columns, not staggered per column.
+//   - input_dispatch already staggers row r's a_en by r cycles, and the
+//     a-side shift chain adds one more cycle of delay per column hop.
+//     Those two skews cancel out along the diagonal, so column c's p_out
+//     starts reflecting real (non-reset) data ARRAY_COLS-1+c cycles after
+//     row 0's a_en first rises: column 0 first, then one more column every
+//     following cycle, all ARRAY_COLS columns live ARRAY_COLS-1 cycles
+//     after that.
+//   - once a column is live it produces exactly one new valid result per
+//     cycle, forever, so each column's captures are independently
+//     addressed by its own free-running counter (0..total_rows-1) - no
+//     need to realign columns to a shared row index.
+//
+// a_en0 is row 0's a_en bit (pe_array a_en[0] / input_dispatch a_en[0]);
+// only its first rising edge after reset/completion is used to anchor
+// timing, so later gaps in a_en0 (e.g. input FIFO underrun) don't
+// re-trigger the sequence.
+`timescale 1ps/1ps
+
+module output_loader #(
+    parameter DATA_WIDTH     = 8,
+    parameter ARRAY_COLS     = 32,
+    parameter ROW_ADDR_WIDTH = 16,   // per-bank address width - must span num_n_blocks*total_rows
+    parameter DIM_WIDTH      = 16    // width of committed_n_blk_idx (from weight_ctrl)
+)(
+    input                                          clock,
+    input                                           rst_n,       // active-low
+
+    // ---- pe_array bottom edge ----
+    input      [ARRAY_COLS*DATA_WIDTH-1:0]         p_in,        // pe_array p_out
+    output     [ARRAY_COLS-1:0]                    b_en,        // pe_array b_en
+
+    // ---- timing anchor + block identity (from weight_ctrl) ----
+    input                                           a_en0,                 // pe_array a_en[0]
+    input      [ROW_ADDR_WIDTH-1:0]                 total_rows,            // M: expected valid results per column, per pass
+    input      [DIM_WIDTH-1:0]                      committed_n_blk_idx,   // weight_ctrl: output block this pass belongs to
+    input                                            committed_first_k_blk, // weight_ctrl: write instead of accumulate
+
+    // ---- output_buffer read+write ports, one bank per array column ----
+    output     [ARRAY_COLS-1:0]                     obuf_rden,
+    output     [ARRAY_COLS*ROW_ADDR_WIDTH-1:0]      obuf_rdaddress,
+    input      [ARRAY_COLS*DATA_WIDTH-1:0]          obuf_q,
+    output     [ARRAY_COLS-1:0]                     obuf_wren,
+    output     [ARRAY_COLS*ROW_ADDR_WIDTH-1:0]      obuf_waddr,
+    output     [ARRAY_COLS*DATA_WIDTH-1:0]          obuf_wdata,
+
+    output                                          busy,
+    output                                          done
+);
+
+    localparam LATENCY     = ARRAY_COLS - 1;               // cycles: a_en0 rise -> column 0 live
+    localparam ELAPSED_MAX = LATENCY + ARRAY_COLS - 1;      // cycles: a_en0 rise -> last column live
+    localparam ELAPSED_W   = $clog2(ELAPSED_MAX + 1);
+
+    reg                     armed;      // ready to latch the next a_en0 rising edge
+    reg                     a_en0_d;
+    reg                     running;
+    reg [ELAPSED_W-1:0]     elapsed;
+
+    reg [ROW_ADDR_WIDTH-1:0] col_count [0:ARRAY_COLS-1];
+    wire [ARRAY_COLS-1:0]    col_done;
+
+    // ---- sampled once at start_edge, held for this block's whole drain ----
+    reg [DIM_WIDTH-1:0] held_n_blk_idx;
+    reg                 held_first_k_blk;
+
+    wire start_edge = armed && a_en0 && !a_en0_d;
+
+    always @(posedge clock) begin
+        if (~rst_n)
+            a_en0_d <= 1'b0;
+        else
+            a_en0_d <= a_en0;
+    end
+
+    always @(posedge clock) begin
+        if (~rst_n) begin
+            armed            <= 1'b1;
+            running          <= 1'b0;
+            elapsed          <= {ELAPSED_W{1'b0}};
+            held_n_blk_idx   <= '0;
+            held_first_k_blk <= 1'b0;
+        end
+        else if (start_edge) begin
+            armed            <= 1'b0;
+            running          <= 1'b1;
+            elapsed          <= {ELAPSED_W{1'b0}};
+            held_n_blk_idx   <= committed_n_blk_idx;
+            held_first_k_blk <= committed_first_k_blk;
+        end
+        else if (running) begin
+            if (elapsed < ELAPSED_MAX)
+                elapsed <= elapsed + 1'b1;
+
+            if (done) begin
+                running <= 1'b0;
+                armed   <= 1'b1;
+            end
+        end
+    end
+
+    // held high for the whole compute+drain window - never gated per column
+    assign b_en = {ARRAY_COLS{running}};
+
+    genvar c;
+    generate
+        for (c = 0; c < ARRAY_COLS; c = c + 1) begin : COL
+            wire col_live   = running && (elapsed >= (LATENCY + c));
+            wire col_active = col_live && (col_count[c] < total_rows);
+
+            always @(posedge clock) begin
+                if (~rst_n)
+                    col_count[c] <= {ROW_ADDR_WIDTH{1'b0}};
+                else if (start_edge)
+                    col_count[c] <= {ROW_ADDR_WIDTH{1'b0}};
+                else if (col_active)
+                    col_count[c] <= col_count[c] + 1'b1;
+            end
+
+            assign col_done[c] = (col_count[c] == total_rows);
+
+            // this bank's address for the position col_count[c] currently
+            // points at: held_n_blk_idx's segment, appended after every
+            // earlier n_blk_idx's total_rows-sized segment in this bank
+            wire [ROW_ADDR_WIDTH-1:0] cur_addr = held_n_blk_idx*total_rows + col_count[c];
+
+            assign obuf_rden[c] = col_active;
+            assign obuf_rdaddress[c*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH] = cur_addr;
+
+            // one-cycle pipeline so obuf_q[c] (this RAM's own one-cycle
+            // synchronous read latency) lines up with the psum it should
+            // be added to
+            reg                      active_d;
+            reg [ROW_ADDR_WIDTH-1:0] addr_d;
+            reg [DATA_WIDTH-1:0]     psum_d;
+
+            always @(posedge clock) begin
+                if (~rst_n) begin
+                    active_d <= 1'b0;
+                    addr_d   <= {ROW_ADDR_WIDTH{1'b0}};
+                    psum_d   <= {DATA_WIDTH{1'b0}};
+                end
+                else begin
+                    active_d <= col_active;
+                    addr_d   <= cur_addr;
+                    psum_d   <= p_in[c*DATA_WIDTH +: DATA_WIDTH];
+                end
+            end
+
+            wire [DATA_WIDTH-1:0] old_val = obuf_q[c*DATA_WIDTH +: DATA_WIDTH];
+            wire [DATA_WIDTH-1:0] new_val = held_first_k_blk ? psum_d : (old_val + psum_d);
+
+            assign obuf_wren[c] = active_d;
+            assign obuf_waddr[c*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH]  = addr_d;
+            assign obuf_wdata[c*DATA_WIDTH +: DATA_WIDTH]         = new_val;
+        end
+    endgenerate
+
+    assign busy = running;
+    assign done = running && &col_done;
+
+endmodule

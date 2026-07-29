@@ -46,9 +46,19 @@ module ctrl_rf_tb #(
     logic                              resetn;
 
     // Register CONTROL
-    logic                     [ 0: 0] CONTROL_start_q;
-    logic                     [ 1: 1] CONTROL_input_ready_q;
-    logic                     [ 2: 2] CONTROL_weight_ready_q;
+    logic                     [ 0: 0] CONTROL_matmul_start_q;
+
+    // Register WEIGHT_ROWS
+    logic                     [15: 0] WEIGHT_ROWS_value_q;
+
+    // Register WEIGHT_COLS
+    logic                     [15: 0] WEIGHT_COLS_value_q;
+
+    // Register INPUT_MAX_ADDR
+    logic                     [ 9: 0] INPUT_MAX_ADDR_value_q;
+
+    // Register INPUT_COLS
+    logic                     [15: 0] INPUT_COLS_value_q;
 
     // Register STATUS
     logic                             STATUS_out_ready_we;
@@ -57,6 +67,15 @@ module ctrl_rf_tb #(
     logic                             STATUS_out_count_we;
     logic                             STATUS_out_count_wel;
     logic                     [16: 1] STATUS_out_count_wdata;
+    logic                             STATUS_weight_tile_ready_we;
+    logic                             STATUS_weight_tile_ready_wel;
+    logic                     [17:17] STATUS_weight_tile_ready_wdata;
+    logic                             STATUS_busy_we;
+    logic                             STATUS_busy_wel;
+    logic                     [18:18] STATUS_busy_wdata;
+    logic                             STATUS_done_we;
+    logic                             STATUS_done_wel;
+    logic                     [19:19] STATUS_done_wdata;
 
     // Register Bus
     logic                             valid;    // active high
@@ -92,6 +111,12 @@ module ctrl_rf_tb #(
         STATUS_out_ready_wdata <= '0;
         STATUS_out_count_wr <= '0;
         STATUS_out_count_wdata <= '0;
+        STATUS_weight_tile_ready_wr <= '0;
+        STATUS_weight_tile_ready_wdata <= '0;
+        STATUS_busy_wr <= '0;
+        STATUS_busy_wdata <= '0;
+        STATUS_done_wr <= '0;
+        STATUS_done_wdata <= '0;
 
         // init all sw input
         valid <= '0;
@@ -102,54 +127,88 @@ module ctrl_rf_tb #(
 
         @(posedge resetn);
         repeat(5) @(posedge clk);
-        $display("%t: Testcase (CONTROL_start ):", $time());
+        $display("%t: Testcase (CONTROL_matmul_start ):", $time());
         $display("%t:\tSoftware write (hardware read) test", $time());
         for (int IDX = 0; IDX <= 0; ++IDX) begin
 
             temp = '0;
-            temp[ 0: 0] = CONTROL_start_q;
+            temp[ 0: 0] = CONTROL_matmul_start_q;
             temp = (1 << IDX);
             value = '0;
 
             `SW_WRITE( 0, (1 << IDX) )
-            #1 `CHECK_EQUAL(CONTROL_start_q, temp[ 0: 0])
+            #1 `CHECK_EQUAL(CONTROL_matmul_start_q, temp[ 0: 0])
 
             `SW_WRITE( 0, 0 )
-            #1 `CHECK_EQUAL(CONTROL_start_q, value[ 0: 0])
+            #1 `CHECK_EQUAL(CONTROL_matmul_start_q, value[ 0: 0])
 
         end
         repeat(5) @(posedge clk);
-        $display("%t: Testcase (CONTROL_input_ready ):", $time());
+        $display("%t: Testcase (WEIGHT_ROWS_value ):", $time());
         $display("%t:\tSoftware write (hardware read) test", $time());
-        for (int IDX = 1; IDX <= 1; ++IDX) begin
+        for (int IDX = 0; IDX <= 15; ++IDX) begin
 
             temp = '0;
-            temp[ 1: 1] = CONTROL_input_ready_q;
+            temp[15: 0] = WEIGHT_ROWS_value_q;
             temp = (1 << IDX);
             value = '0;
 
-            `SW_WRITE( 0, (1 << IDX) )
-            #1 `CHECK_EQUAL(CONTROL_input_ready_q, temp[ 1: 1])
+            `SW_WRITE( 4, (1 << IDX) )
+            #1 `CHECK_EQUAL(WEIGHT_ROWS_value_q, temp[15: 0])
 
-            `SW_WRITE( 0, 0 )
-            #1 `CHECK_EQUAL(CONTROL_input_ready_q, value[ 1: 1])
+            `SW_WRITE( 4, 0 )
+            #1 `CHECK_EQUAL(WEIGHT_ROWS_value_q, value[15: 0])
 
         end
         repeat(5) @(posedge clk);
-        $display("%t: Testcase (CONTROL_weight_ready ):", $time());
+        $display("%t: Testcase (WEIGHT_COLS_value ):", $time());
         $display("%t:\tSoftware write (hardware read) test", $time());
-        for (int IDX = 2; IDX <= 2; ++IDX) begin
+        for (int IDX = 0; IDX <= 15; ++IDX) begin
 
             temp = '0;
-            temp[ 2: 2] = CONTROL_weight_ready_q;
+            temp[15: 0] = WEIGHT_COLS_value_q;
             temp = (1 << IDX);
             value = '0;
 
-            `SW_WRITE( 0, (1 << IDX) )
-            #1 `CHECK_EQUAL(CONTROL_weight_ready_q, temp[ 2: 2])
+            `SW_WRITE( 8, (1 << IDX) )
+            #1 `CHECK_EQUAL(WEIGHT_COLS_value_q, temp[15: 0])
 
-            `SW_WRITE( 0, 0 )
-            #1 `CHECK_EQUAL(CONTROL_weight_ready_q, value[ 2: 2])
+            `SW_WRITE( 8, 0 )
+            #1 `CHECK_EQUAL(WEIGHT_COLS_value_q, value[15: 0])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (INPUT_MAX_ADDR_value ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 0; IDX <= 9; ++IDX) begin
+
+            temp = '0;
+            temp[ 9: 0] = INPUT_MAX_ADDR_value_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 12, (1 << IDX) )
+            #1 `CHECK_EQUAL(INPUT_MAX_ADDR_value_q, temp[ 9: 0])
+
+            `SW_WRITE( 12, 0 )
+            #1 `CHECK_EQUAL(INPUT_MAX_ADDR_value_q, value[ 9: 0])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (INPUT_COLS_value ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 0; IDX <= 15; ++IDX) begin
+
+            temp = '0;
+            temp[15: 0] = INPUT_COLS_value_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 16, (1 << IDX) )
+            #1 `CHECK_EQUAL(INPUT_COLS_value_q, temp[15: 0])
+
+            `SW_WRITE( 16, 0 )
+            #1 `CHECK_EQUAL(INPUT_COLS_value_q, value[15: 0])
 
         end
         repeat(5) @(posedge clk);
@@ -158,11 +217,11 @@ module ctrl_rf_tb #(
         for (int IDX = 0; IDX <= 0; ++IDX) begin
 
             `HW_WRITE( STATUS_out_ready, , (1 << (IDX-0)) )
-            `SW_READ( 4 )
+            `SW_READ( 20 )
             `CHECK_EQUAL(rdata[ 0: 0], (1 << (IDX-0)))
 
             `HW_WRITE( STATUS_out_ready, , 0 )
-            `SW_READ( 4 )
+            `SW_READ( 20 )
             `CHECK_EQUAL(rdata[ 0: 0], 0)
 
         end
@@ -172,12 +231,54 @@ module ctrl_rf_tb #(
         for (int IDX = 1; IDX <= 16; ++IDX) begin
 
             `HW_WRITE( STATUS_out_count, , (1 << (IDX-1)) )
-            `SW_READ( 4 )
+            `SW_READ( 20 )
             `CHECK_EQUAL(rdata[16: 1], (1 << (IDX-1)))
 
             `HW_WRITE( STATUS_out_count, , 0 )
-            `SW_READ( 4 )
+            `SW_READ( 20 )
             `CHECK_EQUAL(rdata[16: 1], 0)
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (STATUS_weight_tile_ready ):", $time());
+        $display("%t:\tHardware write test", $time());
+        for (int IDX = 17; IDX <= 17; ++IDX) begin
+
+            `HW_WRITE( STATUS_weight_tile_ready, , (1 << (IDX-17)) )
+            `SW_READ( 20 )
+            `CHECK_EQUAL(rdata[17:17], (1 << (IDX-17)))
+
+            `HW_WRITE( STATUS_weight_tile_ready, , 0 )
+            `SW_READ( 20 )
+            `CHECK_EQUAL(rdata[17:17], 0)
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (STATUS_busy ):", $time());
+        $display("%t:\tHardware write test", $time());
+        for (int IDX = 18; IDX <= 18; ++IDX) begin
+
+            `HW_WRITE( STATUS_busy, , (1 << (IDX-18)) )
+            `SW_READ( 20 )
+            `CHECK_EQUAL(rdata[18:18], (1 << (IDX-18)))
+
+            `HW_WRITE( STATUS_busy, , 0 )
+            `SW_READ( 20 )
+            `CHECK_EQUAL(rdata[18:18], 0)
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (STATUS_done ):", $time());
+        $display("%t:\tHardware write test", $time());
+        for (int IDX = 19; IDX <= 19; ++IDX) begin
+
+            `HW_WRITE( STATUS_done, , (1 << (IDX-19)) )
+            `SW_READ( 20 )
+            `CHECK_EQUAL(rdata[19:19], (1 << (IDX-19)))
+
+            `HW_WRITE( STATUS_done, , 0 )
+            `SW_READ( 20 )
+            `CHECK_EQUAL(rdata[19:19], 0)
 
         end
 

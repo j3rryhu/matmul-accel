@@ -75,56 +75,92 @@ int main(int argc, char** argv) {
     cycle(top);
     cycle(top);
     cycle(top);
-    std::cout << main_time << ": Testcase (CONTROL_start ):\n";
+    std::cout << main_time << ": Testcase (CONTROL_matmul_start ):\n";
     std::cout << main_time << ": \tSoftware write test\n";
     for (int IDX = 0; IDX <= 0; ++IDX) {
         int temp, value;
 
-        temp = top->CONTROL_start_q << 0;
+        temp = top->CONTROL_matmul_start_q << 0;
         temp = (1 << IDX);
         value = 0;
 
         SW_WRITE( 0, (1 << IDX) )
-        CHECK_EQUAL(top->CONTROL_start_q, RANGE(temp, 1, 0))
+        CHECK_EQUAL(top->CONTROL_matmul_start_q, RANGE(temp, 1, 0))
 
         SW_WRITE( 0, 0 )
-        CHECK_EQUAL(top->CONTROL_start_q, RANGE(value, 1, 0))
+        CHECK_EQUAL(top->CONTROL_matmul_start_q, RANGE(value, 1, 0))
 
     }
     cycle(top);
     cycle(top);
-    std::cout << main_time << ": Testcase (CONTROL_input_ready ):\n";
+    std::cout << main_time << ": Testcase (WEIGHT_ROWS_value ):\n";
     std::cout << main_time << ": \tSoftware write test\n";
-    for (int IDX = 1; IDX <= 1; ++IDX) {
+    for (int IDX = 0; IDX <= 15; ++IDX) {
         int temp, value;
 
-        temp = top->CONTROL_input_ready_q << 1;
+        temp = top->WEIGHT_ROWS_value_q << 0;
         temp = (1 << IDX);
         value = 0;
 
-        SW_WRITE( 0, (1 << IDX) )
-        CHECK_EQUAL(top->CONTROL_input_ready_q, RANGE(temp, 1, 1))
+        SW_WRITE( 4, (1 << IDX) )
+        CHECK_EQUAL(top->WEIGHT_ROWS_value_q, RANGE(temp, 16, 0))
 
-        SW_WRITE( 0, 0 )
-        CHECK_EQUAL(top->CONTROL_input_ready_q, RANGE(value, 1, 1))
+        SW_WRITE( 4, 0 )
+        CHECK_EQUAL(top->WEIGHT_ROWS_value_q, RANGE(value, 16, 0))
 
     }
     cycle(top);
     cycle(top);
-    std::cout << main_time << ": Testcase (CONTROL_weight_ready ):\n";
+    std::cout << main_time << ": Testcase (WEIGHT_COLS_value ):\n";
     std::cout << main_time << ": \tSoftware write test\n";
-    for (int IDX = 2; IDX <= 2; ++IDX) {
+    for (int IDX = 0; IDX <= 15; ++IDX) {
         int temp, value;
 
-        temp = top->CONTROL_weight_ready_q << 2;
+        temp = top->WEIGHT_COLS_value_q << 0;
         temp = (1 << IDX);
         value = 0;
 
-        SW_WRITE( 0, (1 << IDX) )
-        CHECK_EQUAL(top->CONTROL_weight_ready_q, RANGE(temp, 1, 2))
+        SW_WRITE( 8, (1 << IDX) )
+        CHECK_EQUAL(top->WEIGHT_COLS_value_q, RANGE(temp, 16, 0))
 
-        SW_WRITE( 0, 0 )
-        CHECK_EQUAL(top->CONTROL_weight_ready_q, RANGE(value, 1, 2))
+        SW_WRITE( 8, 0 )
+        CHECK_EQUAL(top->WEIGHT_COLS_value_q, RANGE(value, 16, 0))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (INPUT_MAX_ADDR_value ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 0; IDX <= 9; ++IDX) {
+        int temp, value;
+
+        temp = top->INPUT_MAX_ADDR_value_q << 0;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 12, (1 << IDX) )
+        CHECK_EQUAL(top->INPUT_MAX_ADDR_value_q, RANGE(temp, 10, 0))
+
+        SW_WRITE( 12, 0 )
+        CHECK_EQUAL(top->INPUT_MAX_ADDR_value_q, RANGE(value, 10, 0))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (INPUT_COLS_value ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 0; IDX <= 15; ++IDX) {
+        int temp, value;
+
+        temp = top->INPUT_COLS_value_q << 0;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 16, (1 << IDX) )
+        CHECK_EQUAL(top->INPUT_COLS_value_q, RANGE(temp, 16, 0))
+
+        SW_WRITE( 16, 0 )
+        CHECK_EQUAL(top->INPUT_COLS_value_q, RANGE(value, 16, 0))
 
     }
     cycle(top);
@@ -145,7 +181,7 @@ int main(int argc, char** argv) {
         top->ctrl_rf_rf__DOT__STATUS_out_ready_q = (1 << (IDX-0));
         HW_WRITE( STATUS_out_ready, , (1 << (IDX-0)) )
         cycle(top);
-        SW_READ( 4 )
+        SW_READ( 20 )
         CHECK_EQUAL(RANGE(rdata, 1, 0), (1 << (IDX-0)))
     }
     cycle(top);
@@ -166,8 +202,71 @@ int main(int argc, char** argv) {
         top->ctrl_rf_rf__DOT__STATUS_out_count_q = (1 << (IDX-1));
         HW_WRITE( STATUS_out_count, , (1 << (IDX-1)) )
         cycle(top);
-        SW_READ( 4 )
+        SW_READ( 20 )
         CHECK_EQUAL(RANGE(rdata, 16, 1), (1 << (IDX-1)))
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (STATUS_weight_tile_ready ):\n";
+    std::cout << main_time << ": \tHardware write test\n";
+    for (int IDX = 17; IDX <= 17; ++IDX) {
+
+        HW_WRITE_WE( STATUS_weight_tile_ready, , (1 << (IDX-17)) )
+        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_weight_tile_ready_q, (1 << (IDX-17)))
+
+        HW_WRITE_WE( STATUS_weight_tile_ready, , 0 )
+        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_weight_tile_ready_q, 0)
+    }
+    std::cout << main_time << ": \tSoftware read test\n";
+    for (int IDX = 17; IDX <= 17; ++IDX) {
+
+        top->ctrl_rf_rf__DOT__STATUS_weight_tile_ready_q = (1 << (IDX-17));
+        HW_WRITE( STATUS_weight_tile_ready, , (1 << (IDX-17)) )
+        cycle(top);
+        SW_READ( 20 )
+        CHECK_EQUAL(RANGE(rdata, 1, 17), (1 << (IDX-17)))
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (STATUS_busy ):\n";
+    std::cout << main_time << ": \tHardware write test\n";
+    for (int IDX = 18; IDX <= 18; ++IDX) {
+
+        HW_WRITE_WE( STATUS_busy, , (1 << (IDX-18)) )
+        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_busy_q, (1 << (IDX-18)))
+
+        HW_WRITE_WE( STATUS_busy, , 0 )
+        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_busy_q, 0)
+    }
+    std::cout << main_time << ": \tSoftware read test\n";
+    for (int IDX = 18; IDX <= 18; ++IDX) {
+
+        top->ctrl_rf_rf__DOT__STATUS_busy_q = (1 << (IDX-18));
+        HW_WRITE( STATUS_busy, , (1 << (IDX-18)) )
+        cycle(top);
+        SW_READ( 20 )
+        CHECK_EQUAL(RANGE(rdata, 1, 18), (1 << (IDX-18)))
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (STATUS_done ):\n";
+    std::cout << main_time << ": \tHardware write test\n";
+    for (int IDX = 19; IDX <= 19; ++IDX) {
+
+        HW_WRITE_WE( STATUS_done, , (1 << (IDX-19)) )
+        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_done_q, (1 << (IDX-19)))
+
+        HW_WRITE_WE( STATUS_done, , 0 )
+        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_done_q, 0)
+    }
+    std::cout << main_time << ": \tSoftware read test\n";
+    for (int IDX = 19; IDX <= 19; ++IDX) {
+
+        top->ctrl_rf_rf__DOT__STATUS_done_q = (1 << (IDX-19));
+        HW_WRITE( STATUS_done, , (1 << (IDX-19)) )
+        cycle(top);
+        SW_READ( 20 )
+        CHECK_EQUAL(RANGE(rdata, 1, 19), (1 << (IDX-19)))
     }
 
     cycle(top);

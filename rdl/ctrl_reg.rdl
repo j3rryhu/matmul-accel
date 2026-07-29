@@ -1,40 +1,99 @@
 addrmap ctrl_rf {
-    // Control Register (0x00)
+    // Control Register (0x00) - single sw-pulsed start bit. The rest of the
+    // weight/input control sequencing (weight block prefetch, input preload,
+    // compute start) is still TODO - it'll be driven some other way, not
+    // more single-pulse CONTROL bits like the ones this replaced.
     reg {
         field {
             singlepulse = true; // Single pulse mode
             reset = 0;
             sw = w;    // Read-write
             hw = r;    // No hardware feedback
-        } start;     // Bit 0: start compute
-        
-        field {
-            singlepulse = true; // Single pulse mode
-            reset = 0;
-            sw = w;    // Read-write
-            hw = r;    // No hardware feedback
-        } input_ready;
+        } matmul_start;        // a new matmul is starting: latch WEIGHT_ROWS/
+                                // WEIGHT_COLS and reset weight_ctrl's block
+                                // position to (0,0)
 
-        field {
-            singlepulse = true; // Single pulse mode
-            reset = 0;
-            sw = w;    // Read-write
-            hw = r;    // No hardware feedback
-        } weight_ready;
-        
     } CONTROL;
 
+    // Weight matrix dimensions (0x04/0x08). weight_buffer can hold more than
+    // one 32x32 tile's worth of weights; these describe the full extent so
+    // future multi-tile loads know how many tiles to prefetch.
+    //
+    // WEIGHT_ROWS/WEIGHT_COLS name which pe_array axis a dimension loads
+    // into, NOT "row/col of the weight matrix as you'd write it on paper":
+    //   - WEIGHT_ROWS feeds pe_array's ARRAY_ROWS axis, which pe.v's b_in
+    //     cascades down and sums - i.e. WEIGHT_ROWS is the CONTRACTION size.
+    //   - WEIGHT_COLS feeds ARRAY_COLS - values here stay separate (one
+    //     accumulated result per array column) - i.e. the OUTPUT size.
+    // If your weight matrix is conventionally (out_features x in_features),
+    // program WEIGHT_ROWS = in_features and WEIGHT_COLS = out_features,
+    // regardless of which one is literally "rows" in that convention. See
+    // rtl/weight_ctrl.v's header comment for the full reasoning.
+    reg {
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } value [15:0];   // contraction (reduction) dimension size
+    } WEIGHT_ROWS;
 
     reg {
         field {
-            sw = r;    // Read-write
-            hw = w;    // No hardware feedback
+            sw = w;
+            hw = r;
+            reset = 0;
+        } value [15:0];   // output dimension size
+    } WEIGHT_COLS;
+
+    // Input dimensions (0x0C/0x10). No separate row-count register: the
+    // valid row range for the block currently in the array is derived by
+    // weight_ctrl from WEIGHT_ROWS and the current block position, since
+    // weight rows (K) and activation rows share the same array-row extent.
+    reg {
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } value [9:0];    // max input_buffer read address (input_dispatch i_max_addr)
+    } INPUT_MAX_ADDR;
+
+    reg {
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } value [15:0];   // number of columns of the input (activation) matrix
+    } INPUT_COLS;
+
+    // Status Register (0x14)
+    reg {
+        field {
+            sw = r;
+            hw = w;
         } out_ready;
 
         field {
             sw = r;
             hw = w;
         } out_count [16:1];
+
+        field {
+            sw = r;
+            hw = w;
+            reset = 0;
+        } weight_tile_ready;  // one 32x32 tile's worth of weights buffered, ready to prefetch
+
+        field {
+            sw = r;
+            hw = w;
+            reset = 0;
+        } busy;               // compute running (weights loading, streaming, or draining)
+
+        field {
+            sw = r;
+            hw = w;
+            reset = 0;
+        } done;               // all inputs drained and all outputs written
 
     } STATUS;
 };
