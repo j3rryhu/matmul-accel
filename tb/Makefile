@@ -1,9 +1,9 @@
 # cocotb + icarus verilog testbench for accel_top.
 #
 # Buffer-RAM IP (weight_buffer/input_buffer/output_buffer) and FIFO IP
-# (sync_fifo_w8_d16) aren't in this repo - models/ provides simulation-only
+# (sync_fifo_w8_d32) aren't in this repo - models/ provides simulation-only
 # behavioral stand-ins with matching module names/ports (see
-# models/buffer_ram_models.v, models/sync_fifo_w8_d16.v). Swap those two
+# models/buffer_ram_models.v, models/sync_fifo_w8_d32.v). Swap those two
 # files out of VERILOG_SOURCES for the real generated IP once it exists;
 # nothing else needs to change.
 #
@@ -14,7 +14,7 @@
 SIM ?= icarus
 TOPLEVEL_LANG ?= verilog
 
-PWD        := $(CURDIR)
+PWD        := $(shell pwd)
 RTL_DIR    := $(PWD)/../rtl
 RDL_SV_DIR := $(PWD)/../rdl/ctrl_reg.sv
 MODEL_DIR  := $(PWD)/models
@@ -29,13 +29,13 @@ VERILOG_SOURCES += $(RTL_DIR)/pe_array.v
 VERILOG_SOURCES += $(RTL_DIR)/weight_loader.v
 VERILOG_SOURCES += $(RTL_DIR)/weight_ctrl.v
 VERILOG_SOURCES += $(RTL_DIR)/input_dispatch.v
-VERILOG_SOURCES += $(RTL_DIR)/input_buffer_8_bank.v
+VERILOG_SOURCES += $(RTL_DIR)/input_buffer_32_bank.v
 VERILOG_SOURCES += $(RTL_DIR)/output_loader.v
 VERILOG_SOURCES += $(RTL_DIR)/output_buffer_32_bank.v
 VERILOG_SOURCES += $(RTL_DIR)/accel_top.sv
 
 # simulation-only models - see header note above
-VERILOG_SOURCES += $(MODEL_DIR)/sync_fifo_w8_d16.v
+VERILOG_SOURCES += $(MODEL_DIR)/sync_fifo_w8_d32.v
 VERILOG_SOURCES += $(MODEL_DIR)/buffer_ram_models.v
 
 TOPLEVEL = accel_top

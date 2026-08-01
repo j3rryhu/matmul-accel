@@ -76,7 +76,7 @@ module pe #(
         if (!rst_n)
             p_out <= {DATA_WIDTH{1'b0}};
         else
-            p_out <= ($signed(weight_reg) * $signed(a_buf)) + $signed(b_buf);
+            p_out <= ($signed(weight_reg) * $signed(a_in)) + $signed(b_in);
     end
 
 endmodule

@@ -1,7 +1,7 @@
 // output_buffer_32_bank : 32 independent output_buffer banks, one per
-// pe_array column - mirrors input_buffer_8_bank's split-address-space
+// pe_array column - mirrors input_buffer_32_bank's split-address-space
 // pattern, but output_loader needs independent read+write per bank
-// (read-modify-write accumulation) rather than input_buffer_8_bank's
+// (read-modify-write accumulation) rather than input_buffer_32_bank's
 // single shared read address, so each bank gets its own full port here.
 //
 // output_loader drives every bank's read+write directly (bank_r*/bank_w*
@@ -15,7 +15,7 @@
 // wins while busy, the Avalon-derived address wins once idle.
 //
 // ext_rdaddress is a single linear address split the same way
-// input_buffer_8_bank's write address is: upper bits pick the bank,
+// input_buffer_32_bank's write address is: upper bits pick the bank,
 // low bits are the offset within it.
 `timescale 1ps/1ps
 

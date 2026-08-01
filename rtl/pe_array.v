@@ -49,20 +49,29 @@ module pe_array #(
                 wire [DATA_WIDTH-1:0] pe_b_in;
                 wire [DATA_WIDTH-1:0] pe_a_out;
                 wire [DATA_WIDTH-1:0] pe_p_out;
+                wire                  pe_a_en;
+                reg                   pe_a_en_d;
 
                 // this PE's prefetch reg is written when the incoming
                 // address matches its flat index and w_en is asserted
                 wire pe_w_en = w_en && (w_addr == (r*ARRAY_COLS+c));
 
-                if (c == 0)
-                    assign pe_a_in = a_in[(r+1)*DATA_WIDTH-1 -: DATA_WIDTH];
-                else
-                    assign pe_a_in = ROW[r].COL[c-1].pe_a_out;
-
                 if (r == 0)
+                    assign pe_a_in = a_in[(c+1)*DATA_WIDTH-1 -: DATA_WIDTH];
+                else
+                    assign pe_a_in = ROW[r-1].COL[c].pe_a_out;
+
+                if (c == 0)
                     assign pe_b_in = {DATA_WIDTH{1'b0}};
                 else
-                    assign pe_b_in = ROW[r-1].COL[c].pe_p_out;
+                    assign pe_b_in = ROW[r].COL[c-1].pe_p_out;
+                
+                assign pe_a_en = (r == 0) ? a_en[c] : pe_a_en_d;
+
+                always@(posedge clk)begin
+                    if(r > 0)
+                        pe_a_en_d <= ROW[r-1].COL[c].pe_a_en;
+                end
 
                 pe #(
                     .DATA_WIDTH (DATA_WIDTH)
@@ -70,9 +79,9 @@ module pe_array #(
                     .clk     (clk),
                     .rst_n   (rst_n),
                     .a_in    (pe_a_in),
-                    .a_en    (a_en[r]),
+                    .a_en    (pe_a_en),
                     .b_in    (pe_b_in),
-                    .b_en    (b_en[c]),
+                    .b_en    (b_en[r]),
                     .w_in    (w_data),
                     .w_en    (pe_w_en),
                     .w_load  (w_load),
@@ -81,10 +90,10 @@ module pe_array #(
                 );
 
                 if (c == ARRAY_COLS-1)
-                    assign a_out[(r+1)*DATA_WIDTH-1 -: DATA_WIDTH] = pe_a_out;
+                    assign p_out[(r+1)*DATA_WIDTH-1 -: DATA_WIDTH] = pe_p_out;
 
                 if (r == ARRAY_ROWS-1)
-                    assign p_out[(c+1)*DATA_WIDTH-1 -: DATA_WIDTH] = pe_p_out;
+                    assign a_out[(c+1)*DATA_WIDTH-1 -: DATA_WIDTH] = pe_a_out;
 
             end
         end

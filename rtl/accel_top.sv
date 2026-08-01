@@ -89,11 +89,11 @@ module accel_top #(
     wire [12:0] ibuf_wraddress = (avs_address - IBUF_BASE);
     wire [7:0]  ibuf_wdata     = be_select_byte(avs_writedata, avs_byteenable);
 
-    wire [63:0] ibuf_q;
-    wire [9:0]  ibuf_rdaddress;
+    wire [255:0] ibuf_q;
+    wire [7:0]  ibuf_rdaddress;
     wire        ibuf_rden;
 
-    input_buffer_8_bank u_input_buffer (
+    input_buffer_32_bank u_input_buffer (
         .clock     (clk),
         .data      (ibuf_wdata),
         .rdaddress (ibuf_rdaddress),
@@ -165,6 +165,23 @@ module accel_top #(
     wire [9:0]  input_max_addr;        // max input_buffer read address
     wire [15:0] input_cols;            // number of columns of the input (activation) matrix
     wire        weight_ctrl_busy;      // weight_ctrl/weight_loader busy, for STATUS.busy
+    wire        weight_ctrl_done;      // level: last block committed and its input band fully streamed in
+
+    // STATUS.busy: weight/input side sequencing OR output_loader still
+    // draining the last block's psums (weight_ctrl_done can go high a few
+    // pipeline cycles before output_loader finishes writing that block's
+    // results - see output_loader.v's header note on drain latency).
+    wire        matmul_busy = weight_ctrl_busy || output_loader_busy;
+
+    // STATUS.done: weight_ctrl_done only means every block has been
+    // *committed* (weight_ctrl.v's WC_DONE) - output_loader.done pulses
+    // per committed block, not once for the whole matmul (see
+    // output_loader.v), so the real "whole matmul done" level is
+    // weight_ctrl_done still held true once output_loader has also gone
+    // idle (i.e. the last block's drain has finished). Both sides are
+    // levels, so this stays high until the next matmul_start drops
+    // weight_ctrl_done again - safe for software to poll at any time.
+    wire        matmul_done = weight_ctrl_done && !output_loader_busy;
 
     ctrl_rf_rf #(
         .ADDR_OFFSET (CTRL_BASE),
@@ -181,11 +198,8 @@ module accel_top #(
         .INPUT_MAX_ADDR_value_q  (input_max_addr),
         .INPUT_COLS_value_q      (input_cols),  // TODO: drive compute datapath (not yet consumed by input_dispatch)
 
-        .STATUS_out_ready_wdata         (1'b0),   // TODO: drive from compute datapath
-        .STATUS_out_count_wdata        (16'b0),   // TODO: drive from compute datapath
-        .STATUS_weight_tile_ready_wdata (1'b0),   // TODO: drive from compute datapath
-        .STATUS_busy_wdata              (1'b0), // TODO: OR in activation streaming/drain busy once wired
-        .STATUS_done_wdata              (1'b0),   // TODO: drive from compute datapath
+        .STATUS_busy_wdata              (matmul_busy),
+        .STATUS_done_wdata              (matmul_done),
 
         .valid  (ctrl_valid),
         .read   (avs_read),
@@ -208,15 +222,13 @@ module accel_top #(
     wire [ARRAY_ROWS*PE_DATA_WIDTH-1:0] a_out;
     wire [ARRAY_ROWS-1:0]               a_en;
 
-    wire [9:0] input_band_base_addr;  // weight_ctrl -> input_dispatch: current block's band base address
+    wire [7:0] input_band_base_addr;  // weight_ctrl -> input_dispatch: current block's per-bank base offset
     wire       input_band_start;      // weight_ctrl -> input_dispatch: pulse, begin preloading that band
     wire       input_compute_start;   // weight_ctrl -> input_dispatch: pulse, begin streaming into pe_array
     wire       input_fifos_primed;    // input_dispatch -> weight_ctrl: all row FIFOs hold >=1 element
     wire       input_band_done;       // input_dispatch -> weight_ctrl: current band fully drained
 
     input_dispatch #(
-        .NUM_BANKS  (8),
-        .BANK_WIDTH (8),
         .ARRAY_ROWS (ARRAY_ROWS),
         .DATA_WIDTH (PE_DATA_WIDTH)
     ) u_input_dispatch (
@@ -230,9 +242,8 @@ module accel_top #(
         .a_out          (a_out),
         .a_en           (a_en),
 
-        .i_max_addr       (input_max_addr),
+        .i_max_addr       (input_max_addr[7:0]),
         .i_band_base_addr (input_band_base_addr),
-        .i_input_cols     (input_cols[9:0]),
         .i_band_start     (input_band_start),
         .i_start_compute  (input_compute_start),
         .fifos_primed     (input_fifos_primed),
@@ -258,7 +269,7 @@ module accel_top #(
         .ARRAY_ROWS      (ARRAY_ROWS),
         .ARRAY_COLS      (ARRAY_COLS),
         .WBUF_ADDR_WIDTH (14),
-        .IBUF_ADDR_WIDTH (10),
+        .IBUF_ADDR_WIDTH (8),
         .DIM_WIDTH       (16)
     ) u_weight_ctrl (
         .clk               (clk),
@@ -269,7 +280,7 @@ module accel_top #(
         .weight_cols       (weight_cols),
 
         .busy              (weight_ctrl_busy),
-        .done              (),
+        .done              (weight_ctrl_done),
 
         .wbuf_rden         (wbuf_rden),
         .wbuf_rdaddress    (wbuf_rdaddress),
@@ -280,7 +291,7 @@ module accel_top #(
         .w_en              (w_en),
         .w_load            (w_load),
 
-        .input_max_addr       (input_max_addr),
+        .input_max_addr       (input_max_addr[7:0]),
         .input_band_start     (input_band_start),
         .input_band_base_addr (input_band_base_addr),
         .input_compute_start  (input_compute_start),
@@ -311,7 +322,7 @@ module accel_top #(
         .p_in  (pe_p_out),
         .b_en  (pe_b_en),
 
-        .a_en0                 (a_en[0]),
+        .a_en_last             (a_en[ARRAY_COLS-1]),
         .total_rows            (input_cols[OBUF_BANK_ADDR_WIDTH-1:0]),
         .committed_n_blk_idx   (committed_n_blk_idx),
         .committed_first_k_blk (committed_first_k_blk),

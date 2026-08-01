@@ -72,9 +72,4 @@ end
 assign full = (count > num_bytes - num_bytes_per_wr)? 1 : 0;
 assign empty = (count < num_bytes_per_rd)? 1 : 0;
 
-// linting
-always@(*)begin
-	if(|FIFO_RD_DEPTH);
-end
-
 endmodule

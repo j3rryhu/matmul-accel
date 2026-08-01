@@ -46,7 +46,7 @@ module weight_ctrl #(
     parameter ARRAY_ROWS      = 32,
     parameter ARRAY_COLS      = 32,
     parameter WBUF_ADDR_WIDTH = 14,
-    parameter IBUF_ADDR_WIDTH = 10,   // input_buffer address width (input_dispatch)
+    parameter IBUF_ADDR_WIDTH = 8,    // input_buffer per-bank address width (input_dispatch)
     parameter DIM_WIDTH       = 16    // WEIGHT_ROWS/WEIGHT_COLS field width
 )(
     input                        clk,

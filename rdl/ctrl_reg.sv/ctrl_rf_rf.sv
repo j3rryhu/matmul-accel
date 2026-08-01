@@ -24,9 +24,6 @@ module ctrl_rf_rf #(
     output logic                     [15: 0] INPUT_COLS_value_q,              //! Current field value
 
     // Register STATUS
-    input  logic                     [ 0: 0] STATUS_out_ready_wdata,          //! HW write data
-    input  logic                     [15: 0] STATUS_out_count_wdata,          //! HW write data
-    input  logic                     [ 0: 0] STATUS_weight_tile_ready_wdata,          //! HW write data
     input  logic                     [ 0: 0] STATUS_busy_wdata,          //! HW write data
     input  logic                     [ 0: 0] STATUS_done_wdata,          //! HW write data
 
@@ -64,21 +61,6 @@ module ctrl_rf_rf #(
     logic                             INPUT_COLS_value_anded;
     logic                             INPUT_COLS_value_ored;
     logic                             INPUT_COLS_value_xored;
-    logic                           [ 0: 0] STATUS_out_ready_q;
-    logic                           [ 0: 0] STATUS_out_ready_next;
-    logic                             STATUS_out_ready_anded;
-    logic                             STATUS_out_ready_ored;
-    logic                             STATUS_out_ready_xored;
-    logic                           [15: 0] STATUS_out_count_q;
-    logic                           [15: 0] STATUS_out_count_next;
-    logic                             STATUS_out_count_anded;
-    logic                             STATUS_out_count_ored;
-    logic                             STATUS_out_count_xored;
-    logic                           [ 0: 0] STATUS_weight_tile_ready_q;
-    logic                           [ 0: 0] STATUS_weight_tile_ready_next;
-    logic                             STATUS_weight_tile_ready_anded;
-    logic                             STATUS_weight_tile_ready_ored;
-    logic                             STATUS_weight_tile_ready_xored;
     logic                           [ 0: 0] STATUS_busy_q;
     logic                           [ 0: 0] STATUS_busy_next;
     logic                             STATUS_busy_anded;
@@ -349,11 +331,8 @@ module ctrl_rf_rf #(
         
     // ============================================================
     // Register: STATUS
-    //    [ 0: 0]            out_ready: hw=w     sw=r     reset=0x0
-    //    [16: 1]            out_count: hw=w     sw=r     reset=0x0
-    //    [17:17]    weight_tile_ready: hw=w     sw=r     reset=0x0
-    //    [18:18]                 busy: hw=w     sw=r     reset=0x0
-    //    [19:19]                 done: hw=w     sw=r     reset=0x0
+    //    [ 0: 0]                 busy: hw=w     sw=r     reset=0x0
+    //    [ 1: 1]                 done: hw=w     sw=r     reset=0x0
     // ============================================================
     logic                  STATUS_decode;
     logic                  STATUS_sw_wr;
@@ -366,48 +345,12 @@ module ctrl_rf_rf #(
 
     always_comb begin
         STATUS_q = '0;
-        STATUS_q[ 0: 0] = STATUS_out_ready_q;
-        STATUS_q[16: 1] = STATUS_out_count_q;
-        STATUS_q[17:17] = STATUS_weight_tile_ready_q;
-        STATUS_q[18:18] = STATUS_busy_q;
-        STATUS_q[19:19] = STATUS_done_q;
+        STATUS_q[ 0: 0] = STATUS_busy_q;
+        STATUS_q[ 1: 1] = STATUS_done_q;
     end
 
     // masked version of return data
     assign STATUS_rdata = STATUS_sw_rd ? STATUS_q : 'b0;
-
-    // ------------------------------------------------------------
-    // Field: out_ready (wire)
-    // ------------------------------------------------------------
-    assign STATUS_out_ready_anded = & STATUS_out_ready_q;
-    assign STATUS_out_ready_ored  = | STATUS_out_ready_q;
-    assign STATUS_out_ready_xored = ^ STATUS_out_ready_q;
-
-    // next hardware value
-    assign STATUS_out_ready_next = STATUS_out_ready_wdata;
-    assign STATUS_out_ready_q = STATUS_out_ready_next;
-
-    // ------------------------------------------------------------
-    // Field: out_count (wire)
-    // ------------------------------------------------------------
-    assign STATUS_out_count_anded = & STATUS_out_count_q;
-    assign STATUS_out_count_ored  = | STATUS_out_count_q;
-    assign STATUS_out_count_xored = ^ STATUS_out_count_q;
-
-    // next hardware value
-    assign STATUS_out_count_next = STATUS_out_count_wdata;
-    assign STATUS_out_count_q = STATUS_out_count_next;
-
-    // ------------------------------------------------------------
-    // Field: weight_tile_ready (wire)
-    // ------------------------------------------------------------
-    assign STATUS_weight_tile_ready_anded = & STATUS_weight_tile_ready_q;
-    assign STATUS_weight_tile_ready_ored  = | STATUS_weight_tile_ready_q;
-    assign STATUS_weight_tile_ready_xored = ^ STATUS_weight_tile_ready_q;
-
-    // next hardware value
-    assign STATUS_weight_tile_ready_next = STATUS_weight_tile_ready_wdata;
-    assign STATUS_weight_tile_ready_q = STATUS_weight_tile_ready_next;
 
     // ------------------------------------------------------------
     // Field: busy (wire)

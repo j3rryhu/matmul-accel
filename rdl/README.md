@@ -10,12 +10,9 @@ at `CTRL_BASE = 0x0000_0000`, size `0x100` (see `rtl/accel_top.sv`).
 | 0x04   | WEIGHT_ROWS     | `value`               | [15:0] | sw=w   | Contraction (reduction) dimension size - feeds pe_array's `ARRAY_ROWS` axis, which `pe.v`'s `b_in` cascade sums. Not "rows of the weight matrix on paper" - see note below. |
 | 0x08   | WEIGHT_COLS     | `value`               | [15:0] | sw=w   | Output dimension size - feeds `ARRAY_COLS`; values here stay separate (one result per array column). |
 | 0x0C   | INPUT_MAX_ADDR  | `value`               | [9:0]  | sw=w   | Max `input_buffer` read address, fed to `input_dispatch.i_max_addr`. |
-| 0x10   | INPUT_COLS      | `value`               | [15:0] | sw=w   | Number of columns of the input (activation) matrix. Not yet consumed downstream - see Status below. |
-| 0x14   | STATUS          | `out_ready`           | [0]    | sw=r, hw=w | An output result is available to read. |
-|        |                 | `out_count`           | [16:1] | sw=r, hw=w | Number of output rows written so far. |
-|        |                 | `weight_tile_ready`   | [17]   | sw=r, hw=w | One 32x32 tile's worth of weights has been buffered - ready to prefetch. |
-|        |                 | `busy`                | [18]   | sw=r, hw=w | Compute running (loading weights, streaming, or draining). |
-|        |                 | `done`                | [19]   | sw=r, hw=w | All inputs drained and all outputs written. |
+| 0x10   | INPUT_COLS      | `value`               | [15:0] | sw=w   | Number of columns of the input (activation) matrix. Feeds `output_loader.total_rows`. |
+| 0x14   | STATUS          | `busy`                | [0]    | sw=r, hw=w | Compute running (loading weights, streaming, or draining). |
+|        |                 | `done`                | [1]    | sw=r, hw=w | Whole matmul finished: every block committed and drained into `output_buffer`. |
 
 Bit positions above 0 for multi-bit/later fields are assigned automatically
 by PeakRDL in declaration order; re-check `ctrl_rf_rf.sv` after regenerating
@@ -55,14 +52,19 @@ activation rows share the same array-row extent.
 
 ## Status
 
-`CONTROL` (`matmul_start` only), `WEIGHT_ROWS`, `WEIGHT_COLS`,
-`INPUT_MAX_ADDR`, and `INPUT_COLS` are wired up in `rtl/accel_top.sv`, and
-`weight_ctrl` fully drives `input_dispatch`'s preload/compute-start
-handshake (`i_band_start`/`i_start_compute`/`fifos_primed`/`band_done`) -
-no software pulses needed once `matmul_start` fires. `INPUT_COLS` feeds
-`input_dispatch`'s row-major address stride but isn't otherwise consumed
-yet. Still TODO: the byte-counter logic that computes `weight_tile_ready`,
-`output_loader` (partial-sum -> `output_buffer`), multi-block output
-accumulation (when the contraction dimension needs more than one 32-block
-pass), and folding activation streaming/drain busy into
-`STATUS.busy`/`STATUS.done`.
+Everything in the table is wired up in `rtl/accel_top.sv`: `weight_ctrl`
+fully drives `input_dispatch`'s preload/compute-start handshake
+(`i_band_start`/`i_start_compute`/`fifos_primed`/`band_done`) and
+`output_loader`'s read-modify-write into `output_buffer_32_bank` - no
+software pulses needed once `matmul_start` fires. `STATUS.busy` is
+`weight_ctrl`'s own busy OR'd with `output_loader`'s busy (so it stays set
+through the last block's drain, after `weight_ctrl` itself has finished
+sequencing). `STATUS.done` is `weight_ctrl`'s `done` (every block
+committed) held until `output_loader` also goes idle - `output_loader`'s
+own `done` pulses once *per committed block*, not once for the whole
+matmul, so `STATUS.done` can't be wired to it directly. Both are levels
+that stay valid until the next `matmul_start`, safe to poll at any time.
+
+Still TODO: multi-block output accumulation (when the contraction
+dimension needs more than one 32-block pass) hasn't been exercised by a
+test yet.

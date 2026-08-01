@@ -165,108 +165,45 @@ int main(int argc, char** argv) {
     }
     cycle(top);
     cycle(top);
-    std::cout << main_time << ": Testcase (STATUS_out_ready ):\n";
+    std::cout << main_time << ": Testcase (STATUS_busy ):\n";
     std::cout << main_time << ": \tHardware write test\n";
     for (int IDX = 0; IDX <= 0; ++IDX) {
 
-        HW_WRITE_WE( STATUS_out_ready, , (1 << (IDX-0)) )
-        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_out_ready_q, (1 << (IDX-0)))
+        HW_WRITE_WE( STATUS_busy, , (1 << (IDX-0)) )
+        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_busy_q, (1 << (IDX-0)))
 
-        HW_WRITE_WE( STATUS_out_ready, , 0 )
-        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_out_ready_q, 0)
+        HW_WRITE_WE( STATUS_busy, , 0 )
+        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_busy_q, 0)
     }
     std::cout << main_time << ": \tSoftware read test\n";
     for (int IDX = 0; IDX <= 0; ++IDX) {
 
-        top->ctrl_rf_rf__DOT__STATUS_out_ready_q = (1 << (IDX-0));
-        HW_WRITE( STATUS_out_ready, , (1 << (IDX-0)) )
+        top->ctrl_rf_rf__DOT__STATUS_busy_q = (1 << (IDX-0));
+        HW_WRITE( STATUS_busy, , (1 << (IDX-0)) )
         cycle(top);
         SW_READ( 20 )
         CHECK_EQUAL(RANGE(rdata, 1, 0), (1 << (IDX-0)))
     }
     cycle(top);
     cycle(top);
-    std::cout << main_time << ": Testcase (STATUS_out_count ):\n";
-    std::cout << main_time << ": \tHardware write test\n";
-    for (int IDX = 1; IDX <= 16; ++IDX) {
-
-        HW_WRITE_WE( STATUS_out_count, , (1 << (IDX-1)) )
-        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_out_count_q, (1 << (IDX-1)))
-
-        HW_WRITE_WE( STATUS_out_count, , 0 )
-        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_out_count_q, 0)
-    }
-    std::cout << main_time << ": \tSoftware read test\n";
-    for (int IDX = 1; IDX <= 16; ++IDX) {
-
-        top->ctrl_rf_rf__DOT__STATUS_out_count_q = (1 << (IDX-1));
-        HW_WRITE( STATUS_out_count, , (1 << (IDX-1)) )
-        cycle(top);
-        SW_READ( 20 )
-        CHECK_EQUAL(RANGE(rdata, 16, 1), (1 << (IDX-1)))
-    }
-    cycle(top);
-    cycle(top);
-    std::cout << main_time << ": Testcase (STATUS_weight_tile_ready ):\n";
-    std::cout << main_time << ": \tHardware write test\n";
-    for (int IDX = 17; IDX <= 17; ++IDX) {
-
-        HW_WRITE_WE( STATUS_weight_tile_ready, , (1 << (IDX-17)) )
-        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_weight_tile_ready_q, (1 << (IDX-17)))
-
-        HW_WRITE_WE( STATUS_weight_tile_ready, , 0 )
-        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_weight_tile_ready_q, 0)
-    }
-    std::cout << main_time << ": \tSoftware read test\n";
-    for (int IDX = 17; IDX <= 17; ++IDX) {
-
-        top->ctrl_rf_rf__DOT__STATUS_weight_tile_ready_q = (1 << (IDX-17));
-        HW_WRITE( STATUS_weight_tile_ready, , (1 << (IDX-17)) )
-        cycle(top);
-        SW_READ( 20 )
-        CHECK_EQUAL(RANGE(rdata, 1, 17), (1 << (IDX-17)))
-    }
-    cycle(top);
-    cycle(top);
-    std::cout << main_time << ": Testcase (STATUS_busy ):\n";
-    std::cout << main_time << ": \tHardware write test\n";
-    for (int IDX = 18; IDX <= 18; ++IDX) {
-
-        HW_WRITE_WE( STATUS_busy, , (1 << (IDX-18)) )
-        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_busy_q, (1 << (IDX-18)))
-
-        HW_WRITE_WE( STATUS_busy, , 0 )
-        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_busy_q, 0)
-    }
-    std::cout << main_time << ": \tSoftware read test\n";
-    for (int IDX = 18; IDX <= 18; ++IDX) {
-
-        top->ctrl_rf_rf__DOT__STATUS_busy_q = (1 << (IDX-18));
-        HW_WRITE( STATUS_busy, , (1 << (IDX-18)) )
-        cycle(top);
-        SW_READ( 20 )
-        CHECK_EQUAL(RANGE(rdata, 1, 18), (1 << (IDX-18)))
-    }
-    cycle(top);
-    cycle(top);
     std::cout << main_time << ": Testcase (STATUS_done ):\n";
     std::cout << main_time << ": \tHardware write test\n";
-    for (int IDX = 19; IDX <= 19; ++IDX) {
+    for (int IDX = 1; IDX <= 1; ++IDX) {
 
-        HW_WRITE_WE( STATUS_done, , (1 << (IDX-19)) )
-        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_done_q, (1 << (IDX-19)))
+        HW_WRITE_WE( STATUS_done, , (1 << (IDX-1)) )
+        CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_done_q, (1 << (IDX-1)))
 
         HW_WRITE_WE( STATUS_done, , 0 )
         CHECK_EQUAL(top->ctrl_rf_rf__DOT__STATUS_done_q, 0)
     }
     std::cout << main_time << ": \tSoftware read test\n";
-    for (int IDX = 19; IDX <= 19; ++IDX) {
+    for (int IDX = 1; IDX <= 1; ++IDX) {
 
-        top->ctrl_rf_rf__DOT__STATUS_done_q = (1 << (IDX-19));
-        HW_WRITE( STATUS_done, , (1 << (IDX-19)) )
+        top->ctrl_rf_rf__DOT__STATUS_done_q = (1 << (IDX-1));
+        HW_WRITE( STATUS_done, , (1 << (IDX-1)) )
         cycle(top);
         SW_READ( 20 )
-        CHECK_EQUAL(RANGE(rdata, 1, 19), (1 << (IDX-19)))
+        CHECK_EQUAL(RANGE(rdata, 1, 1), (1 << (IDX-1)))
     }
 
     cycle(top);

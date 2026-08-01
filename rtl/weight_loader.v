@@ -162,14 +162,14 @@ module weight_loader #(
         end
         else begin
             rd_issued_d <= (wload_state == STATE_PRELOAD);
-            rd_valid_d  <= elem_valid;
-            rd_addr_d   <= cur_row*ARRAY_COLS + cur_col;
+            rd_valid_d  <= wbuf_rden;
+            rd_addr_d   <= wbuf_rdaddress;
         end
     end
 
     assign w_addr = rd_addr_d;
     assign w_data = rd_valid_d ? wbuf_q : {DATA_WIDTH{1'b0}};
-    assign w_en   = rd_issued_d;
+    assign w_en   = rd_valid_d;
     assign w_load = commit && (wload_state == STATE_READY);
 
 endmodule

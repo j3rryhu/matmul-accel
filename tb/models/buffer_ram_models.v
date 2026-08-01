@@ -1,5 +1,5 @@
 // Simulation-only behavioral stand-ins for the buffer-RAM IP referenced by
-// rtl/accel_top.sv, rtl/input_buffer_8_bank.v, and rtl/output_buffer_32_bank.v
+// rtl/accel_top.sv, rtl/input_buffer_32_bank.v, and rtl/output_buffer_32_bank.v
 // (weight_buffer, input_buffer, output_buffer). Each is a plain flop array:
 // synchronous write, registered (1-cycle-latency) read - matching the
 // "synchronous on-chip RAM" assumption documented throughout weight_ctrl.v/
@@ -68,8 +68,8 @@ endmodule
 // weight_buffer: WBUF_SIZE=0x4000 (16384 bytes), 14-bit address
 `DEFINE_BUFFER_RAM(weight_buffer, 14)
 
-// input_buffer: one bank of input_buffer_8_bank, 1024 bytes/bank, 10-bit address
-`DEFINE_BUFFER_RAM(input_buffer, 10)
+// input_buffer: one bank of input_buffer_32_bank, 256 bytes/bank, 8-bit address
+`DEFINE_BUFFER_RAM(input_buffer, 8)
 
 // output_buffer: one bank of output_buffer_32_bank, 128 bytes/bank, 7-bit address
 `DEFINE_BUFFER_RAM(output_buffer, 7)

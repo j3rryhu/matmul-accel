@@ -70,22 +70,6 @@ addrmap ctrl_rf {
         field {
             sw = r;
             hw = w;
-        } out_ready;
-
-        field {
-            sw = r;
-            hw = w;
-        } out_count [16:1];
-
-        field {
-            sw = r;
-            hw = w;
-            reset = 0;
-        } weight_tile_ready;  // one 32x32 tile's worth of weights buffered, ready to prefetch
-
-        field {
-            sw = r;
-            hw = w;
             reset = 0;
         } busy;               // compute running (weights loading, streaming, or draining)
 
@@ -93,7 +77,7 @@ addrmap ctrl_rf {
             sw = r;
             hw = w;
             reset = 0;
-        } done;               // all inputs drained and all outputs written
+        } done;               // whole matmul finished: all blocks committed and drained
 
     } STATUS;
 };

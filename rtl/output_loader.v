@@ -1,6 +1,6 @@
 // output_loader : accumulates pe_array's partial sums into output_buffer,
 // which is banked one bank per array column (ARRAY_COLS banks total) -
-// mirrors input_buffer_8_bank's banking pattern on the input side, scaled
+// mirrors input_buffer_32_bank's banking pattern on the input side, scaled
 // to ARRAY_COLS so every column that's currently producing a real result
 // can be read-modify-written the same cycle it arrives, with no elastic
 // buffering or backpressure required.
@@ -23,11 +23,11 @@
 // otherwise stale/uninitialized and gets written directly instead.
 // weight_ctrl's committed_n_blk_idx/committed_first_k_blk (latched at
 // commit, valid for that block's whole compute+drain window) tell us
-// which case we're in; this module samples them once, at its own a_en0
+// which case we're in; this module samples them once, at its own a_en_last
 // start edge, and holds them for the rest of that block's drain - by
 // construction weight_ctrl's *next* commit (which would advance those
 // signals) can't happen until this block's input band has finished
-// draining, which is always after this block's a_en0 has already risen,
+// draining, which is always after this block's a_en_last has already risen,
 // so the sampled copies are never overwritten out from under an
 // in-progress drain.
 //
@@ -57,9 +57,9 @@
 //     addressed by its own free-running counter (0..total_rows-1) - no
 //     need to realign columns to a shared row index.
 //
-// a_en0 is row 0's a_en bit (pe_array a_en[0] / input_dispatch a_en[0]);
+// a_en_last is row 0's a_en bit (pe_array a_en[0] / input_dispatch a_en[0]);
 // only its first rising edge after reset/completion is used to anchor
-// timing, so later gaps in a_en0 (e.g. input FIFO underrun) don't
+// timing, so later gaps in a_en_last (e.g. input FIFO underrun) don't
 // re-trigger the sequence.
 `timescale 1ps/1ps
 
@@ -77,7 +77,7 @@ module output_loader #(
     output     [ARRAY_COLS-1:0]                    b_en,        // pe_array b_en
 
     // ---- timing anchor + block identity (from weight_ctrl) ----
-    input                                           a_en0,                 // pe_array a_en[0]
+    input                                           a_en_last,                 // pe_array a_en[0]
     input      [ROW_ADDR_WIDTH-1:0]                 total_rows,            // M: expected valid results per column, per pass
     input      [DIM_WIDTH-1:0]                      committed_n_blk_idx,   // weight_ctrl: output block this pass belongs to
     input                                            committed_first_k_blk, // weight_ctrl: write instead of accumulate
@@ -94,12 +94,11 @@ module output_loader #(
     output                                          done
 );
 
-    localparam LATENCY     = ARRAY_COLS - 1;               // cycles: a_en0 rise -> column 0 live
-    localparam ELAPSED_MAX = LATENCY + ARRAY_COLS - 1;      // cycles: a_en0 rise -> last column live
+    localparam ELAPSED_MAX = ARRAY_COLS - 1;      
     localparam ELAPSED_W   = $clog2(ELAPSED_MAX + 1);
 
-    reg                     armed;      // ready to latch the next a_en0 rising edge
-    reg                     a_en0_d;
+    reg                     armed;      // ready to latch the next a_en_last rising edge
+    reg                     a_en_last_d;
     reg                     running;
     reg [ELAPSED_W-1:0]     elapsed;
 
@@ -110,13 +109,13 @@ module output_loader #(
     reg [DIM_WIDTH-1:0] held_n_blk_idx;
     reg                 held_first_k_blk;
 
-    wire start_edge = armed && a_en0 && !a_en0_d;
+    wire start_edge = armed && a_en_last && !a_en_last_d;
 
     always @(posedge clock) begin
         if (~rst_n)
-            a_en0_d <= 1'b0;
+            a_en_last_d <= 1'b0;
         else
-            a_en0_d <= a_en0;
+            a_en_last_d <= a_en_last;
     end
 
     always @(posedge clock) begin
@@ -127,20 +126,22 @@ module output_loader #(
             held_n_blk_idx   <= '0;
             held_first_k_blk <= 1'b0;
         end
-        else if (start_edge) begin
-            armed            <= 1'b0;
-            running          <= 1'b1;
-            elapsed          <= {ELAPSED_W{1'b0}};
-            held_n_blk_idx   <= committed_n_blk_idx;
-            held_first_k_blk <= committed_first_k_blk;
-        end
-        else if (running) begin
-            if (elapsed < ELAPSED_MAX)
-                elapsed <= elapsed + 1'b1;
+        else begin
+            if (a_en_last) begin
+                armed            <= 1'b0;
+                running          <= 1'b1;
+                elapsed          <= {ELAPSED_W{1'b0}};
+                held_n_blk_idx   <= committed_n_blk_idx;
+                held_first_k_blk <= committed_first_k_blk;
+            end
+            if (running) begin
+                if (elapsed < ELAPSED_MAX)
+                    elapsed <= elapsed + 1'b1;
 
-            if (done) begin
-                running <= 1'b0;
-                armed   <= 1'b1;
+                if (done) begin
+                    running <= 1'b0;
+                    armed   <= 1'b1;
+                end
             end
         end
     end
@@ -151,16 +152,16 @@ module output_loader #(
     genvar c;
     generate
         for (c = 0; c < ARRAY_COLS; c = c + 1) begin : COL
-            wire col_live   = running && (elapsed >= (LATENCY + c));
+            wire col_live   = running && elapsed >= c;
             wire col_active = col_live && (col_count[c] < total_rows);
 
             always @(posedge clock) begin
                 if (~rst_n)
                     col_count[c] <= {ROW_ADDR_WIDTH{1'b0}};
-                else if (start_edge)
-                    col_count[c] <= {ROW_ADDR_WIDTH{1'b0}};
                 else if (col_active)
                     col_count[c] <= col_count[c] + 1'b1;
+                else if (&col_done)
+                    col_count[c] <= 0;
             end
 
             assign col_done[c] = (col_count[c] == total_rows);
@@ -177,7 +178,9 @@ module output_loader #(
             // synchronous read latency) lines up with the psum it should
             // be added to
             reg                      active_d;
+            reg                      active_2d;
             reg [ROW_ADDR_WIDTH-1:0] addr_d;
+            reg [ROW_ADDR_WIDTH-1:0] addr_2d;
             reg [DATA_WIDTH-1:0]     psum_d;
 
             always @(posedge clock) begin
@@ -190,6 +193,9 @@ module output_loader #(
                     active_d <= col_active;
                     addr_d   <= cur_addr;
                     psum_d   <= p_in[c*DATA_WIDTH +: DATA_WIDTH];
+
+                    addr_2d  <= addr_d;
+                    active_2d <= active_d;
                 end
             end
 
