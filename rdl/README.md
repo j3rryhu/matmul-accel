@@ -13,6 +13,7 @@ at `CTRL_BASE = 0x0000_0000`, size `0x100` (see `rtl/accel_top.sv`).
 | 0x10   | INPUT_COLS      | `value`               | [15:0] | sw=w   | Number of columns of the input (activation) matrix. Feeds `output_loader.total_rows`. |
 | 0x14   | STATUS          | `busy`                | [0]    | sw=r, hw=w | Compute running (loading weights, streaming, or draining). |
 |        |                 | `done`                | [1]    | sw=r, hw=w | Whole matmul finished: every block committed and drained into `output_buffer`. |
+| 0x18   | OUTPUT_SCALE    | `value`               | [15:0] | sw=w   | Q0.16 fixed point (unsigned, 0 integer + 16 fractional bits, range `[0,1)` - actual scale is `value/65536`). Rescales `pe_array`'s 32-bit accumulator (`ACC_WIDTH`, see `pe.v`) back down to int8 under the quantization scheme this array targets: `output_loader` multiplies each arriving psum by this factor, arithmetic-shifts right by 16, and saturates to `[-128,127]` before writing `output_buffer` (see `output_loader.v`). |
 
 Bit positions above 0 for multi-bit/later fields are assigned automatically
 by PeakRDL in declaration order; re-check `ctrl_rf_rf.sv` after regenerating
@@ -67,4 +68,6 @@ that stay valid until the next `matmul_start`, safe to poll at any time.
 
 Still TODO: multi-block output accumulation (when the contraction
 dimension needs more than one 32-block pass) hasn't been exercised by a
-test yet.
+test yet - the k-block accumulate add now also saturates to `[-128,127]`
+(see `output_loader.v`), so repeated accumulation compounds requantization
+error across k-blocks; this hasn't been evaluated for accuracy either.

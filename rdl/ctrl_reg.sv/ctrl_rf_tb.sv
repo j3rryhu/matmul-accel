@@ -68,6 +68,9 @@ module ctrl_rf_tb #(
     logic                             STATUS_done_wel;
     logic                     [ 1: 1] STATUS_done_wdata;
 
+    // Register OUTPUT_SCALE
+    logic                     [15: 0] OUTPUT_SCALE_value_q;
+
     // Register Bus
     logic                             valid;    // active high
     logic                             read;     // indicates request is a read
@@ -222,6 +225,23 @@ module ctrl_rf_tb #(
             `HW_WRITE( STATUS_done, , 0 )
             `SW_READ( 20 )
             `CHECK_EQUAL(rdata[ 1: 1], 0)
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (OUTPUT_SCALE_value ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 0; IDX <= 15; ++IDX) begin
+
+            temp = '0;
+            temp[15: 0] = OUTPUT_SCALE_value_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 24, (1 << IDX) )
+            #1 `CHECK_EQUAL(OUTPUT_SCALE_value_q, temp[15: 0])
+
+            `SW_WRITE( 24, 0 )
+            #1 `CHECK_EQUAL(OUTPUT_SCALE_value_q, value[15: 0])
 
         end
 

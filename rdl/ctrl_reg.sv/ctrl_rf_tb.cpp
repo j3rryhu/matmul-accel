@@ -205,6 +205,24 @@ int main(int argc, char** argv) {
         SW_READ( 20 )
         CHECK_EQUAL(RANGE(rdata, 1, 1), (1 << (IDX-1)))
     }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (OUTPUT_SCALE_value ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 0; IDX <= 15; ++IDX) {
+        int temp, value;
+
+        temp = top->OUTPUT_SCALE_value_q << 0;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 24, (1 << IDX) )
+        CHECK_EQUAL(top->OUTPUT_SCALE_value_q, RANGE(temp, 16, 0))
+
+        SW_WRITE( 24, 0 )
+        CHECK_EQUAL(top->OUTPUT_SCALE_value_q, RANGE(value, 16, 0))
+
+    }
 
     cycle(top);
     cycle(top);

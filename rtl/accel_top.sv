@@ -19,7 +19,13 @@
 module accel_top #(
     parameter AVS_ADDR_WIDTH = 32,
     parameter AVS_DATA_WIDTH = 32,   // byte-lane mux below assumes 32
-    parameter PE_DATA_WIDTH  = 8,
+    parameter PE_DATA_WIDTH  = 8,    // activation/weight operand width (int8)
+    parameter ACC_DATA_WIDTH = 32,   // pe_array accumulator width - kept wider
+                                      // than PE_DATA_WIDTH so a full contraction
+                                      // sum of int8 x int8 products can't
+                                      // overflow before software rescales it
+                                      // back down under the int8 quantization
+                                      // scheme (see pe.v)
     parameter ARRAY_ROWS     = 32,
     parameter ARRAY_COLS     = 32
 )(
@@ -108,7 +114,10 @@ module accel_top #(
     // output_buffer_32_bank.v). output_loader drives each bank's
     // read+write directly; Avalon reads through a single muxed external
     // port, read-only, one cycle of read latency, stalled with
-    // avs_waitrequest same as before.
+    // avs_waitrequest same as before. Entries are int8 (PE_DATA_WIDTH) -
+    // output_loader rescales pe_array's wider ACC_DATA_WIDTH accumulator
+    // down to int8 before it ever reaches output_buffer (see
+    // output_loader.v).
     // ============================================================
     localparam OBUF_BANK_ADDR_WIDTH = 7;   // 4096-byte OBUF_SIZE / 32 banks = 128 entries/bank
 
@@ -164,6 +173,7 @@ module accel_top #(
     wire [15:0] weight_cols;           // N: weight cols
     wire [9:0]  input_max_addr;        // max input_buffer read address
     wire [15:0] input_cols;            // number of columns of the input (activation) matrix
+    wire [15:0] output_scale;          // Q0.16 rescale factor (value/65536, range [0,1)) for pe_array's ACC_WIDTH accumulator
     wire        weight_ctrl_busy;      // weight_ctrl/weight_loader busy, for STATUS.busy
     wire        weight_ctrl_done;      // level: last block committed and its input band fully streamed in
 
@@ -197,6 +207,7 @@ module accel_top #(
         .WEIGHT_COLS_value_q     (weight_cols),
         .INPUT_MAX_ADDR_value_q  (input_max_addr),
         .INPUT_COLS_value_q      (input_cols),  // TODO: drive compute datapath (not yet consumed by input_dispatch)
+        .OUTPUT_SCALE_value_q    (output_scale),  // Q0.16 rescale factor, consumed by output_loader's requantize stage
 
         .STATUS_busy_wdata              (matmul_busy),
         .STATUS_done_wdata              (matmul_done),
@@ -306,12 +317,13 @@ module accel_top #(
     // output_loader - drives pe_array's b_en, reads p_out, and read-
     // modify-write accumulates into output_buffer_32_bank
     // ============================================================
-    wire [ARRAY_COLS-1:0]               pe_b_en;
-    wire [ARRAY_COLS*PE_DATA_WIDTH-1:0] pe_p_out;
+    wire [ARRAY_COLS-1:0]                pe_b_en;
+    wire [ARRAY_COLS*ACC_DATA_WIDTH-1:0] pe_p_out;
     wire                                 output_loader_done;
 
     output_loader #(
         .DATA_WIDTH     (PE_DATA_WIDTH),
+        .ACC_WIDTH      (ACC_DATA_WIDTH),
         .ARRAY_COLS     (ARRAY_COLS),
         .ROW_ADDR_WIDTH (OBUF_BANK_ADDR_WIDTH),
         .DIM_WIDTH       (16)
@@ -326,6 +338,8 @@ module accel_top #(
         .total_rows            (input_cols[OBUF_BANK_ADDR_WIDTH-1:0]),
         .committed_n_blk_idx   (committed_n_blk_idx),
         .committed_first_k_blk (committed_first_k_blk),
+
+        .output_scale   (output_scale),
 
         .obuf_rden      (obuf_bank_rden),
         .obuf_rdaddress (obuf_bank_rdaddress),
@@ -344,6 +358,7 @@ module accel_top #(
     // ============================================================
     pe_array #(
         .DATA_WIDTH (PE_DATA_WIDTH),
+        .ACC_WIDTH  (ACC_DATA_WIDTH),
         .ARRAY_ROWS (ARRAY_ROWS),
         .ARRAY_COLS (ARRAY_COLS)
     ) u_pe_array (

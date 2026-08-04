@@ -31,6 +31,18 @@
 // so the sampled copies are never overwritten out from under an
 // in-progress drain.
 //
+// Rescale/requantize: p_in arrives at pe_array's full ACC_WIDTH (32-bit)
+// accumulator width, but output_buffer stores DATA_WIDTH (int8) results -
+// under the quantization scheme this array targets, ACC_WIDTH exists so a
+// full contraction-dimension sum can't overflow before this rescale step,
+// not so the raw accumulator gets stored. Each arriving psum is multiplied
+// by output_scale (Q0.16 fixed point, unsigned, range [0,1), actual scale =
+// output_scale/65536) and the product is arithmetic-shifted right by 16 to
+// land back in ACC_WIDTH's integer domain, then saturated (not wrapped) to
+// DATA_WIDTH's signed range. The k-block accumulate add (old_val +
+// scaled psum) is saturated the same way before being written back, since
+// that sum can exceed DATA_WIDTH on its own even when each term doesn't.
+//
 // Read-modify-write per column: output_buffer is a synchronous on-chip
 // RAM (q valid one cycle after rdaddress/rden), so the read for a
 // position is issued one cycle *before* p_in[c] holds the psum for that
@@ -64,7 +76,9 @@
 `timescale 1ps/1ps
 
 module output_loader #(
-    parameter DATA_WIDTH     = 8,
+    parameter DATA_WIDTH     = 8,    // output_buffer entry width (int8, post-rescale)
+    parameter ACC_WIDTH      = 32,   // must match pe_array's ACC_WIDTH (p_in - raw pre-rescale accumulator)
+    parameter SCALE_WIDTH    = 16,   // output_scale width - Q0.16 fixed point (unsigned, range [0,1))
     parameter ARRAY_COLS     = 32,
     parameter ROW_ADDR_WIDTH = 16,   // per-bank address width - must span num_n_blocks*total_rows
     parameter DIM_WIDTH      = 16    // width of committed_n_blk_idx (from weight_ctrl)
@@ -73,7 +87,7 @@ module output_loader #(
     input                                           rst_n,       // active-low
 
     // ---- pe_array bottom edge ----
-    input      [ARRAY_COLS*DATA_WIDTH-1:0]         p_in,        // pe_array p_out
+    input      [ARRAY_COLS*ACC_WIDTH-1:0]          p_in,        // pe_array p_out
     output     [ARRAY_COLS-1:0]                    b_en,        // pe_array b_en
 
     // ---- timing anchor + block identity (from weight_ctrl) ----
@@ -81,6 +95,9 @@ module output_loader #(
     input      [ROW_ADDR_WIDTH-1:0]                 total_rows,            // M: expected valid results per column, per pass
     input      [DIM_WIDTH-1:0]                      committed_n_blk_idx,   // weight_ctrl: output block this pass belongs to
     input                                            committed_first_k_blk, // weight_ctrl: write instead of accumulate
+
+    // ---- rescale factor (from ctrl_rf, see rdl/ctrl_reg.rdl OUTPUT_SCALE) ----
+    input      [SCALE_WIDTH-1:0]                    output_scale,
 
     // ---- output_buffer read+write ports, one bank per array column ----
     output     [ARRAY_COLS-1:0]                     obuf_rden,
@@ -94,8 +111,12 @@ module output_loader #(
     output                                          done
 );
 
-    localparam ELAPSED_MAX = ARRAY_COLS - 1;      
+    localparam ELAPSED_MAX = ARRAY_COLS - 1;
     localparam ELAPSED_W   = $clog2(ELAPSED_MAX + 1);
+
+    // signed DATA_WIDTH saturation bounds (e.g. -128/127 for DATA_WIDTH=8)
+    localparam signed [DATA_WIDTH-1:0] DATA_MAX = {1'b0, {(DATA_WIDTH-1){1'b1}}};
+    localparam signed [DATA_WIDTH-1:0] DATA_MIN = {1'b1, {(DATA_WIDTH-1){1'b0}}};
 
     reg                     armed;      // ready to latch the next a_en_last rising edge
     reg                     a_en_last_d;
@@ -181,26 +202,47 @@ module output_loader #(
             reg                      active_2d;
             reg [ROW_ADDR_WIDTH-1:0] addr_d;
             reg [ROW_ADDR_WIDTH-1:0] addr_2d;
-            reg [DATA_WIDTH-1:0]     psum_d;
+            reg [ACC_WIDTH-1:0]      psum_d;   // raw pre-rescale accumulator, captured this cycle
 
             always @(posedge clock) begin
                 if (~rst_n) begin
                     active_d <= 1'b0;
                     addr_d   <= {ROW_ADDR_WIDTH{1'b0}};
-                    psum_d   <= {DATA_WIDTH{1'b0}};
+                    psum_d   <= {ACC_WIDTH{1'b0}};
                 end
                 else begin
                     active_d <= col_active;
                     addr_d   <= cur_addr;
-                    psum_d   <= p_in[c*DATA_WIDTH +: DATA_WIDTH];
+                    psum_d   <= p_in[c*ACC_WIDTH +: ACC_WIDTH];
 
                     addr_2d  <= addr_d;
                     active_2d <= active_d;
                 end
             end
 
+            // rescale: psum_d (ACC_WIDTH) * output_scale (Q0.16) >> 16,
+            // saturated into DATA_WIDTH's signed range. {1'b0,output_scale}
+            // keeps the (always non-negative) scale factor signed-safe for
+            // the multiply.
+            wire signed [ACC_WIDTH+SCALE_WIDTH:0] scale_product = $signed(psum_d) * $signed({1'b0, output_scale});
+            wire signed [ACC_WIDTH+SCALE_WIDTH:0] scale_shifted = scale_product >>> SCALE_WIDTH;
+
+            wire [DATA_WIDTH-1:0] scaled_psum =
+                (scale_shifted > $signed(DATA_MAX)) ? DATA_MAX :
+                (scale_shifted < $signed(DATA_MIN)) ? DATA_MIN :
+                                                       scale_shifted[DATA_WIDTH-1:0];
+
             wire [DATA_WIDTH-1:0] old_val = obuf_q[c*DATA_WIDTH +: DATA_WIDTH];
-            wire [DATA_WIDTH-1:0] new_val = held_first_k_blk ? psum_d : (old_val + psum_d);
+
+            // k-block accumulate: also saturated, since old_val+scaled_psum
+            // can exceed DATA_WIDTH even when each term is already in range
+            wire signed [DATA_WIDTH:0] acc_sum = $signed(old_val) + $signed(scaled_psum);
+            wire [DATA_WIDTH-1:0] acc_sat =
+                (acc_sum > $signed(DATA_MAX)) ? DATA_MAX :
+                (acc_sum < $signed(DATA_MIN)) ? DATA_MIN :
+                                                 acc_sum[DATA_WIDTH-1:0];
+
+            wire [DATA_WIDTH-1:0] new_val = held_first_k_blk ? scaled_psum : acc_sat;
 
             assign obuf_wren[c] = active_d;
             assign obuf_waddr[c*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH]  = addr_d;

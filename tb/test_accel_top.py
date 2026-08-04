@@ -1,11 +1,26 @@
 """
-Minimum viable cocotb test for accel_top: a single 32x32 (weight) x 32x32
-(input) matmul - exactly one contraction block (k_blk_idx=0 only) and one
-output block (n_blk_idx=0 only), so no multi-block accumulation and no
-partial-block masking are exercised. Just enough to check the whole
-pipeline end to end: Avalon writes -> weight_buffer/input_buffer -> weight_ctrl
--> weight_loader/input_dispatch -> pe_array -> output_loader -> output_buffer
--> Avalon reads.
+Cocotb test for accel_top simulating a real int8-quantization deployment
+flow: a single 32x32 (weight) x 32x32 (input) matmul - exactly one
+contraction block (k_blk_idx=0 only) and one output block (n_blk_idx=0
+only), so no multi-block accumulation and no partial-block masking are
+exercised. Checks the whole pipeline end to end: Avalon writes ->
+weight_buffer/input_buffer -> weight_ctrl -> weight_loader/input_dispatch
+-> pe_array -> output_loader -> output_buffer -> Avalon reads.
+
+Quantization scheme: start from "real" (float) weight/input matrices,
+per-tensor symmetric-quantize each to int8 (scale = max(|x|)/127), and load
+the *quantized* int8 values into the device - this is what a real
+quantized-inference flow would actually feed the array. weight_scale and
+input_scale are the two quantizer scales; output_scale is derived from the
+float reference output's own range (as a calibration pass would produce).
+Hardware only ever sees one combined factor via the OUTPUT_SCALE register:
+
+    y_int8 = (W_int8 @ X_int8) * weight_scale * input_scale / output_scale
+
+i.e. OUTPUT_SCALE (Q0.16 fixed point, see rdl/ctrl_reg.rdl) is programmed
+with weight_scale*input_scale/output_scale, and output_loader's requantize
+stage multiplies the raw accumulator by it, shifts, and saturates (see
+output_loader.v) to produce exactly that.
 
 Everything is addressed per the RTL's own documented conventions:
   - weight_buffer: row-major over the (contraction x output) matrix,
@@ -19,14 +34,13 @@ Everything is addressed per the RTL's own documented conventions:
     single 32x32 output block, n_blk_idx=0, so bank c holds row c directly,
     laid out at OBUF_BASE + c*(1<<OBUF_BANK_ADDR_WIDTH) + m.
 
-Golden model: y[n,m] = sum_k W[k,n]*x[k,m], wrapped to signed int8 - pe.v's
-MAC (weight*a + b_in) is truncated to DATA_WIDTH at every cascade step, but
-since that's pure accumulation of products (no further multiply on the
-partial sum), reducing mod 256 once at the end of a full-precision sum
-gives the identical result to truncating at every step.
+Golden model: raw = W_int8 @ X_int8 at full precision (the 32-bit
+ACC_DATA_WIDTH accumulator - see pe.v/pe_array.v - can't overflow for any
+draw at these matrix sizes), then rescaled by the *actual* OUTPUT_SCALE
+value written to the device (raw*OUTPUT_SCALE >> 16, arithmetic shift) and
+saturated to signed int8 [-128,127] - matching output_loader's requantize
+stage bit-for-bit.
 """
-
-import random
 
 import numpy as np
 
@@ -45,6 +59,7 @@ WEIGHT_ROWS_ADDR    = CTRL_BASE + 0x04
 WEIGHT_COLS_ADDR    = CTRL_BASE + 0x08
 INPUT_MAX_ADDR_ADDR = CTRL_BASE + 0x0C
 INPUT_COLS_ADDR     = CTRL_BASE + 0x10
+OUTPUT_SCALE_ADDR   = CTRL_BASE + 0x18
 
 MATMUL_START_BIT = 0
 
@@ -55,12 +70,10 @@ M = 32   # input/output column count (INPUT_COLS == INPUT_MAX_ADDR here)
 
 ARRAY_ROWS = 32  # must match accel_top.sv's ARRAY_ROWS / input_buffer_32_bank's bank count
 
-# Value ranges kept small enough that sum_k W[k,n]*X[k,m] can't overflow
-# int8 for any draw: worst case is K * W_VAL_RANGE * X_VAL_RANGE = 32*3*1 =
-# 96 <= 127, so the golden model's wraparound never actually triggers here -
-# any mismatch is a real datapath bug, not an expected truncation artifact.
-W_VAL_RANGE = 3  # weights drawn from [-3, 3]
-X_VAL_RANGE = 1  # activations drawn from [-1, 1]
+# "Real" (float) weight/input matrices are drawn N(0, REAL_VAL_STD) - wide
+# enough dynamic range to make quantization meaningful without needing
+# either matrix to be degenerate (all-zero, etc).
+REAL_VAL_STD = 1.0
 
 OBUF_BANK_ADDR_WIDTH = 7  # must match accel_top.sv's OBUF_BANK_ADDR_WIDTH
 IBUF_BANK_ADDR_WIDTH = 8  # must match input_buffer_32_bank.v's per-bank address width
@@ -163,45 +176,81 @@ def to_uint8(int_val):
     return int_val & 0xFF
 
 
+def quantize_symmetric_int8(x):
+    """Per-tensor symmetric quantization to signed int8 (zero point 0,
+    range [-127,127] - the 127 excludes -128 so the range stays symmetric
+    around 0). Returns (x_int8, scale) with x ~= x_int8 * scale."""
+    max_abs = float(np.max(np.abs(x)))
+    scale = max_abs / 127.0 if max_abs > 0 else 1.0
+    x_int8 = np.clip(np.round(x / scale), -127, 127).astype(np.int64)
+    return x_int8, scale
+
+
 @cocotb.test()
 async def test_min_32x32_matmul(dut):
-    random.seed(0)
+    rng = np.random.default_rng(0)
     await start_clock(dut)
     cocotb.start_soon(watchdog(dut))
     await reset_dut(dut)
 
-    # ---- random signed int8 weight (K x N) and input (K x M) matrices ----
-    W = np.array(
-        [[random.randint(-W_VAL_RANGE, W_VAL_RANGE) for _ in range(N)] for _ in range(K)],
-        dtype=np.int64,
-    )
-    X = np.array(
-        [[random.randint(-X_VAL_RANGE, X_VAL_RANGE) for _ in range(M)] for _ in range(K)],
-        dtype=np.int64,
-    )
-    with open("sim_build/matrices.txt", "w") as f:
-        f.write(f"W (K x N, W[k,n]) =\n{np.array2string(W, threshold=np.inf, max_line_width=200)}\n\n")
-        f.write(f"X (K x M, X[k,m]) =\n{np.array2string(X, threshold=np.inf, max_line_width=200)}\n")
+    # ---- "real" (float) weight (K x N) and input (K x M) matrices - stand
+    # in for values that would come from a trained model / real activations ----
+    W_real = rng.normal(loc=0.0, scale=REAL_VAL_STD, size=(K, N))
+    X_real = rng.normal(loc=0.0, scale=REAL_VAL_STD, size=(K, M))
 
-    # ---- write weights: row-major (k*N+n) into weight_buffer ----
+    # ---- per-tensor symmetric int8 quantization - the actual values loaded
+    # into the device are W_int8/X_int8, not W_real/X_real ----
+    W_int8, weight_scale = quantize_symmetric_int8(W_real)
+    X_int8, input_scale = quantize_symmetric_int8(X_real)
+
+    # ---- real-valued reference output and its own quantization scale - in
+    # a real flow output_scale would come from calibration over many
+    # samples; here we just use this single sample's own range ----
+    Y_real = W_real @ X_real
+    _, output_scale = quantize_symmetric_int8(Y_real)
+
+    # ---- combined rescale factor: hardware only ever sees this one Q0.16
+    # value (OUTPUT_SCALE), applied to the raw int32 accumulator as
+    # raw * combined_scale = (W_int8 @ X_int8) * weight_scale * input_scale / output_scale ----
+    combined_scale = weight_scale * input_scale / output_scale
+    assert 0.0 <= combined_scale < 1.0, (
+        f"combined_scale={combined_scale} doesn't fit OUTPUT_SCALE's Q0.16 "
+        f"[0,1) range - adjust REAL_VAL_STD or K/N/M"
+    )
+    output_scale_q16 = round(combined_scale * 65536)
+
+    with open("sim_build/matrices.txt", "w") as f:
+        f.write(
+            f"weight_scale={weight_scale!r}\ninput_scale={input_scale!r}\n"
+            f"output_scale={output_scale!r}\ncombined_scale={combined_scale!r}\n"
+            f"OUTPUT_SCALE (Q0.16) = 0x{output_scale_q16:04x}\n\n"
+        )
+        f.write(f"W_real (K x N) =\n{np.array2string(W_real, threshold=np.inf, max_line_width=200)}\n\n")
+        f.write(f"W_int8 (K x N) =\n{np.array2string(W_int8, threshold=np.inf, max_line_width=200)}\n\n")
+        f.write(f"X_real (K x M) =\n{np.array2string(X_real, threshold=np.inf, max_line_width=200)}\n\n")
+        f.write(f"X_int8 (K x M) =\n{np.array2string(X_int8, threshold=np.inf, max_line_width=200)}\n")
+
+    # ---- write quantized weights: row-major (k*N+n) into weight_buffer ----
     for k in range(K):
         for n in range(N):
-            await write_byte(dut, WBUF_BASE + k * N + n, to_uint8(int(W[k, n])))
+            await write_byte(dut, WBUF_BASE + k * N + n, to_uint8(int(W_int8[k, n])))
 
-    # ---- write input: banked one bank per array row (bank = k % ARRAY_ROWS,
-    # offset = k_blk_idx*M + m, matching weight_ctrl's input_band_base_addr) ----
+    # ---- write quantized input: banked one bank per array row (bank =
+    # k % ARRAY_ROWS, offset = k_blk_idx*M + m, matching weight_ctrl's
+    # input_band_base_addr) ----
     for k in range(K):
         k_local = k % ARRAY_ROWS
         k_blk = k // ARRAY_ROWS
         for m in range(M):
             addr = IBUF_BASE + k_local * (1 << IBUF_BANK_ADDR_WIDTH) + k_blk * M + m
-            await write_byte(dut, addr, to_uint8(int(X[k, m])))
+            await write_byte(dut, addr, to_uint8(int(X_int8[k, m])))
 
-    # ---- program dimensions ----
+    # ---- program dimensions + rescale factor ----
     await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
     await avalon_write(dut, WEIGHT_COLS_ADDR, N)
     await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
     await avalon_write(dut, INPUT_COLS_ADDR, M)
+    await avalon_write(dut, OUTPUT_SCALE_ADDR, output_scale_q16)
 
     # ---- kick off the matmul: everything past this is sequenced by
     # weight_ctrl internally (see rtl/weight_ctrl.v) ----
@@ -211,9 +260,16 @@ async def test_min_32x32_matmul(dut):
     # give output_buffer's write a cycle to land before reading it back
     await ClockCycles(dut.clk, 2)
 
-    # ---- golden model: y[n,m] = sum_k W[k,n]*X[k,m], wrapped to int8 ----
-    golden = (W @ X)
-    golden = ((golden + 128) % 256) - 128  # wrap to signed int8
+    # ---- golden model: raw = W_int8 @ X_int8 at full precision, then
+    # requantized exactly like output_loader's rescale stage using the
+    # *actual* OUTPUT_SCALE value written above (so its own Q0.16 rounding
+    # is reflected, not just the ideal combined_scale): raw*OUTPUT_SCALE
+    # arithmetic-shifted right by 16, saturated to int8. Python's >> on
+    # signed ints is already an arithmetic (floor) shift, so this
+    # reproduces the hardware's `>>>` bit-for-bit. ----
+    raw = W_int8 @ X_int8
+    scaled = (raw * output_scale_q16) >> 16
+    golden = np.clip(scaled, -128, 127)
 
     # ---- read back output_buffer: bank c (=row n, since n_blk_idx=0),
     # offset m ----

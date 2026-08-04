@@ -27,6 +27,9 @@ module ctrl_rf_rf #(
     input  logic                     [ 0: 0] STATUS_busy_wdata,          //! HW write data
     input  logic                     [ 0: 0] STATUS_done_wdata,          //! HW write data
 
+    // Register OUTPUT_SCALE
+    output logic                     [15: 0] OUTPUT_SCALE_value_q,              //! Current field value
+
     // Register Bus
     input  logic                             valid,    //! Active high valid
     input  logic                             read,     //! Indicates request is a read
@@ -71,6 +74,10 @@ module ctrl_rf_rf #(
     logic                             STATUS_done_anded;
     logic                             STATUS_done_ored;
     logic                             STATUS_done_xored;
+    logic                           [15: 0] OUTPUT_SCALE_value_next;
+    logic                             OUTPUT_SCALE_value_anded;
+    logic                             OUTPUT_SCALE_value_ored;
+    logic                             OUTPUT_SCALE_value_xored;
 /* verilator lint_on UNUSED */
 
     // ============================================================
@@ -107,6 +114,7 @@ module ctrl_rf_rf #(
     logic                     [DATA_WIDTH-1:0] INPUT_MAX_ADDR_rdata;
     logic                     [DATA_WIDTH-1:0] INPUT_COLS_rdata;
     logic                     [DATA_WIDTH-1:0] STATUS_rdata;
+    logic                     [DATA_WIDTH-1:0] OUTPUT_SCALE_rdata;
 
     assign sw_rdata = // or of each register return (masked)
                    CONTROL_rdata | 
@@ -114,7 +122,8 @@ module ctrl_rf_rf #(
                    WEIGHT_COLS_rdata | 
                    INPUT_MAX_ADDR_rdata | 
                    INPUT_COLS_rdata | 
-                   STATUS_rdata;
+                   STATUS_rdata | 
+                   OUTPUT_SCALE_rdata;
             
         
     // ============================================================
@@ -373,5 +382,47 @@ module ctrl_rf_rf #(
     // next hardware value
     assign STATUS_done_next = STATUS_done_wdata;
     assign STATUS_done_q = STATUS_done_next;
+            
+        
+    // ============================================================
+    // Register: OUTPUT_SCALE
+    //    [15: 0]                value: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  OUTPUT_SCALE_decode;
+    logic                  OUTPUT_SCALE_sw_wr;
+    logic                  OUTPUT_SCALE_sw_rd;
+    logic [DATA_WIDTH-1:0] OUTPUT_SCALE_q;
+
+    assign OUTPUT_SCALE_decode = (addr == (ADDR_OFFSET+'h0+'h18));
+    assign OUTPUT_SCALE_sw_wr = sw_wr && OUTPUT_SCALE_decode;
+    assign OUTPUT_SCALE_sw_rd = sw_rd && OUTPUT_SCALE_decode;
+
+    always_comb begin
+        OUTPUT_SCALE_q = '0;
+        OUTPUT_SCALE_q[15: 0] = OUTPUT_SCALE_value_q;
+    end
+
+    // masked version of return data
+    assign OUTPUT_SCALE_rdata = OUTPUT_SCALE_sw_rd ? OUTPUT_SCALE_q : 'b0;
+
+    // ------------------------------------------------------------
+    // Field: value
+    // ------------------------------------------------------------
+    assign OUTPUT_SCALE_value_anded = & OUTPUT_SCALE_value_q;
+    assign OUTPUT_SCALE_value_ored  = | OUTPUT_SCALE_value_q;
+    assign OUTPUT_SCALE_value_xored = ^ OUTPUT_SCALE_value_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        OUTPUT_SCALE_value_q <= 0;
+    end else begin
+        // Software write
+        if (OUTPUT_SCALE_sw_wr) begin
+            OUTPUT_SCALE_value_q <=  sw_masked_data[15: 0] | (OUTPUT_SCALE_value_q & ~sw_mask[15: 0]);
+        end
+    end
 
 endmodule: ctrl_rf_rf

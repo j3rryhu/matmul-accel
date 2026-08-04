@@ -80,4 +80,18 @@ addrmap ctrl_rf {
         } done;               // whole matmul finished: all blocks committed and drained
 
     } STATUS;
+
+    // Output rescale factor (0x18). Q0.16 fixed point: unsigned, 0 integer
+    // bits + 16 fractional bits, representable range [0, 1) - value/65536
+    // is the actual scale. Meant to rescale pe_array's 32-bit accumulator
+    // (see pe.v's ACC_WIDTH) back down to int8 under the quantization
+    // scheme this array targets; not yet consumed downstream of
+    // output_loader (see rtl/accel_top.sv).
+    reg {
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } value [15:0];
+    } OUTPUT_SCALE;
 };

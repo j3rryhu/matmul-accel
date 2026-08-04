@@ -35,24 +35,24 @@ module flop_ram #(
 endmodule
 
 // Stamps out a concretely-named module (matching a real IP's name exactly)
-// as a thin flop_ram wrapper at the given address width, 8 bits wide.
+// as a thin flop_ram wrapper at the given address/data width.
 //
 // NB: the macro argument below is named AW, not ADDR_WIDTH - naive
 // text-substitution macros rewrite *every* matching token, including the
 // ADDR_WIDTH inside ".ADDR_WIDTH(...)"'s named parameter connection, so
 // reusing that exact name here would mangle it into ".14(14)" or similar.
-`define DEFINE_BUFFER_RAM(NAME, AW) \
+`define DEFINE_BUFFER_RAM(NAME, AW, DW) \
 module NAME ( \
     input               clock, \
-    input      [7:0]    data, \
+    input      [DW-1:0] data, \
     input      [AW-1:0] rdaddress, \
     input               rden, \
     input      [AW-1:0] wraddress, \
     input               wren, \
-    output     [7:0]    q \
+    output     [DW-1:0] q \
 ); \
     flop_ram #( \
-        .WIDTH      (8), \
+        .WIDTH      (DW), \
         .ADDR_WIDTH (AW) \
     ) u_flop_ram ( \
         .clock     (clock), \
@@ -65,13 +65,15 @@ module NAME ( \
     ); \
 endmodule
 
-// weight_buffer: WBUF_SIZE=0x4000 (16384 bytes), 14-bit address
-`DEFINE_BUFFER_RAM(weight_buffer, 14)
+// weight_buffer: WBUF_SIZE=0x4000 (16384 bytes), 14-bit address, 8-bit (int8) entries
+`DEFINE_BUFFER_RAM(weight_buffer, 14, 8)
 
-// input_buffer: one bank of input_buffer_32_bank, 256 bytes/bank, 8-bit address
-`DEFINE_BUFFER_RAM(input_buffer, 8)
+// input_buffer: one bank of input_buffer_32_bank, 256 bytes/bank, 8-bit address, 8-bit (int8) entries
+`DEFINE_BUFFER_RAM(input_buffer, 8, 8)
 
-// output_buffer: one bank of output_buffer_32_bank, 128 bytes/bank, 7-bit address
-`DEFINE_BUFFER_RAM(output_buffer, 7)
+// output_buffer: one bank of output_buffer_32_bank, 128 bytes/bank, 7-bit
+// address, 8-bit (int8) entries - output_loader rescales pe_array's
+// ACC_WIDTH accumulator down to int8 before writing (see output_loader.v)
+`DEFINE_BUFFER_RAM(output_buffer, 7, 8)
 
 `undef DEFINE_BUFFER_RAM

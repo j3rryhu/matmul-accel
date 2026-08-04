@@ -20,7 +20,7 @@
 `timescale 1ps/1ps
 
 module output_buffer_32_bank #(
-    parameter DATA_WIDTH      = 8,
+    parameter DATA_WIDTH      = 8,   // int8 - output_loader rescales pe_array's ACC_WIDTH accumulator down to this before writing (see output_loader.v)
     parameter NUM_BANKS       = 32,
     parameter BANK_ADDR_WIDTH = 10    // per-bank address width - match the generated output_buffer IP's depth
 )(

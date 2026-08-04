@@ -11,7 +11,8 @@
 `timescale 1ps/1ps
 
 module pe_array #(
-    parameter DATA_WIDTH  = 32,
+    parameter DATA_WIDTH  = 8,
+    parameter ACC_WIDTH   = 32,
     parameter ARRAY_ROWS  = 32,
     parameter ARRAY_COLS  = 32
 )(
@@ -35,8 +36,9 @@ module pe_array #(
     // activation output, right edge - one lane per row (for tile cascading)
     output [ARRAY_ROWS*DATA_WIDTH-1:0]              a_out,
 
-    // partial-sum output, bottom edge - one lane per column (final results)
-    output [ARRAY_COLS*DATA_WIDTH-1:0]              p_out
+    // partial-sum output, bottom edge - one lane per column (final results,
+    // ACC_WIDTH-wide - see pe.v)
+    output [ARRAY_COLS*ACC_WIDTH-1:0]               p_out
 );
 
     genvar r, c;
@@ -46,9 +48,9 @@ module pe_array #(
             for (c = 0; c < ARRAY_COLS; c = c + 1) begin : COL
 
                 wire [DATA_WIDTH-1:0] pe_a_in;
-                wire [DATA_WIDTH-1:0] pe_b_in;
+                wire [ACC_WIDTH-1:0]  pe_b_in;
                 wire [DATA_WIDTH-1:0] pe_a_out;
-                wire [DATA_WIDTH-1:0] pe_p_out;
+                wire [ACC_WIDTH-1:0]  pe_p_out;
                 wire                  pe_a_en;
                 reg                   pe_a_en_d;
 
@@ -62,7 +64,7 @@ module pe_array #(
                     assign pe_a_in = ROW[r-1].COL[c].pe_a_out;
 
                 if (c == 0)
-                    assign pe_b_in = {DATA_WIDTH{1'b0}};
+                    assign pe_b_in = {ACC_WIDTH{1'b0}};
                 else
                     assign pe_b_in = ROW[r].COL[c-1].pe_p_out;
                 
@@ -74,7 +76,8 @@ module pe_array #(
                 end
 
                 pe #(
-                    .DATA_WIDTH (DATA_WIDTH)
+                    .DATA_WIDTH (DATA_WIDTH),
+                    .ACC_WIDTH  (ACC_WIDTH)
                 ) u_pe (
                     .clk     (clk),
                     .rst_n   (rst_n),
@@ -90,7 +93,7 @@ module pe_array #(
                 );
 
                 if (c == ARRAY_COLS-1)
-                    assign p_out[(r+1)*DATA_WIDTH-1 -: DATA_WIDTH] = pe_p_out;
+                    assign p_out[(r+1)*ACC_WIDTH-1 -: ACC_WIDTH] = pe_p_out;
 
                 if (r == ARRAY_ROWS-1)
                     assign a_out[(c+1)*DATA_WIDTH-1 -: DATA_WIDTH] = pe_a_out;
