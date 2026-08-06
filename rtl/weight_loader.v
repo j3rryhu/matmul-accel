@@ -76,6 +76,7 @@ module weight_loader #(
     reg [ROW_CNT_WIDTH-1:0]   cur_row;
     reg [COL_CNT_WIDTH-1:0]   cur_col;
     reg [WBUF_ADDR_WIDTH-1:0] rd_addr;
+    reg [PE_ADDR_WIDTH-1:0]   pe_ld_addr;
 
     wire elem_valid = (cur_row < valid_rows) && (cur_col < valid_cols);
     wire last_elem  = (cur_row == ARRAY_ROWS-1) && (cur_col == ARRAY_COLS-1);
@@ -93,6 +94,7 @@ module weight_loader #(
             rd_addr        <= '0;
             wbuf_rden      <= 1'b0;
             wbuf_rdaddress <= '0;
+            pe_ld_addr     <= '0;
         end
         else begin
             case (wload_state)
@@ -107,8 +109,10 @@ module weight_loader #(
                 end
 
                 STATE_PRELOAD: begin
+                    done_r         <= '0;
                     wbuf_rden      <= elem_valid;
                     wbuf_rdaddress <= rd_addr;
+                    pe_ld_addr     <= pe_ld_addr + 1;
 
                     if (cur_col == ARRAY_COLS-1) begin
                         cur_col <= '0;
@@ -130,6 +134,7 @@ module weight_loader #(
                     // read), so one cycle here is always enough
                     wbuf_rden   <= 1'b0;
                     wload_state <= STATE_READY;
+                    pe_ld_addr  <= 0;
                 end
 
                 STATE_READY: begin
@@ -138,6 +143,14 @@ module weight_loader #(
                     if (commit) begin
                         wload_state <= STATE_IDLE;
                         done_r      <= 1'b1;
+                    end
+
+                    if(wbuf_rdy)begin
+                        wload_state <= STATE_PRELOAD;
+                        done_r      <= 1'b1;
+                        cur_row     <= '0;
+                        cur_col     <= '0;
+                        rd_addr     <= base_addr;
                     end
                 end
             endcase
@@ -150,24 +163,24 @@ module weight_loader #(
     // Every PE in the block is written every cycle it's walked: in-range
     // PEs get wbuf_q, out-of-range PEs (past valid_rows/valid_cols) get an
     // explicit 0 instead of a stale wbuf_q from the last real read. ----
-    reg                     rd_issued_d;
     reg                     rd_valid_d;
     reg [PE_ADDR_WIDTH-1:0] rd_addr_d;
+    reg [PE_ADDR_WIDTH-1:0] rd_addr_2d;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            rd_issued_d <= 1'b0;
             rd_valid_d  <= 1'b0;
             rd_addr_d   <= '0;
+            rd_addr_2d  <= '0;
         end
         else begin
-            rd_issued_d <= (wload_state == STATE_PRELOAD);
             rd_valid_d  <= wbuf_rden;
-            rd_addr_d   <= wbuf_rdaddress;
+            rd_addr_d   <= pe_ld_addr;
+            rd_addr_2d  <= rd_addr_d;
         end
     end
 
-    assign w_addr = rd_addr_d;
+    assign w_addr = rd_addr_2d;
     assign w_data = rd_valid_d ? wbuf_q : {DATA_WIDTH{1'b0}};
     assign w_en   = rd_valid_d;
     assign w_load = commit && (wload_state == STATE_READY);

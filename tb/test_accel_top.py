@@ -1,11 +1,16 @@
 """
-Cocotb test for accel_top simulating a real int8-quantization deployment
-flow: a single 32x32 (weight) x 32x32 (input) matmul - exactly one
-contraction block (k_blk_idx=0 only) and one output block (n_blk_idx=0
-only), so no multi-block accumulation and no partial-block masking are
-exercised. Checks the whole pipeline end to end: Avalon writes ->
-weight_buffer/input_buffer -> weight_ctrl -> weight_loader/input_dispatch
--> pe_array -> output_loader -> output_buffer -> Avalon reads.
+Cocotb tests for accel_top simulating a real int8-quantization deployment
+flow. Two tests:
+  - test_min_32x32_matmul: a single 32x32 (weight) x 32x32 (input) matmul -
+    exactly one contraction block (k_blk_idx=0 only) and one output block
+    (n_blk_idx=0 only), so no multi-block accumulation and no partial-block
+    masking are exercised. Checks the whole pipeline end to end: Avalon
+    writes -> weight_buffer/input_buffer -> weight_ctrl ->
+    weight_loader/input_dispatch -> pe_array -> output_loader ->
+    output_buffer -> Avalon reads.
+  - test_64x64_multiblock_matmul: 64x64 x 64x64 (2x2 blocks), exercising
+    the multi-k-block accumulate and multi-n-block output_buffer addressing
+    that the single-block test never touches - see its own docstring.
 
 Quantization scheme: start from "real" (float) weight/input matrices,
 per-tensor symmetric-quantize each to int8 (scale = max(|x|)/127), and load
@@ -34,12 +39,12 @@ Everything is addressed per the RTL's own documented conventions:
     single 32x32 output block, n_blk_idx=0, so bank c holds row c directly,
     laid out at OBUF_BASE + c*(1<<OBUF_BANK_ADDR_WIDTH) + m.
 
-Golden model: raw = W_int8 @ X_int8 at full precision (the 32-bit
-ACC_DATA_WIDTH accumulator - see pe.v/pe_array.v - can't overflow for any
-draw at these matrix sizes), then rescaled by the *actual* OUTPUT_SCALE
-value written to the device (raw*OUTPUT_SCALE >> 16, arithmetic shift) and
-saturated to signed int8 [-128,127] - matching output_loader's requantize
-stage bit-for-bit.
+Golden model (both tests): raw = W_int8 @ X_int8 at full precision (the
+32-bit ACC_DATA_WIDTH accumulator - see pe.v/pe_array.v - can't overflow
+for int8 operands at any K used here: worst case is K*127*127, well under
+2^31), then rescaled by the *actual* OUTPUT_SCALE value written to the
+device (raw*OUTPUT_SCALE >> 16, arithmetic shift) and saturated to signed
+int8 [-128,127] - matching output_loader's requantize stage bit-for-bit.
 """
 
 import numpy as np
@@ -69,6 +74,7 @@ N = 32   # output size (WEIGHT_COLS)
 M = 32   # input/output column count (INPUT_COLS == INPUT_MAX_ADDR here)
 
 ARRAY_ROWS = 32  # must match accel_top.sv's ARRAY_ROWS / input_buffer_32_bank's bank count
+ARRAY_COLS = 32  # must match accel_top.sv's ARRAY_COLS / output_buffer_32_bank's bank count
 
 # "Real" (float) weight/input matrices are drawn N(0, REAL_VAL_STD) - wide
 # enough dynamic range to make quantization meaningful without needing
@@ -81,6 +87,20 @@ IBUF_BANK_ADDR_WIDTH = 8  # must match input_buffer_32_bank.v's per-bank address
 CLK_PERIOD_NS = 10
 DONE_TIMEOUT_CYCLES = 8000
 WATCHDOG_CYCLES = 8000
+
+# wait_matmul_done only needs to cover compute (block prefetch/drain, see
+# weight_ctrl.v/weight_loader.v) - 20000 is already generous for a 2x2-block
+# (64x64x64) run.
+MULTIBLOCK_DONE_TIMEOUT_CYCLES = 20000
+
+# The watchdog runs for the *whole* test, start to finish - not just
+# compute. For 64x64x64 that's dominated by the per-byte Avalon loops, not
+# the matmul itself: weight+input writes are 64*64*2 = 8192 cycles (writes
+# never stall on avs_waitrequest - that's only asserted for OBUF reads), and
+# readback is 64*64 = 4096 reads at ~2 cycles each (obuf_rd_pending stalls
+# one cycle per read) = ~8192 cycles. Add ~4900 for compute (4 blocks) and
+# the total is already ~21300 before any margin - comfortable headroom here.
+MULTIBLOCK_WATCHDOG_CYCLES = 60000
 
 
 async def start_clock(dut):
@@ -168,6 +188,24 @@ async def wait_output_done(dut, timeout_cycles=DONE_TIMEOUT_CYCLES):
     )
 
 
+async def wait_matmul_done(dut, timeout_cycles=MULTIBLOCK_DONE_TIMEOUT_CYCLES):
+    """matmul_done (accel_top.sv) is a level that only goes high once every
+    block has been committed (weight_ctrl_done) AND output_loader has
+    drained the last one - the right "whole matmul finished" signal for a
+    multi-block run. output_loader.done isn't usable here the way
+    wait_output_done uses it for a single block: it pulses once *per
+    committed block*, not once for the whole matmul (see output_loader.v /
+    rdl/README.md), so waiting on it once would only catch the first
+    block."""
+    for _ in range(timeout_cycles):
+        await RisingEdge(dut.clk)
+        if int(dut.matmul_done.value) == 1:
+            return
+    raise TimeoutError(
+        f"matmul_done never asserted within {timeout_cycles} cycles"
+    )
+
+
 def to_int8(byte_val):
     return byte_val - 256 if byte_val >= 128 else byte_val
 
@@ -186,32 +224,155 @@ def quantize_symmetric_int8(x):
     return x_int8, scale
 
 
+# @cocotb.test()
+# async def test_min_32x32_matmul(dut):
+#     rng = np.random.default_rng(0)
+#     await start_clock(dut)
+#     cocotb.start_soon(watchdog(dut))
+#     await reset_dut(dut)
+
+#     # ---- "real" (float) weight (K x N) and input (K x M) matrices - stand
+#     # in for values that would come from a trained model / real activations ----
+#     W_real = rng.normal(loc=0.0, scale=REAL_VAL_STD, size=(K, N))
+#     X_real = rng.normal(loc=0.0, scale=REAL_VAL_STD, size=(K, M))
+
+#     # ---- per-tensor symmetric int8 quantization - the actual values loaded
+#     # into the device are W_int8/X_int8, not W_real/X_real ----
+#     W_int8, weight_scale = quantize_symmetric_int8(W_real)
+#     X_int8, input_scale = quantize_symmetric_int8(X_real)
+
+#     # ---- real-valued reference output and its own quantization scale - in
+#     # a real flow output_scale would come from calibration over many
+#     # samples; here we just use this single sample's own range ----
+#     Y_real = W_real @ X_real
+#     _, output_scale = quantize_symmetric_int8(Y_real)
+
+#     # ---- combined rescale factor: hardware only ever sees this one Q0.16
+#     # value (OUTPUT_SCALE), applied to the raw int32 accumulator as
+#     # raw * combined_scale = (W_int8 @ X_int8) * weight_scale * input_scale / output_scale ----
+#     combined_scale = weight_scale * input_scale / output_scale
+#     assert 0.0 <= combined_scale < 1.0, (
+#         f"combined_scale={combined_scale} doesn't fit OUTPUT_SCALE's Q0.16 "
+#         f"[0,1) range - adjust REAL_VAL_STD or K/N/M"
+#     )
+#     output_scale_q16 = round(combined_scale * 65536)
+
+#     with open("sim_build/matrices.txt", "w") as f:
+#         f.write(
+#             f"weight_scale={weight_scale!r}\ninput_scale={input_scale!r}\n"
+#             f"output_scale={output_scale!r}\ncombined_scale={combined_scale!r}\n"
+#             f"OUTPUT_SCALE (Q0.16) = 0x{output_scale_q16:04x}\n\n"
+#         )
+#         f.write(f"W_real (K x N) =\n{np.array2string(W_real, threshold=np.inf, max_line_width=200)}\n\n")
+#         f.write(f"W_int8 (K x N) =\n{np.array2string(W_int8, threshold=np.inf, max_line_width=200)}\n\n")
+#         f.write(f"X_real (K x M) =\n{np.array2string(X_real, threshold=np.inf, max_line_width=200)}\n\n")
+#         f.write(f"X_int8 (K x M) =\n{np.array2string(X_int8, threshold=np.inf, max_line_width=200)}\n")
+
+#     # ---- write quantized weights: row-major (k*N+n) into weight_buffer ----
+#     for k in range(K):
+#         for n in range(N):
+#             await write_byte(dut, WBUF_BASE + k * N + n, to_uint8(int(W_int8[k, n])))
+
+#     # ---- write quantized input: banked one bank per array row (bank =
+#     # k % ARRAY_ROWS, offset = k_blk_idx*M + m, matching weight_ctrl's
+#     # input_band_base_addr) ----
+#     for k in range(K):
+#         k_local = k % ARRAY_ROWS
+#         k_blk = k // ARRAY_ROWS
+#         for m in range(M):
+#             addr = IBUF_BASE + k_local * (1 << IBUF_BANK_ADDR_WIDTH) + k_blk * M + m
+#             await write_byte(dut, addr, to_uint8(int(X_int8[k, m])))
+
+#     # ---- program dimensions + rescale factor ----
+#     await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
+#     await avalon_write(dut, WEIGHT_COLS_ADDR, N)
+#     await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
+#     await avalon_write(dut, INPUT_COLS_ADDR, M)
+#     await avalon_write(dut, OUTPUT_SCALE_ADDR, output_scale_q16)
+
+#     # ---- kick off the matmul: everything past this is sequenced by
+#     # weight_ctrl internally (see rtl/weight_ctrl.v) ----
+#     await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+
+#     await wait_output_done(dut)
+#     # give output_buffer's write a cycle to land before reading it back
+#     await ClockCycles(dut.clk, 2)
+
+#     # ---- golden model: raw = W_int8 @ X_int8 at full precision, then
+#     # requantized exactly like output_loader's rescale stage using the
+#     # *actual* OUTPUT_SCALE value written above (so its own Q0.16 rounding
+#     # is reflected, not just the ideal combined_scale): raw*OUTPUT_SCALE
+#     # arithmetic-shifted right by 16, saturated to int8. Python's >> on
+#     # signed ints is already an arithmetic (floor) shift, so this
+#     # reproduces the hardware's `>>>` bit-for-bit. ----
+#     raw = W_int8 @ X_int8
+#     scaled = (raw * output_scale_q16) >> 16
+#     golden = np.clip(scaled, -128, 127)
+
+#     # ---- read back output_buffer: bank c (=row n, since n_blk_idx=0),
+#     # offset m ----
+#     mismatches = []
+#     for n in range(N):
+#         bank_base = OBUF_BASE + (n << OBUF_BANK_ADDR_WIDTH)
+#         for m in range(M):
+#             got = to_int8(await read_byte(dut, bank_base + m))
+#             exp = int(golden[n, m])
+#             if got != exp:
+#                 mismatches.append((n, m, exp, got))
+
+#     if mismatches:
+#         preview = ", ".join(
+#             f"y[{n},{m}]: expected {exp}, got {got}"
+#             for n, m, exp, got in mismatches[:10]
+#         )
+#         raise AssertionError(
+#             f"{len(mismatches)}/{N * M} output mismatches. First few: {preview}"
+#         )
+
+
 @cocotb.test()
-async def test_min_32x32_matmul(dut):
-    rng = np.random.default_rng(0)
+async def test_64x64_multiblock_matmul(dut):
+    """64x64 (weight) x 64x64 (input) matmul - 2 k-blocks x 2 n-blocks (4
+    32x32 blocks total), sequenced column-major by weight_ctrl (k fast/
+    inner, n slow/outer - see rtl/weight_ctrl.v). Unlike
+    test_min_32x32_matmul, this exercises:
+      - multi-k-block output accumulation: output_loader's read-modify-
+        write add (committed_first_k_blk ? write : old_val+scaled_psum -
+        see output_loader.v) actually accumulates across k_blk_idx=0,1
+        instead of only ever taking the "first/only" branch.
+      - multi-n-block output_buffer addressing: each bank is reused across
+        n_blk_idx=0,1, with that pass's total_rows-sized segment appended
+        after the previous one (bank c's internal address =
+        n_blk_idx*total_rows + m - see output_loader.v's header note).
+
+    Same quantization scheme as test_min_32x32_matmul (real float
+    W/X -> per-tensor symmetric int8 -> OUTPUT_SCALE combines
+    weight_scale*input_scale/output_scale) - see that test's docstring.
+
+    Buffer capacity check: output_buffer's per-bank depth
+    (1<<OBUF_BANK_ADDR_WIDTH = 128 entries) must hold num_n_blocks*M
+    entries; here that's 2*64 = 128, exactly at capacity.
+    """
+    K = 64
+    N = 64
+    M = 64
+
+    rng = np.random.default_rng(1)
     await start_clock(dut)
-    cocotb.start_soon(watchdog(dut))
+    cocotb.start_soon(watchdog(dut, max_cycles=MULTIBLOCK_WATCHDOG_CYCLES))
     await reset_dut(dut)
 
-    # ---- "real" (float) weight (K x N) and input (K x M) matrices - stand
-    # in for values that would come from a trained model / real activations ----
+    # ---- "real" (float) weight/input matrices, quantized the same way as
+    # test_min_32x32_matmul - see its docstring for the scheme ----
     W_real = rng.normal(loc=0.0, scale=REAL_VAL_STD, size=(K, N))
     X_real = rng.normal(loc=0.0, scale=REAL_VAL_STD, size=(K, M))
 
-    # ---- per-tensor symmetric int8 quantization - the actual values loaded
-    # into the device are W_int8/X_int8, not W_real/X_real ----
     W_int8, weight_scale = quantize_symmetric_int8(W_real)
     X_int8, input_scale = quantize_symmetric_int8(X_real)
 
-    # ---- real-valued reference output and its own quantization scale - in
-    # a real flow output_scale would come from calibration over many
-    # samples; here we just use this single sample's own range ----
     Y_real = W_real @ X_real
     _, output_scale = quantize_symmetric_int8(Y_real)
 
-    # ---- combined rescale factor: hardware only ever sees this one Q0.16
-    # value (OUTPUT_SCALE), applied to the raw int32 accumulator as
-    # raw * combined_scale = (W_int8 @ X_int8) * weight_scale * input_scale / output_scale ----
     combined_scale = weight_scale * input_scale / output_scale
     assert 0.0 <= combined_scale < 1.0, (
         f"combined_scale={combined_scale} doesn't fit OUTPUT_SCALE's Q0.16 "
@@ -219,7 +380,7 @@ async def test_min_32x32_matmul(dut):
     )
     output_scale_q16 = round(combined_scale * 65536)
 
-    with open("sim_build/matrices.txt", "w") as f:
+    with open("sim_build/matrices_64x64.txt", "w") as f:
         f.write(
             f"weight_scale={weight_scale!r}\ninput_scale={input_scale!r}\n"
             f"output_scale={output_scale!r}\ncombined_scale={combined_scale!r}\n"
@@ -230,14 +391,17 @@ async def test_min_32x32_matmul(dut):
         f.write(f"X_real (K x M) =\n{np.array2string(X_real, threshold=np.inf, max_line_width=200)}\n\n")
         f.write(f"X_int8 (K x M) =\n{np.array2string(X_int8, threshold=np.inf, max_line_width=200)}\n")
 
-    # ---- write quantized weights: row-major (k*N+n) into weight_buffer ----
+    # ---- write weights: row-major over the *full* K x N matrix - this
+    # layout doesn't change for multi-block (weight_ctrl.v's base_addr
+    # walks it with row_stride=N regardless of block count) ----
     for k in range(K):
         for n in range(N):
             await write_byte(dut, WBUF_BASE + k * N + n, to_uint8(int(W_int8[k, n])))
 
-    # ---- write quantized input: banked one bank per array row (bank =
-    # k % ARRAY_ROWS, offset = k_blk_idx*M + m, matching weight_ctrl's
-    # input_band_base_addr) ----
+    # ---- write input: banked one bank per array row (bank = k %
+    # ARRAY_ROWS); k_blk_idx's M-sized band is appended after the previous
+    # k_blk's within the same bank, matching weight_ctrl's
+    # input_band_base_addr = k_blk_idx*input_max_addr ----
     for k in range(K):
         k_local = k % ARRAY_ROWS
         k_blk = k // ARRAY_ROWS
@@ -245,37 +409,51 @@ async def test_min_32x32_matmul(dut):
             addr = IBUF_BASE + k_local * (1 << IBUF_BANK_ADDR_WIDTH) + k_blk * M + m
             await write_byte(dut, addr, to_uint8(int(X_int8[k, m])))
 
-    # ---- program dimensions + rescale factor ----
     await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
     await avalon_write(dut, WEIGHT_COLS_ADDR, N)
     await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
     await avalon_write(dut, INPUT_COLS_ADDR, M)
     await avalon_write(dut, OUTPUT_SCALE_ADDR, output_scale_q16)
 
-    # ---- kick off the matmul: everything past this is sequenced by
-    # weight_ctrl internally (see rtl/weight_ctrl.v) ----
     await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
 
-    await wait_output_done(dut)
-    # give output_buffer's write a cycle to land before reading it back
+    # ---- wait for the *whole* matmul, not just the first committed block
+    # (see wait_matmul_done) ----
+    await wait_matmul_done(dut)
     await ClockCycles(dut.clk, 2)
 
-    # ---- golden model: raw = W_int8 @ X_int8 at full precision, then
-    # requantized exactly like output_loader's rescale stage using the
-    # *actual* OUTPUT_SCALE value written above (so its own Q0.16 rounding
-    # is reflected, not just the ideal combined_scale): raw*OUTPUT_SCALE
-    # arithmetic-shifted right by 16, saturated to int8. Python's >> on
-    # signed ints is already an arithmetic (floor) shift, so this
-    # reproduces the hardware's `>>>` bit-for-bit. ----
-    raw = W_int8 @ X_int8
-    scaled = (raw * output_scale_q16) >> 16
-    golden = np.clip(scaled, -128, 127)
+    # ---- golden model: output_loader rescales/saturates EACH k-block's
+    # raw partial psum separately, then accumulates the already-saturated
+    # int8 results (see output_loader.v: scaled_psum = saturate(psum_d *
+    # output_scale >>> 16); acc_sat = saturate(old_val + scaled_psum)). It
+    # does NOT sum the full-precision raw accumulator across k-blocks and
+    # rescale once - that would require carrying the 32-bit psum across
+    # block boundaries instead of just the int8 result already sitting in
+    # output_buffer, defeating the point of rescaling to int8 between
+    # passes. Reproduce that ordering exactly.
+    #
+    # Block kb covers contraction index p in [kb*ARRAY_ROWS,
+    # (kb+1)*ARRAY_ROWS) - X_int8 is blocked by ROWS (confirmed above by
+    # this test's own input-writing code: k_blk = k // ARRAY_ROWS), and
+    # since the full contraction is sum_p W_int8[n,p]*X_int8[p,m], p *is*
+    # X_int8's row index by definition of matmul - so W_int8 must be
+    # sliced by the *matching columns* (not rows) for the same p range. ----
+    num_k_blocks = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
+    golden = None
+    for kb in range(num_k_blocks):
+        lo, hi = kb * ARRAY_ROWS, min((kb + 1) * ARRAY_ROWS, K)
+        raw_block = W_int8[:, lo:hi] @ X_int8[lo:hi, :]
+        scaled_block = np.clip((raw_block * output_scale_q16) >> 16, -128, 127)
+        golden = scaled_block if golden is None else np.clip(golden + scaled_block, -128, 127)
 
-    # ---- read back output_buffer: bank c (=row n, since n_blk_idx=0),
-    # offset m ----
+    # ---- read back output_buffer: row n lives in bank c = n % ARRAY_COLS,
+    # at that bank's n_blk_idx*M + m offset, where n_blk_idx = n //
+    # ARRAY_COLS (see output_loader.v's header note on bank layout) ----
     mismatches = []
     for n in range(N):
-        bank_base = OBUF_BASE + (n << OBUF_BANK_ADDR_WIDTH)
+        n_blk = n // ARRAY_COLS
+        c = n % ARRAY_COLS
+        bank_base = OBUF_BASE + (c << OBUF_BANK_ADDR_WIDTH) + n_blk * M
         for m in range(M):
             got = to_int8(await read_byte(dut, bank_base + m))
             exp = int(golden[n, m])

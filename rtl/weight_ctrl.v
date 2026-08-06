@@ -87,7 +87,8 @@ module weight_ctrl #(
     // edge (which always happens well before the next commit could
     // possibly land), so they stay valid for its whole drain window.
     output reg [DIM_WIDTH-1:0] committed_n_blk_idx,   // which output block this draining pass belongs to
-    output reg                 committed_first_k_blk  // this pass is k_blk_idx==0 for that output block - write, don't accumulate
+    output reg                 committed_first_k_blk,  // this pass is k_blk_idx==0 for that output block - write, don't accumulate
+    output reg [DIM_WIDTH-1:0] committed_k_blk_idx
 );
 
     localparam K_CNT_WIDTH = $clog2(ARRAY_ROWS+1);
@@ -113,8 +114,8 @@ module weight_ctrl #(
     wire [DIM_WIDTH-1:0] num_k_blocks = (k_latched + ARRAY_ROWS - 1) >> K_SHIFT;
     wire [DIM_WIDTH-1:0] num_n_blocks = (n_latched + ARRAY_COLS - 1) >> N_SHIFT;
 
-    wire is_last_k_blk  = (k_blk_idx == num_k_blocks - 1'b1);
-    wire is_last_n_blk  = (n_blk_idx == num_n_blocks - 1'b1);
+    wire is_last_k_blk  = (k_blk_idx == num_k_blocks-1);
+    wire is_last_n_blk  = (n_blk_idx == num_n_blocks-1);
     wire is_last_block  = is_last_n_blk && is_last_k_blk;
 
     // ---- current block's valid extent - masks a partial last block along
@@ -131,7 +132,7 @@ module weight_ctrl #(
 
     // ---- current block's 32-row band base address in input_buffer (also
     // assumed row-major: each band occupies one input_max_addr-sized span) ----
-    assign input_band_base_addr = k_blk_idx[IBUF_ADDR_WIDTH-1:0] * input_max_addr;
+    assign input_band_base_addr = n_blk_idx[IBUF_ADDR_WIDTH-1:0] * input_max_addr;
 
     reg loader_start;
     reg commit_pulse;
@@ -155,6 +156,7 @@ module weight_ctrl #(
             input_compute_start  <= 1'b0;
             committed_n_blk_idx  <= '0;
             committed_first_k_blk <= 1'b0;
+            committed_k_blk_idx  <= '0;
         end
         else begin
             loader_start        <= 1'b0;
@@ -176,6 +178,7 @@ module weight_ctrl #(
                 wc_state          <= WC_WAIT;
             end
             else begin
+
                 case (wc_state)
                     WC_WAIT: begin
                         if (loader_ready && input_fifos_primed) begin
@@ -183,6 +186,7 @@ module weight_ctrl #(
                             input_compute_start  <= 1'b1;  // input_dispatch PRELOAD -> OFFLOAD
                             last_block_pending   <= is_last_block;
                             committed_n_blk_idx   <= n_blk_idx;
+                            committed_k_blk_idx   <= k_blk_idx;
                             committed_first_k_blk <= (k_blk_idx == '0);
 
                             if (!is_last_block) begin

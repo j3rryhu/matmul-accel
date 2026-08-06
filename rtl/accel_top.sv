@@ -96,17 +96,19 @@ module accel_top #(
     wire [7:0]  ibuf_wdata     = be_select_byte(avs_writedata, avs_byteenable);
 
     wire [255:0] ibuf_q;
-    wire [7:0]  ibuf_rdaddress;
+    wire [ARRAY_ROWS*8-1:0]  ibuf_rdaddress;
     wire        ibuf_rden;
+    wire [ARRAY_ROWS-1:0] ibuf_byteenable;
 
     input_buffer_32_bank u_input_buffer (
-        .clock     (clk),
-        .data      (ibuf_wdata),
-        .rdaddress (ibuf_rdaddress),
-        .rden      (ibuf_rden),
-        .wraddress (ibuf_wraddress),
-        .wren      (ibuf_wren),
-        .q         (ibuf_q)
+        .clock         (clk),
+        .data          (ibuf_wdata),
+        .rdaddress     (ibuf_rdaddress),
+        .rden          (ibuf_rden),
+        .rd_byteenable (ibuf_byteenable),  // per-row masking, driven by input_dispatch (see input_dispatch.v)
+        .wraddress     (ibuf_wraddress),
+        .wren          (ibuf_wren),
+        .q             (ibuf_q)
     );
 
     // ============================================================
@@ -249,6 +251,7 @@ module accel_top #(
         .ibuf_q         (ibuf_q),
         .ibuf_rdaddress (ibuf_rdaddress),
         .ibuf_rden      (ibuf_rden),
+        .ibuf_byteenable(ibuf_byteenable),
 
         .a_out          (a_out),
         .a_en           (a_en),
@@ -273,6 +276,7 @@ module accel_top #(
     wire                                      w_en;
     wire                                      w_load;
     wire [15:0]                              committed_n_blk_idx;    // -> output_loader
+    wire [15:0]                              committed_k_blk_idx;
     wire                                      committed_first_k_blk; // -> output_loader
 
     weight_ctrl #(
@@ -310,6 +314,7 @@ module accel_top #(
         .input_band_done      (input_band_done),
 
         .committed_n_blk_idx   (committed_n_blk_idx),
+        .committed_k_blk_idx   (committed_k_blk_idx),
         .committed_first_k_blk (committed_first_k_blk)
     );
 
@@ -336,6 +341,7 @@ module accel_top #(
 
         .a_en_last             (a_en[ARRAY_COLS-1]),
         .total_rows            (input_cols[OBUF_BANK_ADDR_WIDTH-1:0]),
+        .committed_k_blk_idx   (committed_k_blk_idx),
         .committed_n_blk_idx   (committed_n_blk_idx),
         .committed_first_k_blk (committed_first_k_blk),
 

@@ -21,7 +21,7 @@
 // be added to whatever's already at that output position - except the
 // very first k-block for a given n_blk_idx, whose target position is
 // otherwise stale/uninitialized and gets written directly instead.
-// weight_ctrl's committed_n_blk_idx/committed_first_k_blk (latched at
+// weight_ctrl's committed_k_blk_idx/committed_first_k_blk (latched at
 // commit, valid for that block's whole compute+drain window) tell us
 // which case we're in; this module samples them once, at its own a_en_last
 // start edge, and holds them for the rest of that block's drain - by
@@ -81,7 +81,7 @@ module output_loader #(
     parameter SCALE_WIDTH    = 16,   // output_scale width - Q0.16 fixed point (unsigned, range [0,1))
     parameter ARRAY_COLS     = 32,
     parameter ROW_ADDR_WIDTH = 16,   // per-bank address width - must span num_n_blocks*total_rows
-    parameter DIM_WIDTH      = 16    // width of committed_n_blk_idx (from weight_ctrl)
+    parameter DIM_WIDTH      = 16    // width of committed_k_blk_idx (from weight_ctrl)
 )(
     input                                          clock,
     input                                           rst_n,       // active-low
@@ -93,7 +93,8 @@ module output_loader #(
     // ---- timing anchor + block identity (from weight_ctrl) ----
     input                                           a_en_last,                 // pe_array a_en[0]
     input      [ROW_ADDR_WIDTH-1:0]                 total_rows,            // M: expected valid results per column, per pass
-    input      [DIM_WIDTH-1:0]                      committed_n_blk_idx,   // weight_ctrl: output block this pass belongs to
+    input      [DIM_WIDTH-1:0]                      committed_k_blk_idx,   // weight_ctrl: output block this pass belongs to
+    input      [DIM_WIDTH-1:0]                      committed_n_blk_idx,
     input                                            committed_first_k_blk, // weight_ctrl: write instead of accumulate
 
     // ---- rescale factor (from ctrl_rf, see rdl/ctrl_reg.rdl OUTPUT_SCALE) ----
@@ -121,12 +122,13 @@ module output_loader #(
     reg                     armed;      // ready to latch the next a_en_last rising edge
     reg                     a_en_last_d;
     reg                     running;
-    reg [ELAPSED_W-1:0]     elapsed;
+    reg  [ELAPSED_W:0]      elapsed;
 
-    reg [ROW_ADDR_WIDTH-1:0] col_count [0:ARRAY_COLS-1];
+    reg  [ROW_ADDR_WIDTH-1:0] col_count [0:ARRAY_COLS-1];
     wire [ARRAY_COLS-1:0]    col_done;
 
     // ---- sampled once at start_edge, held for this block's whole drain ----
+    reg [DIM_WIDTH-1:0] held_k_blk_idx;
     reg [DIM_WIDTH-1:0] held_n_blk_idx;
     reg                 held_first_k_blk;
 
@@ -144,17 +146,11 @@ module output_loader #(
             armed            <= 1'b1;
             running          <= 1'b0;
             elapsed          <= {ELAPSED_W{1'b0}};
+            held_k_blk_idx   <= '0;
             held_n_blk_idx   <= '0;
             held_first_k_blk <= 1'b0;
         end
         else begin
-            if (a_en_last) begin
-                armed            <= 1'b0;
-                running          <= 1'b1;
-                elapsed          <= {ELAPSED_W{1'b0}};
-                held_n_blk_idx   <= committed_n_blk_idx;
-                held_first_k_blk <= committed_first_k_blk;
-            end
             if (running) begin
                 if (elapsed < ELAPSED_MAX)
                     elapsed <= elapsed + 1'b1;
@@ -162,8 +158,20 @@ module output_loader #(
                 if (done) begin
                     running <= 1'b0;
                     armed   <= 1'b1;
+                    elapsed <= 0;
                 end
             end
+            else begin
+                if (a_en_last) begin
+                    armed            <= 1'b0;
+                    running          <= 1'b1;
+                    elapsed          <= {ELAPSED_W{1'b0}};
+                    held_k_blk_idx   <= committed_k_blk_idx;
+                    held_n_blk_idx   <= committed_n_blk_idx;
+                    held_first_k_blk <= committed_first_k_blk;
+                end
+            end
+            
         end
     end
 
@@ -175,6 +183,7 @@ module output_loader #(
         for (c = 0; c < ARRAY_COLS; c = c + 1) begin : COL
             wire col_live   = running && elapsed >= c;
             wire col_active = col_live && (col_count[c] < total_rows);
+            wire [ROW_ADDR_WIDTH-1:0] per_col_cnt = col_count[c];
 
             always @(posedge clock) begin
                 if (~rst_n)
@@ -188,9 +197,9 @@ module output_loader #(
             assign col_done[c] = (col_count[c] == total_rows);
 
             // this bank's address for the position col_count[c] currently
-            // points at: held_n_blk_idx's segment, appended after every
+            // points at: held_k_blk_idx's segment, appended after every
             // earlier n_blk_idx's total_rows-sized segment in this bank
-            wire [ROW_ADDR_WIDTH-1:0] cur_addr = held_n_blk_idx*total_rows + col_count[c];
+            wire [ROW_ADDR_WIDTH-1:0] cur_addr = held_k_blk_idx*total_rows + col_count[c];
 
             assign obuf_rden[c] = col_active;
             assign obuf_rdaddress[c*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH] = cur_addr;
@@ -236,13 +245,13 @@ module output_loader #(
 
             // k-block accumulate: also saturated, since old_val+scaled_psum
             // can exceed DATA_WIDTH even when each term is already in range
-            wire signed [DATA_WIDTH:0] acc_sum = $signed(old_val) + $signed(scaled_psum);
+            wire signed [DATA_WIDTH:0] acc_sum = running ? $signed(old_val) + $signed(scaled_psum) : 0;
             wire [DATA_WIDTH-1:0] acc_sat =
                 (acc_sum > $signed(DATA_MAX)) ? DATA_MAX :
                 (acc_sum < $signed(DATA_MIN)) ? DATA_MIN :
                                                  acc_sum[DATA_WIDTH-1:0];
 
-            wire [DATA_WIDTH-1:0] new_val = held_first_k_blk ? scaled_psum : acc_sat;
+            wire [DATA_WIDTH-1:0] new_val = (held_n_blk_idx == 0) ? scaled_psum : acc_sat;
 
             assign obuf_wren[c] = active_d;
             assign obuf_waddr[c*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH]  = addr_d;

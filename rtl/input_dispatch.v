@@ -26,8 +26,9 @@ module input_dispatch #(
     // input_buffer_32_bank read-side connections - one dedicated 8-bit
     // lane per row, all banks sharing the same rdaddress
     input       [ARRAY_ROWS*8-1:0]            ibuf_q,
-    output reg  [7:0]                         ibuf_rdaddress,
+    output reg  [ARRAY_ROWS*8-1:0]            ibuf_rdaddress,
     output reg                                ibuf_rden,
+    output reg  [ARRAY_ROWS-1:0]              ibuf_byteenable,
 
 
     // systolic array activation input, left edge - one lane per row
@@ -43,42 +44,45 @@ module input_dispatch #(
     output reg                                band_done         // pulse: this band fully drained
 );
 
-    reg             fifo_wren;
-    wire [31:0]     ififo_full;
-    wire [31:0]     ififo_empty;
-    reg  [31:0]     fifo_rden;
+    reg  [ARRAY_ROWS-1:0]     fifo_wren;
+    wire [ARRAY_ROWS-1:0]     ififo_full;
+    wire [ARRAY_ROWS-1:0]     ififo_empty;
+    reg  [ARRAY_ROWS-1:0]     fifo_rden;
 
     assign fifos_primed = ~(|ififo_empty[ARRAY_ROWS-1:0]);
+    integer fifo_wren_idx;
 
     always@(posedge clock)begin
         if(~rst_n)begin
             fifo_wren <= 0;
         end
         else begin
-            fifo_wren <= ibuf_rden;
+            for(fifo_wren_idx = 0; fifo_wren_idx < ARRAY_ROWS; fifo_wren_idx=fifo_wren_idx+1)begin
+                fifo_wren[fifo_wren_idx] <= ibuf_rden && ibuf_byteenable[fifo_wren_idx];
+            end
         end
     end
 
-    genvar i;
+    genvar ififo_gen_idx;
 
     generate
-        for(i = 0; i < ARRAY_ROWS; i=i+1)begin
+        for(ififo_gen_idx = 0; ififo_gen_idx < ARRAY_ROWS; ififo_gen_idx=ififo_gen_idx+1)begin
             sync_fifo_w8_d32 input_fifo (
                 .clock  (clock),
-                .data   (ibuf_q[i * 8 +: 8]),
-                .rdreq  (fifo_rden[i]),
-                .wrreq  (fifo_wren),
-                .empty  (ififo_empty[i]),
-                .full   (ififo_full[i]),
-                .q      (a_out[i * DATA_WIDTH +: DATA_WIDTH])
+                .data   (ibuf_q[ififo_gen_idx * 8 +: 8]),
+                .rdreq  (fifo_rden[ififo_gen_idx]),
+                .wrreq  (fifo_wren[ififo_gen_idx]),
+                .empty  (ififo_empty[ififo_gen_idx]),
+                .full   (ififo_full[ififo_gen_idx]),
+                .q      (a_out[ififo_gen_idx * DATA_WIDTH +: DATA_WIDTH])
             );
 
             always @(posedge clock) begin
                 if(~rst_n)begin
-                    a_en[i] <= 0;
+                    a_en[ififo_gen_idx] <= 0;
                 end
                 else begin
-                    a_en[i] <= fifo_rden[i];
+                    a_en[ififo_gen_idx] <= fifo_rden[ififo_gen_idx];
                 end
             end
         end
@@ -92,13 +96,58 @@ module input_dispatch #(
 
     reg  [ 1:0]  dispatch_state;
 
-    reg  [ 7:0]  read_count;    // reads issued this band
+    reg  [ARRAY_ROWS*8-1:0]  read_count;    // reads issued this band
     reg  [ 6:0]  skewed_start_cnt;
+    wire [ARRAY_ROWS-1:0]    ibuf_rd_done;
     integer ififo_idx;
 
-
+    integer i;
     // input buffer read out logic - every accepted read pulls one element
     // per row (all banks read together at the same offset), so the offset
+    genvar ibufdone_idx;
+    generate
+        for(ibufdone_idx = 0; ibufdone_idx < ARRAY_ROWS; ibufdone_idx = ibufdone_idx + 1)begin
+            assign ibuf_rd_done[ibufdone_idx] = (read_count[ibufdone_idx*8 +: 8] == i_max_addr);
+        end
+    endgenerate
+
+    // ---- per-row fill-level tracking, to gate new reads without relying
+    // on ififo_full[i] alone ----
+    // ififo_full[i] lags real fifo occupancy: a read decided this cycle
+    // (read_count[i] incremented, ibuf_byteenable[i] set) doesn't actually
+    // land in that row's fifo until 2 cycles later (1 cycle for
+    // input_buffer's synchronous read latency, +1 for the fifo_wren
+    // register), so ififo_full[i] can still read 0 for up to 2 cycles
+    // after the fifo has effectively committed to being full - reads
+    // issued in that window get silently dropped by the fifo's own
+    // internal wr_en && ~full gating (sync_fifo.v), since fifo depth
+    // (32) is sized with zero spare margin for exactly this many
+    // in-flight rows (see tb/models/sync_fifo_w8_d32.v's header note).
+    // read_count[i] (pushes decided) and pop_count[i] (pops actually
+    // accepted, real-time) are both driven by this module itself with no
+    // such lag, so (read_count[i]-pop_count[i]) is an always-accurate fill
+    // level - gating on it instead avoids the race entirely. ififo_full[i]
+    // is kept as an extra AND term below purely as a backstop; it should
+    // never be the binding condition once this is in place.
+    reg  [ARRAY_ROWS*8-1:0]  pop_count;     // pops actually accepted so far this band, per row
+    integer pop_idx;
+
+    always@(posedge clock)begin
+        if(~rst_n)begin
+            pop_count <= 0;
+        end
+        else if(dispatch_state == STATE_IDLE)begin
+            pop_count <= 0;   // mirrors read_count's per-band reset below
+        end
+        else begin
+            for(pop_idx = 0; pop_idx < ARRAY_ROWS; pop_idx = pop_idx + 1)begin
+                if(fifo_rden[pop_idx] && ~ififo_empty[pop_idx])
+                    pop_count[pop_idx*8 +: 8] <= pop_count[pop_idx*8 +: 8] + 1'b1;
+            end
+        end
+    end
+
+
     // just steps by 1 each cycle
     always@(posedge clock)begin
         if(~rst_n)begin
@@ -109,6 +158,7 @@ module input_dispatch #(
             read_count <= 0;
             band_done <= 1'b0;
             ibuf_rden <= 0;
+            ibuf_byteenable <= 32'hFFFFFFFF;
         end
         else begin
             band_done <= 1'b0;
@@ -117,22 +167,35 @@ module input_dispatch #(
                 STATE_IDLE: begin
                     read_count       <= 0;
                     if(i_band_start)begin
-                       ibuf_rdaddress   <= i_band_base_addr;
-                       ibuf_rden        <= 1'b1;
-                       read_count       <= read_count + 1;
-                       dispatch_state   <= STATE_PRELOAD;
+                        ibuf_rdaddress   <= {(ARRAY_ROWS){i_band_base_addr}};
+                        ibuf_rden        <= 1'b1;
+                        ibuf_byteenable  <= 32'hFFFFFFFF;
+                        for(i=0; i < ARRAY_ROWS; i=i+1)begin
+                            read_count[i*8 +: 8] <= read_count[i*8 +: 8] + 1;
+                        end
+                        dispatch_state   <= STATE_PRELOAD;
                     end
                 end
 
                 STATE_PRELOAD: begin
-                    if(read_count < i_max_addr && ~(|ififo_full))begin
-                        ibuf_rdaddress <= ibuf_rdaddress + 1'b1;
-                        ibuf_rden      <= 1'b1;
-                        read_count     <= read_count + 1'b1;
+                    for(i=0; i < ARRAY_ROWS; i=i+1)begin
+                        if(read_count[i*8+:8] < i_max_addr
+                           && (read_count[i*8+:8] - pop_count[i*8+:8]) < 32
+                           && ~ififo_full[i])begin
+                            ibuf_rdaddress[i*8+:8] <= ibuf_rdaddress[i*8+:8] + 1'b1;
+                            read_count[i*8+:8]     <= read_count[i*8+:8] + 1'b1;
+                            ibuf_byteenable[i]     <= 1;
+                        end
+                        else begin
+                            ibuf_byteenable[i]     <= 0;
+                        end
                     end
 
-                    if(read_count == i_max_addr)begin
+                    if(&ibuf_rd_done || (&ififo_full))begin
                         ibuf_rden <= 0;
+                    end
+                    else begin
+                        ibuf_rden <= 1;
                     end
 
                     if(i_start_compute)begin
@@ -141,10 +204,24 @@ module input_dispatch #(
                 end
 
                 STATE_OFFLOAD: begin
-                    if(read_count < i_max_addr && ~(|ififo_full))begin
-                        ibuf_rdaddress <= ibuf_rdaddress + 1'b1;
-                        ibuf_rden      <= 1'b1;
-                        read_count     <= read_count + 1'b1;
+                    for(i=0; i < ARRAY_ROWS; i=i+1)begin
+                        if(read_count[i*8+:8] < i_max_addr
+                           && (read_count[i*8+:8] - pop_count[i*8+:8]) < 32
+                           && ~ififo_full[i])begin
+                            ibuf_rdaddress[i*8+:8] <= ibuf_rdaddress[i*8+:8] + 1'b1;
+                            read_count[i*8+:8]     <= read_count[i*8+:8] + 1'b1;
+                            ibuf_byteenable[i]     <= 1;
+                        end
+                        else begin
+                            ibuf_byteenable[i]     <= 0;
+                        end
+                    end
+
+                    if(&ibuf_rd_done || (&ififo_full))begin
+                        ibuf_rden <= 0;
+                    end
+                    else begin
+                        ibuf_rden <= 1;
                     end
 
                     if(skewed_start_cnt < 'd32)begin
@@ -152,18 +229,14 @@ module input_dispatch #(
                         skewed_start_cnt <= skewed_start_cnt + 1;
                     end
 
-                    if(skewed_start_cnt >= 'd32 && skewed_start_cnt < 'd64)begin
-                        fifo_rden[skewed_start_cnt-32] <= 0;
-                        skewed_start_cnt <= skewed_start_cnt + 1;
-                    end
+                    // if(skewed_start_cnt >= 'd32 && skewed_start_cnt < 'd64)begin
+                    //     fifo_rden[skewed_start_cnt-32] <= 0;
+                    //     skewed_start_cnt <= skewed_start_cnt + 1;
+                    // end
 
                     for(ififo_idx = 0; ififo_idx < 32; ififo_idx = ififo_idx + 1)begin
                         if(ififo_empty[ififo_idx])
                             fifo_rden[ififo_idx] <= 0;
-                    end
-
-                    if(read_count == i_max_addr)begin
-                        ibuf_rden <= 0;
                     end
 
                     if(&ififo_empty == 1)begin
@@ -176,6 +249,7 @@ module input_dispatch #(
                     ibuf_rden <= 0;
                     skewed_start_cnt <= 0;
                     dispatch_state <= STATE_IDLE;
+                    read_count <= 0;
                 end
 
 

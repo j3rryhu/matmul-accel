@@ -5,15 +5,23 @@
 // input_dispatch.v). wraddress is a single linear address split the same
 // way output_buffer_32_bank's is: upper bits pick the bank (row), low bits
 // are the offset within it.
-module input_buffer_32_bank (
+//
+// rd_byteenable is one bit per bank (bit i gates bank i's rden, on top of
+// the shared rden) - lets a caller mask out specific rows' banks from a
+// given read (e.g. rows beyond a partial block's valid_rows) without
+// touching the shared rdaddress/rden that every other bank still uses.
+module input_buffer_32_bank #(
+    parameter ARRAY_ROWS = 32
+) (
     input                       clock,
     input       [ 7:0]          data,
-    input       [ 7:0]          rdaddress,
+    input       [ARRAY_ROWS*8-1:0]        rdaddress,
     input                       rden,
+    input       [ARRAY_ROWS-1:0]          rd_byteenable,
     input       [12:0]          wraddress,
     input                       wren,
 
-    output wire [8 * 32 - 1:0]  q
+    output wire [8 * ARRAY_ROWS - 1:0]  q
 
 );
 
@@ -23,8 +31,8 @@ module input_buffer_32_bank (
             input_buffer u_input_buffer (
                 .clock     (clock),
                 .data      (data),
-                .rdaddress (rdaddress),
-                .rden      (rden),
+                .rdaddress (rdaddress[i*8+:8]),
+                .rden      (rden & rd_byteenable[i]),
                 .wraddress (wraddress[7:0]),
                 .wren      (wren & (wraddress[12:8] == i)),
                 .q         (q[i * 8 +: 8])

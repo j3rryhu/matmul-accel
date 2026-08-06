@@ -1,6 +1,6 @@
 <testsuites name="results">
   <testsuite name="all" package="all">
-    <property name="random_seed" value="1785812889" />
-    <testcase name="test_min_32x32_matmul" classname="test_accel_top" file="/home/huchenj/matmul-accel/tb/test_accel_top.py" lineno="189" time="9.939010620117188" sim_time_ns="52400.0" ratio_time="5272.154543626211" />
+    <property name="random_seed" value="1785983184" />
+    <testcase name="test_64x64_multiblock_matmul" classname="test_accel_top" file="/home/huchenj/matmul-accel/tb/test_accel_top.py" lineno="333" time="49.38368272781372" sim_time_ns="206420.0" ratio_time="4179.923177008036" />
   </testsuite>
 </testsuites>
