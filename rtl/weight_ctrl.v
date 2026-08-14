@@ -92,8 +92,8 @@ module weight_ctrl #(
     output reg                 committed_first_k_blk,  // this pass is k_blk_idx==0 for that output block - write, don't accumulate
     output reg [DIM_WIDTH-1:0] committed_k_blk_idx,
 
-    output wire [K_CNT_WIDTH-1:0] valid_row,
-    output wire [N_CNT_WIDTH-1:0] valid_col
+    output reg  [K_CNT_WIDTH-1:0] valid_row,
+    output reg  [N_CNT_WIDTH-1:0] valid_col
 );
 
     // localparam K_CNT_WIDTH = $clog2(ARRAY_ROWS+1);
@@ -131,9 +131,6 @@ module weight_ctrl #(
     wire [K_CNT_WIDTH-1:0] valid_k = (k_rem < ARRAY_ROWS) ? k_rem[K_CNT_WIDTH-1:0] : ARRAY_ROWS[K_CNT_WIDTH-1:0];
     wire [N_CNT_WIDTH-1:0] valid_n = (n_rem < ARRAY_COLS) ? n_rem[N_CNT_WIDTH-1:0] : ARRAY_COLS[N_CNT_WIDTH-1:0];
 
-    assign valid_row = valid_k;
-    assign valid_col = valid_n;
-
     // ---- current block's top-left address in weight_buffer (row-major
     // over the full contraction x output matrix) ----
     wire [WBUF_ADDR_WIDTH-1:0] base_addr = (k_blk_idx*ARRAY_ROWS)*n_latched + n_blk_idx*ARRAY_COLS;
@@ -165,6 +162,9 @@ module weight_ctrl #(
             committed_n_blk_idx  <= '0;
             committed_first_k_blk <= 1'b0;
             committed_k_blk_idx  <= '0;
+            
+            valid_row            <= 0;
+            valid_col            <= 0;
         end
         else begin
             loader_start        <= 1'b0;
@@ -196,6 +196,8 @@ module weight_ctrl #(
                             committed_n_blk_idx   <= n_blk_idx;
                             committed_k_blk_idx   <= k_blk_idx;
                             committed_first_k_blk <= (k_blk_idx == '0);
+                            valid_row <= valid_k;
+                            valid_col <= valid_n;
 
                             if (!is_last_block) begin
                                 if (is_last_k_blk) begin

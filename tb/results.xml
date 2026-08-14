@@ -1,6 +1,0 @@
-<testsuites name="results">
-  <testsuite name="all" package="all">
-    <property name="random_seed" value="1786733890" />
-    <testcase name="test_64x64_multiblock_matmul" classname="test_accel_top" file="/home/huchenj/matmul-accel/tb/test_accel_top.py" lineno="333" time="57.128143310546875" sim_time_ns="206420.0" ratio_time="3613.280391030863" />
-  </testsuite>
-</testsuites>

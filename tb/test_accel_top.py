@@ -224,6 +224,16 @@ def quantize_symmetric_int8(x):
     return x_int8, scale
 
 
+def format_int8_hex(arr):
+    """Render a 2D int8-range array as one row of 2-digit two's-complement
+    hex bytes per line (same byte values as what write_byte puts on the
+    wire) - handy for cross-referencing against a waveform."""
+    return "\n".join(
+        " ".join(f"{to_uint8(int(v)):02x}" for v in row)
+        for row in arr
+    )
+
+
 # @cocotb.test()
 # async def test_min_32x32_matmul(dut):
 #     rng = np.random.default_rng(0)
@@ -471,52 +481,62 @@ async def test_64x64_multiblock_matmul(dut):
 
 
 # @cocotb.test()
-# async def test_49x32x64_partial_k_block_matmul(dut):
-#     """weight_rows(K)=49 x weight_cols(N)=32 x input_cols(M)=64 - weight's
-#     row dimension (K, the contraction size - see weight_ctrl.v's header
-#     note: WEIGHT_ROWS is always the contraction size, regardless of which
-#     one is literally "rows" on paper) is 49, not a multiple of
-#     ARRAY_ROWS(32), so it splits into 2 k-blocks (k_blk_idx=0 full 32 rows,
-#     k_blk_idx=1 only 17 valid rows) that both accumulate into the *same*
-#     single n-block (N=32 == ARRAY_COLS exactly, so n_blk_idx is always 0).
+# async def test_49x32x64_partial_row_block_matmul(dut):
+#     """weight_rows(K)=49 x weight_cols(N)=32 x input_cols(M)=64. Weight is
+#     stored exactly as written on paper - (49,32), no transpose - and this
+#     is a plain Y = W @ X: W(49,32) @ X(32,64) = Y(49,64), contracting over
+#     the shared 32 dimension.
 
-#     This is a different gap than test_64x64_multiblock_matmul: that test's
-#     2x2 blocks are all exactly full (64 is a multiple of 32), so it never
-#     exercises a *partial* last k-block, and its k_blk_idx=1 pass always
-#     lands on a different n_blk_idx than this test's does at some point
-#     only if n varies - here, critically, k_blk_idx=0 and k_blk_idx=1 both
-#     commit under n_blk_idx=0, so this is the first test where the
-#     write-vs-accumulate decision has to correctly distinguish "first
-#     k-block for this n-block" from "n_blk_idx==0" - those two conditions
-#     happen to coincide in every existing test (test_min_32x32_matmul has
-#     only one block total; test_64x64_multiblock_matmul's k_blk_idx=0 passes
-#     only ever occur exactly when a *new* n_blk_idx starts), but here
-#     k_blk_idx=1's commit is also under n_blk_idx==0, so a write-vs-
-#     accumulate condition keyed off n_blk_idx==0 rather than off
-#     "first k-block for this n-block" would incorrectly overwrite
-#     k_blk_idx=0's contribution instead of accumulating onto it.
+#     Actual PE dataflow (from pe.v/pe_array.v directly, NOT weight_ctrl.v's
+#     header comment, which describes the wrong axis): weight is loaded
+#     straight into PE(row,col) with no transpose (w_addr = row*ARRAY_COLS+col,
+#     weight_loader walks weight_buffer row-major into the same row/col
+#     layout). Partial sums (b_in) cascade *across columns within a row*
+#     (pe_array.v: pe_b_in = ROW[r].COL[c-1].pe_p_out) - so contraction
+#     happens over the weight's COLUMN axis (WEIGHT_COLS/N), and each PE ROW
+#     independently produces one full output row, taken from its rightmost
+#     column. Activations flow *down* each column from the top (pe_a_in for
+#     r==0 comes from a_in[c]; for r>0 from the PE above) - input_buffer bank
+#     c feeds PE column c, i.e. the contraction axis, matching weight's
+#     columns. So WEIGHT_ROWS(K) is the *output-row* axis (blocked by
+#     ARRAY_ROWS=32: k_blk_idx=0 covers rows 0..31, k_blk_idx=1 covers rows
+#     32..48 - two blocks producing two DISJOINT ranges of output rows,
+#     concatenated, not accumulated), and WEIGHT_COLS(N) is the true
+#     contraction size (32 == ARRAY_COLS here, so it's a single pass, no
+#     masking on that axis needed). This also explains output_loader's
+#     obuf address (held_k_blk_idx*total_rows + m) and its write-vs-accumulate
+#     gate (held_n_blk_idx==0 ? write : accumulate): different k-blocks write
+#     different address ranges (concatenation, not accumulation - correct,
+#     since num_n_blocks==1 here means n_blk_idx is always 0, so every commit
+#     "writes" and none ever needs to accumulate).
 
-#     Exercises:
+#     Input: the whole (32,64) matrix is loaded into input_buffer once, up
+#     front (contraction size N==ARRAY_COLS exactly - a single band, reused
+#     by both k-block passes, since input doesn't depend on k_blk_idx at all).
+
+#     Neither test_64x64_multiblock_matmul (exact 2x2 full blocks) nor
+#     test_min_32x32_matmul (single full block) ever exercises a *partial*
+#     last block on either axis. This one exercises:
 #       - weight_ctrl's valid_k/valid_row masking (rtl/weight_ctrl.v) for a
-#         genuinely partial last k-block.
-#       - output_loader's k-block accumulate (old_val + scaled_psum,
-#         saturated) actually firing for k_blk_idx=1, rather than every
-#         commit under n_blk_idx=0 falling through to a plain write.
+#         genuinely partial last k-block (17 of 32 rows valid).
+#       - weight_loader's zero-padding of out-of-range PE rows for that
+#         partial block (valid_rows), rather than always landing exactly on
+#         a block boundary.
+#       - output_loader's row_live masking (r < weight_rows, weight_rows fed
+#         from valid_row/valid_k) for k_blk_idx=1, where only rows 0..16 of
+#         that pass should ever produce/write a result.
+#       - output_buffer address reuse across k_blk_idx=0,1 (bank r's address
+#         = k_blk_idx*total_rows + m) landing on two disjoint ranges within
+#         the same 32 banks, rather than a single block's worth.
 
 #     Same quantization scheme as the other tests (see
 #     test_64x64_multiblock_matmul's docstring): real float W/X -> per-tensor
 #     symmetric int8 -> OUTPUT_SCALE combines weight_scale*input_scale/output_scale.
 
-#     Weight/input orientation: W_int8 is generated directly with shape
-#     (K, N) = (49, 32) - hardware's native weight_buffer orientation (row-
-#     major, address = k*WEIGHT_COLS+n) - and the golden output is
-#     W_int8.T @ X_int8 (shape (N,K) @ (K,M) = (N,M)), matching
-#     output_loader.v's y[n,m] = sum_k W[k,n]*X[k,m].
-
 #     Buffer capacity check: output_buffer's per-bank depth
-#     (1<<OBUF_BANK_ADDR_WIDTH = 128 entries) only needs to hold
-#     num_n_blocks*M = 1*64 = 64 entries here (single n-block), well under
-#     capacity.
+#     (1<<OBUF_BANK_ADDR_WIDTH = 128 entries) must hold num_k_blocks*M
+#     entries; here that's 2*64 = 128, exactly at capacity (same margin as
+#     test_64x64_multiblock_matmul).
 #     """
 #     K = 49
 #     N = 32
@@ -528,12 +548,12 @@ async def test_64x64_multiblock_matmul(dut):
 #     await reset_dut(dut)
 
 #     W_real = rng.normal(loc=0.0, scale=REAL_VAL_STD, size=(K, N))
-#     X_real = rng.normal(loc=0.0, scale=REAL_VAL_STD, size=(K, M))
+#     X_real = rng.normal(loc=0.0, scale=REAL_VAL_STD, size=(N, M))
 
 #     W_int8, weight_scale = quantize_symmetric_int8(W_real)
 #     X_int8, input_scale = quantize_symmetric_int8(X_real)
 
-#     Y_real = W_real.T @ X_real
+#     Y_real = W_real @ X_real
 #     _, output_scale = quantize_symmetric_int8(Y_real)
 
 #     combined_scale = weight_scale * input_scale / output_scale
@@ -543,6 +563,15 @@ async def test_64x64_multiblock_matmul(dut):
 #     )
 #     output_scale_q16 = round(combined_scale * 65536)
 
+#     # ---- golden model: plain Y = W @ X (see docstring - no transpose, no
+#     # cross-block accumulation; the two k-blocks produce disjoint output-row
+#     # ranges of the same single-pass contraction). Computed up front (needs
+#     # only the quantized inputs, not the simulation) so it can be dumped
+#     # alongside W/X below and reused later for the readback comparison. ----
+#     raw = W_int8 @ X_int8
+#     scaled = (raw * output_scale_q16) >> 16
+#     golden = np.clip(scaled, -128, 127)
+
 #     with open("sim_build/matrices_49x32x64.txt", "w") as f:
 #         f.write(
 #             f"weight_scale={weight_scale!r}\ninput_scale={input_scale!r}\n"
@@ -551,25 +580,29 @@ async def test_64x64_multiblock_matmul(dut):
 #         )
 #         f.write(f"W_real (K x N) =\n{np.array2string(W_real, threshold=np.inf, max_line_width=200)}\n\n")
 #         f.write(f"W_int8 (K x N) =\n{np.array2string(W_int8, threshold=np.inf, max_line_width=200)}\n\n")
-#         f.write(f"X_real (K x M) =\n{np.array2string(X_real, threshold=np.inf, max_line_width=200)}\n\n")
-#         f.write(f"X_int8 (K x M) =\n{np.array2string(X_int8, threshold=np.inf, max_line_width=200)}\n")
+#         f.write(f"X_real (N x M) =\n{np.array2string(X_real, threshold=np.inf, max_line_width=200)}\n\n")
+#         f.write(f"X_int8 (N x M) =\n{np.array2string(X_int8, threshold=np.inf, max_line_width=200)}\n\n")
+#         f.write(f"Y_real (K x M) =\n{np.array2string(Y_real, threshold=np.inf, max_line_width=200)}\n\n")
+#         f.write(f"golden Y_int8 (K x M) =\n{np.array2string(golden, threshold=np.inf, max_line_width=200)}\n\n")
+#         f.write(f"W_int8 hex (K x N), one row per line, each byte 2's-complement =\n{format_int8_hex(W_int8)}\n\n")
+#         f.write(f"X_int8 hex (N x M), one row per line, each byte 2's-complement =\n{format_int8_hex(X_int8)}\n\n")
+#         f.write(f"golden Y_int8 hex (K x M), one row per line, each byte 2's-complement =\n{format_int8_hex(golden)}\n")
 
-#     # ---- write weights: row-major over the K x N matrix (address = k*N+n,
-#     # see weight_ctrl.v's base_addr) ----
+#     # ---- write weights exactly as written on paper: row-major over the
+#     # K x N matrix (address = k*N+n, see weight_ctrl.v's base_addr; PE(row,col)
+#     # is loaded directly from this with no transpose - see docstring) ----
 #     for k in range(K):
 #         for n in range(N):
 #             await write_byte(dut, WBUF_BASE + k * N + n, to_uint8(int(W_int8[k, n])))
 
-#     # ---- write input: banked one bank per array row; k_blk_idx=0 covers
-#     # k=0..31 (bank=k, offset=m), k_blk_idx=1 covers k=32..48 (bank=k-32,
-#     # offset=M+m, appended after k_blk_idx=0's band in the same bank - see
-#     # weight_ctrl's input_band_base_addr = k_blk_idx*input_max_addr) ----
-#     for k in range(K):
-#         k_local = k % ARRAY_ROWS
-#         k_blk = k // ARRAY_ROWS
+#     # ---- write input: banked one bank per PE column (the contraction
+#     # axis) - the whole (32,64) input is loaded into input_buffer once, up
+#     # front (N == ARRAY_COLS exactly, a single band reused by both
+#     # k-block passes, since input doesn't depend on k_blk_idx) ----
+#     for c in range(N):
 #         for m in range(M):
-#             addr = IBUF_BASE + k_local * (1 << IBUF_BANK_ADDR_WIDTH) + k_blk * M + m
-#             await write_byte(dut, addr, to_uint8(int(X_int8[k, m])))
+#             addr = IBUF_BASE + c * (1 << IBUF_BANK_ADDR_WIDTH) + m
+#             await write_byte(dut, addr, to_uint8(int(X_int8[c, m])))
 
 #     await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
 #     await avalon_write(dut, WEIGHT_COLS_ADDR, N)
@@ -579,41 +612,30 @@ async def test_64x64_multiblock_matmul(dut):
 
 #     await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
 
-#     # ---- 2 k-blocks committed (both under n_blk_idx=0), so - like
-#     # test_64x64_multiblock_matmul - wait for the whole matmul rather than
-#     # just the first committed block ----
+#     # ---- 2 k-blocks (k_blk_idx=0,1), so - like test_64x64_multiblock_matmul
+#     # - wait for the whole matmul rather than just the first committed block ----
 #     await wait_matmul_done(dut)
 #     await ClockCycles(dut.clk, 2)
 
-#     # ---- golden model: output_loader rescales/saturates EACH k-block's
-#     # raw partial psum separately, then accumulates the already-saturated
-#     # int8 results (see test_64x64_multiblock_matmul's docstring for why -
-#     # same reasoning applies here, just with the 2nd k-block partial
-#     # (17 valid rows) instead of full) ----
-#     num_k_blocks = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
-#     golden = None
-#     for kb in range(num_k_blocks):
-#         lo, hi = kb * ARRAY_ROWS, min((kb + 1) * ARRAY_ROWS, K)
-#         raw_block = W_int8[lo:hi, :].T @ X_int8[lo:hi, :]
-#         scaled_block = np.clip((raw_block * output_scale_q16) >> 16, -128, 127)
-#         golden = scaled_block if golden is None else np.clip(golden + scaled_block, -128, 127)
-
-#     # ---- read back output_buffer: single n-block (N==ARRAY_COLS), so bank
-#     # c holds output row n=c directly at offset m (n_blk_idx=0 always) ----
+#     # ---- read back output_buffer: output row k lives in bank r = k % ARRAY_ROWS,
+#     # at that bank's k_blk_idx*M + m offset, k_blk_idx = k // ARRAY_ROWS
+#     # (see output_loader.v's obuf address: held_k_blk_idx*total_rows + m) ----
 #     mismatches = []
-#     for n in range(N):
-#         bank_base = OBUF_BASE + (n << OBUF_BANK_ADDR_WIDTH)
+#     for k in range(K):
+#         k_blk = k // ARRAY_ROWS
+#         r = k % ARRAY_ROWS
+#         bank_base = OBUF_BASE + (r << OBUF_BANK_ADDR_WIDTH) + k_blk * M
 #         for m in range(M):
 #             got = to_int8(await read_byte(dut, bank_base + m))
-#             exp = int(golden[n, m])
+#             exp = int(golden[k, m])
 #             if got != exp:
-#                 mismatches.append((n, m, exp, got))
+#                 mismatches.append((k, m, exp, got))
 
 #     if mismatches:
 #         preview = ", ".join(
-#             f"y[{n},{m}]: expected {exp}, got {got}"
-#             for n, m, exp, got in mismatches[:10]
+#             f"y[{k},{m}]: expected {exp}, got {got}"
+#             for k, m, exp, got in mismatches[:10]
 #         )
 #         raise AssertionError(
-#             f"{len(mismatches)}/{N * M} output mismatches. First few: {preview}"
+#             f"{len(mismatches)}/{K * M} output mismatches. First few: {preview}"
 #         )

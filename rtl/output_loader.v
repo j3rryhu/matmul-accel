@@ -274,6 +274,6 @@ module output_loader #(
     endgenerate
 
     assign busy = running;
-    assign done = running && &row_done;
+    assign done = running && &(row_done | ~((1 << weight_rows) - 1));
 
 endmodule
