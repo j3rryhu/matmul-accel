@@ -47,7 +47,9 @@ module weight_ctrl #(
     parameter ARRAY_COLS      = 32,
     parameter WBUF_ADDR_WIDTH = 14,
     parameter IBUF_ADDR_WIDTH = 8,    // input_buffer per-bank address width (input_dispatch)
-    parameter DIM_WIDTH       = 16    // WEIGHT_ROWS/WEIGHT_COLS field width
+    parameter DIM_WIDTH       = 16,    // WEIGHT_ROWS/WEIGHT_COLS field width
+    parameter K_CNT_WIDTH = $clog2(ARRAY_ROWS+1),
+    parameter N_CNT_WIDTH = $clog2(ARRAY_COLS+1)
 )(
     input                        clk,
     input                        rst_n,
@@ -88,11 +90,14 @@ module weight_ctrl #(
     // possibly land), so they stay valid for its whole drain window.
     output reg [DIM_WIDTH-1:0] committed_n_blk_idx,   // which output block this draining pass belongs to
     output reg                 committed_first_k_blk,  // this pass is k_blk_idx==0 for that output block - write, don't accumulate
-    output reg [DIM_WIDTH-1:0] committed_k_blk_idx
+    output reg [DIM_WIDTH-1:0] committed_k_blk_idx,
+
+    output wire [K_CNT_WIDTH-1:0] valid_row,
+    output wire [N_CNT_WIDTH-1:0] valid_col
 );
 
-    localparam K_CNT_WIDTH = $clog2(ARRAY_ROWS+1);
-    localparam N_CNT_WIDTH = $clog2(ARRAY_COLS+1);
+    // localparam K_CNT_WIDTH = $clog2(ARRAY_ROWS+1);
+    // localparam N_CNT_WIDTH = $clog2(ARRAY_COLS+1);
 
     // ARRAY_ROWS/ARRAY_COLS are powers of 2 - divide by shifting instead
     localparam K_SHIFT = $clog2(ARRAY_ROWS);
@@ -125,6 +130,9 @@ module weight_ctrl #(
     wire [DIM_WIDTH-1:0] n_rem = n_latched - n_blk_idx*ARRAY_COLS;
     wire [K_CNT_WIDTH-1:0] valid_k = (k_rem < ARRAY_ROWS) ? k_rem[K_CNT_WIDTH-1:0] : ARRAY_ROWS[K_CNT_WIDTH-1:0];
     wire [N_CNT_WIDTH-1:0] valid_n = (n_rem < ARRAY_COLS) ? n_rem[N_CNT_WIDTH-1:0] : ARRAY_COLS[N_CNT_WIDTH-1:0];
+
+    assign valid_row = valid_k;
+    assign valid_col = valid_n;
 
     // ---- current block's top-left address in weight_buffer (row-major
     // over the full contraction x output matrix) ----

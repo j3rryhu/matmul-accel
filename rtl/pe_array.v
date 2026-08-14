@@ -34,11 +34,11 @@ module pe_array #(
     input                                            w_load,
 
     // activation output, right edge - one lane per row (for tile cascading)
-    output [ARRAY_ROWS*DATA_WIDTH-1:0]              a_out,
+    output [ARRAY_COLS*DATA_WIDTH-1:0]              a_out,
 
     // partial-sum output, bottom edge - one lane per column (final results,
     // ACC_WIDTH-wide - see pe.v)
-    output [ARRAY_COLS*ACC_WIDTH-1:0]               p_out
+    output [ARRAY_ROWS*ACC_WIDTH-1:0]               p_out
 );
 
     genvar r, c;

@@ -278,6 +278,8 @@ module accel_top #(
     wire [15:0]                              committed_n_blk_idx;    // -> output_loader
     wire [15:0]                              committed_k_blk_idx;
     wire                                      committed_first_k_blk; // -> output_loader
+    wire [$clog2(ARRAY_ROWS+1):0]           valid_row;
+    wire [$clog2(ARRAY_COLS+1):0]           valid_col;
 
     weight_ctrl #(
         .DATA_WIDTH      (PE_DATA_WIDTH),
@@ -315,7 +317,10 @@ module accel_top #(
 
         .committed_n_blk_idx   (committed_n_blk_idx),
         .committed_k_blk_idx   (committed_k_blk_idx),
-        .committed_first_k_blk (committed_first_k_blk)
+        .committed_first_k_blk (committed_first_k_blk),
+
+        .valid_row          (valid_row),
+        .valid_col          (valid_col)
     );
 
     // ============================================================
@@ -330,6 +335,7 @@ module accel_top #(
         .DATA_WIDTH     (PE_DATA_WIDTH),
         .ACC_WIDTH      (ACC_DATA_WIDTH),
         .ARRAY_COLS     (ARRAY_COLS),
+        .ARRAY_ROWS     (ARRAY_ROWS),
         .ROW_ADDR_WIDTH (OBUF_BANK_ADDR_WIDTH),
         .DIM_WIDTH       (16)
     ) u_output_loader (
@@ -346,6 +352,9 @@ module accel_top #(
         .committed_first_k_blk (committed_first_k_blk),
 
         .output_scale   (output_scale),
+
+        .weight_rows    (valid_row),
+        .weight_cols    (valid_col),
 
         .obuf_rden      (obuf_bank_rden),
         .obuf_rdaddress (obuf_bank_rdaddress),
