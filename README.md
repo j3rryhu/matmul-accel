@@ -1,3 +1,36 @@
+# Buffer RAM IPs
+
+`weight_buffer`, `input_buffer`, and `output_buffer` are placeholder leaf RAMs
+(no `rtl/*.v` source checked in - just instantiated) standing in for
+Quartus-generated On-Chip Memory IPs. These are the depth/width params those
+generated IPs need to match:
+
+| Buffer | Leaf module | Instances | Per-instance depth x width | Address width | Total capacity | Matches AVS region |
+|---|---|---|---|---|---|---|
+| `weight_buffer` | `weight_buffer` (single instance, `rtl/accel_top.sv:81`) | 1 | 16384 x 8 | 14-bit | 16384 B (16 KB) | `WBUF_SIZE = 0x4000` |
+| `input_buffer` | `input_buffer` (via `input_buffer_32_bank.v`) | 32 (one per `ARRAY_ROWS`) | 256 x 8 | 8-bit | 32 x 256 B = 8192 B (8 KB) | `IBUF_SIZE = 0x2000` |
+| `output_buffer` | `output_buffer` (via `output_buffer_32_bank.v`) | 32 (one per `ARRAY_COLS`) | 128 x 8 | 7-bit | 32 x 128 B = 4096 B (4 KB) | `OBUF_SIZE = 0x1000` |
+
+All three are byte-wide (8-bit data, matching `PE_DATA_WIDTH`/int8) simple
+dual-port RAMs - independent `rdaddress`/`wraddress` each with their own
+`rden`/`wren`, one cycle of registered read latency.
+
+Notes:
+- `input_buffer`'s Avalon write address is 13 bits total
+  (`IBUF_ADDR_WIDTH`), split as bank-select (upper 5 bits, picks 1 of 32
+  banks) + 8-bit offset within the bank - see
+  `input_buffer_32_bank.v:34-37`.
+- `output_buffer`'s per-bank address width is a module parameter
+  (`output_buffer_32_bank.v`'s `BANK_ADDR_WIDTH`, default 10) but
+  `accel_top` overrides it to 7 (`OBUF_BANK_ADDR_WIDTH`, `rtl/accel_top.sv:124`)
+  to land on the 128-entries/bank depth above; use the overridden value,
+  not the module default, when sizing the generated IP.
+- If wrapping the whole `accel_top` into one Quartus IP (systolic array +
+  these three RAMs), each generated On-Chip Memory IP must be a simple
+  dual-port RAM (separate read/write ports) at the depth/width above -
+  regenerating at a different depth requires updating the corresponding
+  `*_SIZE`/`*_ADDR_WIDTH` localparams in `rtl/accel_top.sv` to match.
+
 # Block indexing (`k_blk_idx` / `n_blk_idx`)
 
 Notes on how the weight matrix's block/tile position is tracked and handed
