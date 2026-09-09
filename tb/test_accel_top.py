@@ -94,14 +94,12 @@ WATCHDOG_CYCLES = 8000
 MULTIBLOCK_DONE_TIMEOUT_CYCLES = 20000
 
 # The watchdog runs for the *whole* test, start to finish - not just
-# compute. For 64x64x64 that's dominated by the per-byte weight/input
-# write loops, not the matmul itself or the (now burst-read) readback:
-# weight+input writes are 64*64*2 = 8192 cycles (writes never stall on
-# avs_waitrequest - that's only asserted for OBUF reads), readback is 64
-# row bursts of 64 beats each - ~1 cycle/beat plus a couple cycles of
-# per-command overhead (see read_bytes_burst/avalon_burst_read), so a few
-# hundred cycles total. Add ~4900 for compute (4 blocks) and the total is
-# a few thousand cycles before any margin - comfortable headroom here.
+# compute. For 64x64x64 that's dominated by the per-byte Avalon loops, not
+# the matmul itself: weight+input writes are 64*64*2 = 8192 cycles (writes
+# never stall on avs_waitrequest - that's only asserted for OBUF reads), and
+# readback is 64*64 = 4096 reads at ~2 cycles each (obuf_rd_pending stalls
+# one cycle per read) = ~8192 cycles. Add ~4900 for compute (4 blocks) and
+# the total is already ~21300 before any margin - comfortable headroom here.
 MULTIBLOCK_WATCHDOG_CYCLES = 60000
 
 
@@ -118,73 +116,42 @@ async def watchdog(dut, max_cycles=WATCHDOG_CYCLES):
 
 
 async def reset_dut(dut):
-    dut.reset_n.setimmediatevalue(0)
-    dut.avs_address.setimmediatevalue(0)
-    dut.avs_read.setimmediatevalue(0)
-    dut.avs_write.setimmediatevalue(0)
-    dut.avs_writedata.setimmediatevalue(0)
-    dut.avs_byteenable.setimmediatevalue(0)
-    dut.avs_burstcount.setimmediatevalue(1)
+    dut.reset_n.value = 0
+    dut.avs_address.value = 0
+    dut.avs_read.value = 0
+    dut.avs_write.value = 0
+    dut.avs_writedata.value = 0
+    dut.avs_byteenable.value = 0
+    dut.avs_burstcount.value = 1
     await ClockCycles(dut.clk, 5)
-    dut.reset_n.setimmediatevalue(1)
+    dut.reset_n.value = 1
     await ClockCycles(dut.clk, 5)
 
 
 async def avalon_write(dut, addr, data, byteenable=0xF):
-    """Word-granular Avalon-MM write (used for ctrl_rf, which is 32-bit).
-
-    Uses setimmediatevalue (not .value=) throughout: cocotb's default
-    deposit-style write, issued immediately after resuming from a
-    RisingEdge, does not reliably take effect for the *very next* edge
-    under icarus+cocotb (confirmed on a bare DFF in isolation) - it only
-    becomes visible one edge later than expected, which silently shifts
-    every subsequent read/write by a cycle. Harmless for plain
-    combinational writes (weight_buffer/input_buffer have no accept/busy
-    state to desync), but corrupts anything state-machine-gated like the
-    read burst engine below - see avalon_burst_read."""
-    dut.avs_address.setimmediatevalue(addr)
-    dut.avs_write.setimmediatevalue(1)
-    dut.avs_writedata.setimmediatevalue(data & 0xFFFFFFFF)
-    dut.avs_byteenable.setimmediatevalue(byteenable)
-    dut.avs_read.setimmediatevalue(0)
+    """Word-granular Avalon-MM write (used for ctrl_rf, which is 32-bit)."""
+    dut.avs_address.value = addr
+    dut.avs_write.value = 1
+    dut.avs_writedata.value = data & 0xFFFFFFFF
+    dut.avs_byteenable.value = byteenable
+    dut.avs_read.value = 0
     await RisingEdge(dut.clk)
     while int(dut.avs_waitrequest.value):
         await RisingEdge(dut.clk)
-    dut.avs_write.setimmediatevalue(0)
-    dut.avs_byteenable.setimmediatevalue(0xF)
-
-
-async def avalon_burst_read(dut, addr, burstcount):
-    """Issues one Avalon-MM read command for `burstcount` beats starting at
-    `addr` and returns a list of that many words. accel_top's read burst
-    engine holds avs_waitrequest for the whole command (address-issue *and*
-    data-drain) - see rtl/accel_top.sv's read burst engine for exactly how
-    avs_readdatavalid relates to avs_waitrequest (they're not simply
-    interchangeable) - so beats are collected via avs_readdatavalid, and
-    avs_waitrequest is only used afterwards to know when it's safe to start
-    the next transaction.
-
-    Uses setimmediatevalue, not .value= - see avalon_write's docstring."""
-    dut.avs_address.setimmediatevalue(addr)
-    dut.avs_burstcount.setimmediatevalue(burstcount)
-    dut.avs_read.setimmediatevalue(1)
-    dut.avs_write.setimmediatevalue(0)
-    data = []
-    while len(data) < burstcount:
-        await RisingEdge(dut.clk)
-        if int(dut.avs_readdatavalid.value):
-            data.append(int(dut.avs_readdata.value))
-    while int(dut.avs_waitrequest.value):
-        await RisingEdge(dut.clk)
-    dut.avs_read.setimmediatevalue(0)
-    dut.avs_burstcount.setimmediatevalue(1)
-    return data
+    dut.avs_write.value = 0
+    dut.avs_byteenable.value = 0xF
 
 
 async def avalon_read(dut, addr):
-    """Single-beat convenience wrapper around avalon_burst_read."""
-    data = await avalon_burst_read(dut, addr, 1)
-    return data[0]
+    dut.avs_address.value = addr
+    dut.avs_read.value = 1
+    dut.avs_write.value = 0
+    await RisingEdge(dut.clk)
+    while int(dut.avs_waitrequest.value):
+        await RisingEdge(dut.clk)
+    data = int(dut.avs_readdata.value)
+    dut.avs_read.value = 0
+    return data
 
 
 async def write_byte(dut, byte_addr, value):
@@ -205,18 +172,39 @@ async def read_byte(dut, byte_addr):
     return (data >> (8 * lane)) & 0xFF
 
 
-async def read_bytes_burst(dut, byte_addr, count):
-    """Burst-reads `count` consecutive output_buffer bytes starting at
-    byte_addr in one Avalon-MM command. output_buffer is byte-addressed
-    (accel_top.sv's read burst engine steps avs_address by 1 per beat for
-    this reason - see its header comment), so beat i of the burst is
-    byte_addr+i - unlike read_byte's single-beat form there's no fixed
-    lane to pick per beat, since each beat's own address determines it."""
+async def avalon_burst_read(dut, addr, count):
+    """Burst-read `count` sequential words starting at addr, using
+    accel_top.sv's burst FSM (see its avs_burstcount/rd_burst_on logic).
+    Acceptance works exactly like avalon_read's single-word case (hold
+    avs_read/address/burstcount until avs_waitrequest drops - this also
+    self-corrects if a previous transaction's burst FSM hasn't fully gone
+    idle yet), and that same accepting edge already carries the first
+    beat's data. Each subsequent beat then arrives one avs_readdatavalid
+    pulse per cycle, address auto-incrementing, until `count` beats have
+    been collected."""
+    dut.avs_address.value = addr
+    dut.avs_burstcount.value = count
+    dut.avs_read.value = 1
+    dut.avs_write.value = 0
+    await RisingEdge(dut.clk)
+    while int(dut.avs_waitrequest.value):
+        await RisingEdge(dut.clk)
+    dut.avs_read.value = 0
+    dut.avs_burstcount.value = 1
+    data = [int(dut.avs_readdata.value)]
+    while len(data) < count:
+        await RisingEdge(dut.clk)
+        if int(dut.avs_readdatavalid.value):
+            data.append(int(dut.avs_readdata.value))
+    return data
+
+
+async def read_burst_bytes(dut, byte_addr, count):
+    """Burst-read `count` sequential output_buffer bytes. output_buffer
+    replicates its one byte across all 4 readdata lanes, so no per-word
+    lane selection is needed (see read_byte)."""
     words = await avalon_burst_read(dut, byte_addr, count)
-    return [
-        (word >> (8 * ((byte_addr + i) & 0x3))) & 0xFF
-        for i, word in enumerate(words)
-    ]
+    return [w & 0xFF for w in words]
 
 
 async def wait_output_done(dut, timeout_cycles=DONE_TIMEOUT_CYCLES):
@@ -506,17 +494,15 @@ async def test_64x64_multiblock_matmul(dut):
 
     # ---- read back output_buffer: row n lives in bank c = n % ARRAY_COLS,
     # at that bank's n_blk_idx*M + m offset, where n_blk_idx = n //
-    # ARRAY_COLS (see output_loader.v's header note on bank layout). Each
-    # bank's M-wide row is contiguous, so it's read back in one Avalon
-    # burst instead of M single-beat reads. ----
+    # ARRAY_COLS (see output_loader.v's header note on bank layout) ----
     mismatches = []
     for n in range(N):
         n_blk = n // ARRAY_COLS
         c = n % ARRAY_COLS
         bank_base = OBUF_BASE + (c << OBUF_BANK_ADDR_WIDTH) + n_blk * M
-        row = await read_bytes_burst(dut, bank_base, M)
+        row_bytes = await read_burst_bytes(dut, bank_base, M)
         for m in range(M):
-            got = to_int8(row[m])
+            got = to_int8(row_bytes[m])
             exp = int(golden[n, m])
             if got != exp:
                 mismatches.append((n, m, exp, got))

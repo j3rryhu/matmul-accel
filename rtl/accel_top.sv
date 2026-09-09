@@ -14,21 +14,11 @@
 // still a placeholder depth pending the real generated IP).
 //
 // Requires rdl/ctrl_reg.sv/ctrl_rf_rf.sv in the same compile fileset.
-//
-// Avalon-MM slave notes for Quartus IP wrapping: the reset port is named
-// reset_n (not rst_n) so Platform Designer's signal-role auto-detection
-// associates it with this slave's clock interface, and the read side
-// carries avs_burstcount/avs_readdatavalid so it's recognized as
-// burst-capable with a readdatavalid-qualified variable read latency (see
-// the "Avalon-MM read burst engine" section below). Writes are always
-// single-beat - only reads (reading results back out of output_buffer) are
-// ever bursted in practice.
 `timescale 1ps/1ps
 
 module accel_top #(
-    parameter AVS_ADDR_WIDTH       = 32,
-    parameter AVS_DATA_WIDTH       = 32,   // byte-lane mux below assumes 32
-    parameter AVS_BURSTCOUNT_WIDTH = 8,    // max read burst length = 2**AVS_BURSTCOUNT_WIDTH-1 beats (direct encoding: avs_burstcount's value IS the beat count)
+    parameter AVS_ADDR_WIDTH = 32,
+    parameter AVS_DATA_WIDTH = 32,   // byte-lane mux below assumes 32
     parameter PE_DATA_WIDTH  = 8,    // activation/weight operand width (int8)
     parameter ACC_DATA_WIDTH = 32,   // pe_array accumulator width - kept wider
                                       // than PE_DATA_WIDTH so a full contraction
@@ -40,7 +30,7 @@ module accel_top #(
     parameter ARRAY_COLS     = 32
 )(
     input                                  clk,
-    input                                  reset_n,    // active-low
+    input                                  reset_n,      // active-low
 
     // Avalon-MM slave
     input        [AVS_ADDR_WIDTH-1:0]      avs_address,
@@ -48,7 +38,7 @@ module accel_top #(
     input                                  avs_write,
     input        [AVS_DATA_WIDTH-1:0]      avs_writedata,
     input        [AVS_DATA_WIDTH/8-1:0]    avs_byteenable,
-    input        [AVS_BURSTCOUNT_WIDTH-1:0] avs_burstcount,
+    input        [10:0]                    avs_burstcount,
     output logic [AVS_DATA_WIDTH-1:0]      avs_readdata,
     output logic                           avs_readdatavalid,
     output logic                           avs_waitrequest
@@ -66,6 +56,16 @@ module accel_top #(
     wire sel_wbuf = (avs_address >= WBUF_BASE) && (avs_address < WBUF_BASE + WBUF_SIZE);
     wire sel_ibuf = (avs_address >= IBUF_BASE) && (avs_address < IBUF_BASE + IBUF_SIZE);
     wire sel_obuf = (avs_address >= OBUF_BASE) && (avs_address < OBUF_BASE + OBUF_SIZE);
+    logic accepted;
+    logic burst_busy;
+    logic sel_ctrl_r;
+    logic sel_obuf_r;
+    logic rd_burst_on;
+
+    logic [10:0] burst_cnt_buf;
+    logic [AVS_ADDR_WIDTH-1:0] addr_buf;
+    assign avs_readdatavalid = rf_data_valid || obuf_data_valid;
+    assign avs_waitrequest = (avs_read && !accepted) || burst_busy;
 
     // pick the enabled byte lane out of a 32-bit avalon write word
     function automatic logic [7:0] be_select_byte(input logic [31:0] wdata, input logic [3:0] be);
@@ -79,6 +79,44 @@ module accel_top #(
         end
     endfunction
 
+    always@(posedge clk)begin
+        if(!reset_n)begin
+            burst_cnt_buf <= 0;
+            accepted <= 0;
+            burst_busy <= 0;
+            addr_buf <= 0;
+            sel_ctrl_r <= 0;
+            sel_obuf_r <= 0;
+            rd_burst_on <= 0;
+        end
+        else begin
+            if(avs_read && !rd_burst_on)begin
+                addr_buf <= avs_address + 1;
+                accepted <= 1;
+                burst_cnt_buf <= avs_burstcount == 0 ? 1 : avs_burstcount;
+                sel_ctrl_r <= sel_ctrl;
+                sel_obuf_r <= sel_obuf;
+                rd_burst_on <= 1;
+            end
+
+            if(accepted)begin
+                burst_busy <= 1;
+            end
+
+            if(rd_burst_on)begin
+                burst_cnt_buf <= burst_cnt_buf - 1;
+                addr_buf <= addr_buf + 1;
+                if(burst_cnt_buf == 1)begin
+                    sel_ctrl_r <= 0;
+                    sel_obuf_r <= 0;
+                    rd_burst_on <= 0;
+                    accepted <= 0;
+                    burst_busy <= 0;
+                end
+            end
+        end
+    end
+
     // ============================================================
     // weight_buffer - write-only from Avalon
     // ============================================================
@@ -86,9 +124,9 @@ module accel_top #(
     wire [13:0] wbuf_wraddress = (avs_address - WBUF_BASE);
     wire [7:0]  wbuf_wdata     = be_select_byte(avs_writedata, avs_byteenable);
 
-    wire [13:0] wbuf_rdaddress;
-    wire        wbuf_rden;
-    wire [7:0]  wbuf_q;
+    logic [13:0] wbuf_rdaddress;
+    logic        wbuf_rden;
+    logic [7:0]  wbuf_q;
 
     weight_buffer u_weight_buffer (
         .clock     (clk),
@@ -107,10 +145,10 @@ module accel_top #(
     wire [12:0] ibuf_wraddress = (avs_address - IBUF_BASE);
     wire [7:0]  ibuf_wdata     = be_select_byte(avs_writedata, avs_byteenable);
 
-    wire [255:0] ibuf_q;
-    wire [ARRAY_ROWS*8-1:0]  ibuf_rdaddress;
-    wire        ibuf_rden;
-    wire [ARRAY_ROWS-1:0] ibuf_byteenable;
+    logic [255:0] ibuf_q;
+    logic [ARRAY_ROWS*8-1:0]  ibuf_rdaddress;
+    logic        ibuf_rden;
+    logic [ARRAY_ROWS-1:0] ibuf_byteenable;
 
     input_buffer_32_bank u_input_buffer (
         .clock         (clk),
@@ -135,20 +173,34 @@ module accel_top #(
     // ============================================================
     localparam OBUF_BANK_ADDR_WIDTH = 7;   // 4096-byte OBUF_SIZE / 32 banks = 128 entries/bank
 
-    // rd_issue/rd_issue_addr/rd_issue_sel_obuf are driven by the read burst
-    // engine below (declared later in the file - fine for continuous
-    // assignments in SystemVerilog).
-    wire        obuf_ext_rden      = rd_issue && rd_issue_sel_obuf;
-    wire [11:0] obuf_ext_rdaddress = rd_issue_addr - OBUF_BASE;
-    wire [7:0]  obuf_ext_q;
+    wire        obuf_ext_rden      = (avs_read && sel_obuf) || (rd_burst_on && sel_obuf_r);
+    wire [11:0] obuf_ext_rdaddress = rd_burst_on ? (addr_buf - OBUF_BASE) : (avs_address - OBUF_BASE);
+    logic [7:0]  obuf_ext_q;
 
-    wire        output_loader_busy;
-    wire [31:0]                             obuf_bank_rden;
-    wire [32*OBUF_BANK_ADDR_WIDTH-1:0]      obuf_bank_rdaddress;
-    wire [32*PE_DATA_WIDTH-1:0]             obuf_bank_q;
-    wire [31:0]                             obuf_bank_wren;
-    wire [32*OBUF_BANK_ADDR_WIDTH-1:0]      obuf_bank_waddr;
-    wire [32*PE_DATA_WIDTH-1:0]             obuf_bank_wdata;
+    logic obuf_rd_pending;
+    always_ff @(posedge clk or negedge reset_n)begin
+        if (!reset_n)begin
+            obuf_rd_pending <= 1'b0;
+        end
+        else begin 
+            if (avs_read && sel_obuf && !obuf_rd_pending)
+                obuf_rd_pending <= 1'b1;
+            else if(burst_cnt_buf == 1)
+                obuf_rd_pending <= 1'b0;
+        end
+    end
+
+    logic        obuf_data_valid;
+    always_ff @(posedge clk)
+        obuf_data_valid <= obuf_ext_rden;
+
+    logic        output_loader_busy;
+    logic [31:0]                             obuf_bank_rden;
+    logic [32*OBUF_BANK_ADDR_WIDTH-1:0]      obuf_bank_rdaddress;
+    logic [32*PE_DATA_WIDTH-1:0]             obuf_bank_q;
+    logic [31:0]                             obuf_bank_wren;
+    logic [32*OBUF_BANK_ADDR_WIDTH-1:0]      obuf_bank_waddr;
+    logic [32*PE_DATA_WIDTH-1:0]             obuf_bank_wdata;
 
     output_buffer_32_bank #(
         .DATA_WIDTH      (PE_DATA_WIDTH),
@@ -173,25 +225,18 @@ module accel_top #(
     // ============================================================
     // ctrl_rf_rf - control/status register file
     // ============================================================
-    // ctrl_write/ctrl_read_issue are mutually exclusive (avs_write and
-    // avs_read are never both asserted), so ctrl_addr can safely pick
-    // between the raw Avalon address (writes, always single-beat) and the
-    // read burst engine's current beat address (rd_issue_addr, declared
-    // further down) without needing separate read/write address ports.
-    wire        ctrl_write      = avs_write && sel_ctrl;
-    wire        ctrl_read_issue = rd_issue && rd_issue_sel_ctrl;
-    wire        ctrl_valid      = ctrl_write || ctrl_read_issue;
-    wire [31:0] ctrl_addr       = ctrl_write ? avs_address : rd_issue_addr;
-    wire [31:0] ctrl_rdata;
+    wire        ctrl_valid = ((avs_read || avs_write) && sel_ctrl) || (rd_burst_on && sel_ctrl_r);
+    logic [31:0] ctrl_rdata;
+    wire        rf_data_valid = ctrl_valid;
 
-    wire        matmul_start;          // pulse: latch WEIGHT_ROWS/WEIGHT_COLS, reset block position
-    wire [15:0] weight_rows;           // K: weight rows (contraction dimension)
-    wire [15:0] weight_cols;           // N: weight cols
-    wire [9:0]  input_max_addr;        // max input_buffer read address
-    wire [15:0] input_cols;            // number of columns of the input (activation) matrix
-    wire [15:0] output_scale;          // Q0.16 rescale factor (value/65536, range [0,1)) for pe_array's ACC_WIDTH accumulator
-    wire        weight_ctrl_busy;      // weight_ctrl/weight_loader busy, for STATUS.busy
-    wire        weight_ctrl_done;      // level: last block committed and its input band fully streamed in
+    logic        matmul_start;          // pulse: latch WEIGHT_ROWS/WEIGHT_COLS, reset block position
+    logic [15:0] weight_rows;           // K: weight rows (contraction dimension)
+    logic [15:0] weight_cols;           // N: weight cols
+    logic [9:0]  input_max_addr;        // max input_buffer read address
+    logic [15:0] input_cols;            // number of columns of the input (activation) matrix
+    logic [15:0] output_scale;          // Q0.16 rescale factor (value/65536, range [0,1)) for pe_array's ACC_WIDTH accumulator
+    logic        weight_ctrl_busy;      // weight_ctrl/weight_loader busy, for STATUS.busy
+    logic        weight_ctrl_done;      // level: last block committed and its input band fully streamed in
 
     // STATUS.busy: weight/input side sequencing OR output_loader still
     // draining the last block's psums (weight_ctrl_done can go high a few
@@ -229,119 +274,18 @@ module accel_top #(
         .STATUS_done_wdata              (matmul_done),
 
         .valid  (ctrl_valid),
-        .read   (ctrl_read_issue),
-        .addr   (ctrl_addr),
+        .read   (avs_read),
+        .addr   (avs_address),
         .wdata  (avs_writedata),
         .wmask  (avs_byteenable),
         .rdata  (ctrl_rdata)
     );
 
     // ============================================================
-    // Avalon-MM read burst engine
+    // Avalon read mux / waitrequest
     // ============================================================
-    // Read-only burst support - writes stay single-beat, always accepted
-    // immediately whenever no read burst is draining (matches this
-    // design's actual traffic: software writes weight_buffer/input_buffer
-    // byte-by-byte, then bursts results back out of output_buffer).
-    //
-    // Non-pipelined: at most one read command is in flight at a time -
-    // avs_waitrequest stays asserted for the whole command (address-issue
-    // *and* data-drain phases), so the next command can't be accepted
-    // until the current one's last beat has been returned. Simple and
-    // Avalon-spec-legal. avs_readdatavalid and avs_waitrequest are both
-    // derived from burst_busy (one register apart - see rd_valid_q below),
-    // so for every beat but the last, readdatavalid pulses while
-    // waitrequest is still asserted (mid-burst); the *last* beat's
-    // readdatavalid happens to land the same cycle waitrequest finally
-    // drops - track readdatavalid independently rather than assuming any
-    // fixed relationship to waitrequest.
-    //
-    // ctrl_rf_rf's rdata is combinational (0-latency); output_buffer's leaf
-    // RAM has a fixed 1-cycle registered read latency (see
-    // tb/models/buffer_ram_models.v / the real generated IP). ctrl_rdata_q
-    // below adds one register stage to ctrl's path so both regions present
-    // their data exactly one cycle after their address is issued, letting
-    // a single burst pipeline serve either region uniformly.
-    //
-    // rd_issue/rd_issue_addr deliberately never read avs_address/avs_read
-    // directly - cur_addr is latched from avs_address once, at accept, and
-    // every beat (including the first) is issued from that registered
-    // snapshot on the cycle *after* accept. This costs one extra cycle of
-    // latency on the first beat, in exchange for rd_issue/rd_issue_addr
-    // depending only on registered state (never on a live input that a
-    // master is simultaneously free to change the moment it sees
-    // avs_waitrequest deasserted for the *previous* command) - simpler to
-    // reason about and safe regardless of exactly when in a cycle a master
-    // updates avs_address after that.
-    logic                            burst_busy;
-    logic [AVS_ADDR_WIDTH-1:0]       cur_addr;        // latched beat address, valid while burst_busy
-    logic [AVS_BURSTCOUNT_WIDTH-1:0] beats_remaining; // beats left to issue (including this cycle's), valid while burst_busy
-
-    // rd_issue: a beat's (registered) address is being presented to the
-    // RAMs/regfile this cycle. Consumed above by obuf_ext_rden/
-    // obuf_ext_rdaddress and ctrl_read_issue/ctrl_addr.
-    wire                      rd_issue          = burst_busy;
-    wire [AVS_ADDR_WIDTH-1:0] rd_issue_addr     = cur_addr;
-    wire                      rd_issue_sel_ctrl = (rd_issue_addr >= CTRL_BASE) && (rd_issue_addr < CTRL_BASE + CTRL_SIZE);
-    wire                      rd_issue_sel_obuf = (rd_issue_addr >= OBUF_BASE) && (rd_issue_addr < OBUF_BASE + OBUF_SIZE);
-
-    // data-phase pipeline: one cycle after rd_issue, that beat's data is valid
-    logic                       rd_valid_q;
-    logic [AVS_ADDR_WIDTH-1:0]  rd_addr_q;
-    logic [AVS_DATA_WIDTH-1:0]  ctrl_rdata_q;
-
-    always_ff @(posedge clk or negedge reset_n)
-        if (!reset_n) begin
-            burst_busy      <= 1'b0;
-            cur_addr        <= '0;
-            beats_remaining <= '0;
-            rd_valid_q       <= 1'b0;
-            rd_addr_q         <= '0;
-            ctrl_rdata_q      <= '0;
-        end else begin
-            if (!burst_busy) begin
-                if (avs_read) begin
-                    burst_busy      <= 1'b1;
-                    cur_addr        <= avs_address;
-                    // computed inline, not via a separate "burstcount_eff"
-                    // wire: icarus has a real quirk where a value change on
-                    // a primary input (avs_burstcount) reaches a flip-flop
-                    // that reads it *directly* in time for the very next
-                    // edge, but lags an extra cycle if it's read through an
-                    // intermediate continuous-assign wire first (confirmed
-                    // via an isolated probe outside this design) - avoid
-                    // that class of hazard entirely by never routing a
-                    // primary input through a wire before a register uses
-                    // it.
-                    beats_remaining <= (avs_burstcount == AVS_BURSTCOUNT_WIDTH'(0)) ? AVS_BURSTCOUNT_WIDTH'(1) : avs_burstcount;
-                end
-            end else if (beats_remaining == AVS_BURSTCOUNT_WIDTH'(1)) begin
-                burst_busy <= 1'b0;   // this cycle issues the last beat
-            end else begin
-                // +1, not a word stride: every region on this port
-                // (weight_buffer/input_buffer/output_buffer, and hence the
-                // only regions ever actually burst-read) is byte-addressed
-                // - one avs_address per int8 entry, replicated across all
-                // 4 avs_readdata lanes (see the {4{obuf_ext_q}} mux below) -
-                // not word-addressed like ctrl_rf_rf. A word stride here
-                // would skip 3 of every 4 bytes.
-                cur_addr        <= cur_addr + AVS_ADDR_WIDTH'(1);
-                beats_remaining <= beats_remaining - AVS_BURSTCOUNT_WIDTH'(1);
-            end
-
-            rd_valid_q   <= rd_issue;
-            rd_addr_q    <= rd_issue_addr;
-            ctrl_rdata_q <= ctrl_rdata;
-        end
-
-    wire rd_addr_q_sel_ctrl = (rd_addr_q >= CTRL_BASE) && (rd_addr_q < CTRL_BASE + CTRL_SIZE);
-    wire rd_addr_q_sel_obuf = (rd_addr_q >= OBUF_BASE) && (rd_addr_q < OBUF_BASE + OBUF_SIZE);
-
-    assign avs_waitrequest   = burst_busy;
-    assign avs_readdatavalid = rd_valid_q;
-    assign avs_readdata      = rd_addr_q_sel_ctrl ? ctrl_rdata_q :
-                                rd_addr_q_sel_obuf ? {4{obuf_ext_q}} :
-                                                      32'h0;
+    // assign avs_waitrequest = avs_read && sel_obuf && !obuf_rd_pending;
+    assign avs_readdata    = obuf_rd_pending ? {4{obuf_ext_q}} : (((sel_ctrl && avs_read) || (rd_burst_on && sel_ctrl_r)) ? ctrl_rdata : 32'h0);
 
     // ============================================================
     // input_dispatch - streams input_buffer into the array's left edge,
