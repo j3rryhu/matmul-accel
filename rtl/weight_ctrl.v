@@ -149,8 +149,20 @@ module weight_ctrl #(
     wire loader_busy;
     wire loader_ready;  // block fully prefetched, sitting in pe_array's prefetch regs
 
-    assign busy = (wc_state != WC_IDLE);
-    assign done = (wc_state == WC_DONE);
+    // WC_DONE is a resting state, not work in progress: it holds `done`
+    // asserted for software to poll and is left only on the next
+    // matmul_start. It must therefore NOT read as busy, or STATUS.busy
+    // would stay high forever after the first matmul.
+    assign busy = (wc_state != WC_IDLE) && (wc_state != WC_DONE);
+
+    // ... and `done` must drop the moment a new matmul is kicked off.
+    // wc_state only leaves WC_DONE on the clock edge that samples
+    // matmul_start, so without the !matmul_start term there is a window
+    // where the *previous* matmul's done level is still visible after the
+    // new one has been started - software polling STATUS.done right after
+    // writing CONTROL.matmul_start would see that stale 1 and start
+    // reading output_buffer before this matmul has produced anything.
+    assign done = (wc_state == WC_DONE) && !matmul_start;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

@@ -690,20 +690,20 @@ async def test_partial_row_block_matmul(dut):
         )
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def test_back_to_back_matmul_no_reset(dut):
-    """KNOWN FAILING - pre-existing, not a regression from the 32->16
-    resize. Fails identically on HEAD's untouched 32x32 RTL (558
-    mismatches there). Flip expect_fail to False once fixed.
+    """Two matmuls of the same full ARRAY_ROWS x ARRAY_COLS shape, back to
+    back, with no reset between them.
 
-    Two matmuls of the SAME full ARRAY_ROWS x ARRAY_COLS shape, back to
-    back, with no reset between them. The first is correct; the second is
-    not, and the wrong values look like the first run's results still
-    sitting in output_buffer - i.e. the second matmul largely fails to
-    write. Since both runs are full-size and identically shaped, this is
-    not about partial-block masking or stale out-of-range PE weights:
-    something in the per-matmul sequencing does not re-arm on a second
-    matmul_start without an intervening reset.
+    Regression test for the stale STATUS.done/busy levels in weight_ctrl:
+    WC_DONE is a resting state held until the next matmul_start, so
+    `done` stayed asserted from the previous matmul and `busy` never
+    cleared at all. Software (and this testbench) polling STATUS.done
+    straight after writing CONTROL.matmul_start saw the previous run's
+    level and began reading output_buffer before the new matmul had
+    produced anything - the readback then returned the prior run's
+    results. Fixed in rtl/weight_ctrl.v by gating `done` with
+    !matmul_start and excluding WC_DONE from `busy`.
 
     Every other test in this file resets first and runs exactly one
     matmul, which is why this went unnoticed.
