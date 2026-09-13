@@ -28,8 +28,8 @@
 
 module weight_loader #(
     parameter DATA_WIDTH      = 8,
-    parameter ARRAY_ROWS      = 32,
-    parameter ARRAY_COLS      = 32,
+    parameter ARRAY_ROWS      = 16,
+    parameter ARRAY_COLS      = 16,
     parameter WBUF_ADDR_WIDTH = 14,   // weight_buffer address width
     parameter DIM_WIDTH       = 16    // width of row_stride (full-matrix N)
 )(
@@ -89,12 +89,12 @@ module weight_loader #(
         if (!rst_n) begin
             wload_state    <= STATE_IDLE;
             done_r         <= 1'b0;
-            cur_row        <= '0;
-            cur_col        <= '0;
-            rd_addr        <= '0;
+            cur_row        <= 0;
+            cur_col        <= 0;
+            rd_addr        <= 0;
             wbuf_rden      <= 1'b0;
-            wbuf_rdaddress <= '0;
-            pe_ld_addr     <= '0;
+            wbuf_rdaddress <= 0;
+            pe_ld_addr     <= 0;
         end
         else begin
             case (wload_state)
@@ -102,20 +102,20 @@ module weight_loader #(
                     if (wbuf_rdy) begin
                         wload_state <= STATE_PRELOAD;
                         done_r      <= 1'b0;
-                        cur_row     <= '0;
-                        cur_col     <= '0;
+                        cur_row     <= 0;
+                        cur_col     <= 0;
                         rd_addr     <= base_addr;
                     end
                 end
 
                 STATE_PRELOAD: begin
-                    done_r         <= '0;
+                    done_r         <= 0;
                     wbuf_rden      <= elem_valid;
                     wbuf_rdaddress <= rd_addr;
                     pe_ld_addr     <= pe_ld_addr + 1;
 
                     if (cur_col == ARRAY_COLS-1) begin
-                        cur_col <= '0;
+                        cur_col <= 0;
                         cur_row <= cur_row + 1'b1;
                         rd_addr <= rd_addr + (row_stride - (ARRAY_COLS-1));
                     end
@@ -148,8 +148,8 @@ module weight_loader #(
                     if(wbuf_rdy)begin
                         wload_state <= STATE_PRELOAD;
                         done_r      <= 1'b1;
-                        cur_row     <= '0;
-                        cur_col     <= '0;
+                        cur_row     <= 0;
+                        cur_col     <= 0;
                         rd_addr     <= base_addr;
                     end
                 end
@@ -170,8 +170,8 @@ module weight_loader #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rd_valid_d  <= 1'b0;
-            rd_addr_d   <= '0;
-            rd_addr_2d  <= '0;
+            rd_addr_d   <= 0;
+            rd_addr_2d  <= 0;
         end
         else begin
             rd_valid_d  <= wbuf_rden;

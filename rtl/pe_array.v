@@ -13,8 +13,8 @@
 module pe_array #(
     parameter DATA_WIDTH  = 8,
     parameter ACC_WIDTH   = 32,
-    parameter ARRAY_ROWS  = 32,
-    parameter ARRAY_COLS  = 32
+    parameter ARRAY_ROWS  = 16,
+    parameter ARRAY_COLS  = 16
 )(
     input                                           clk,
     input                                           rst_n,

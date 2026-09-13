@@ -9,9 +9,15 @@
 // (matmul_start is the only software trigger left; everything past that
 // is sequenced by weight_ctrl). output_loader is wired up too: it drives
 // pe_array's b_en, reads p_out, and read-modify-write accumulates into
-// output_buffer_32_bank (32 independent banks, one per array column - see
+// output_buffer_32_bank (ARRAY_COLS independent banks, one per array column - see
 // output_buffer_32_bank.v; the per-bank output_buffer leaf RAM itself is
 // still a placeholder depth pending the real generated IP).
+//
+// NB: the datapath is square-only - pe_array's a_in/a_en lanes are
+// indexed by column while its p_out/b_en lanes are indexed by row, and
+// output_loader banks per p_out lane while naming that axis ARRAY_COLS.
+// Every width lines up only while ARRAY_ROWS == ARRAY_COLS. Resizing the
+// array means changing both together.
 //
 // Requires rdl/ctrl_reg.sv/ctrl_rf_rf.sv in the same compile fileset.
 `timescale 1ps/1ps
@@ -26,8 +32,8 @@ module accel_top #(
                                       // overflow before software rescales it
                                       // back down under the int8 quantization
                                       // scheme (see pe.v)
-    parameter ARRAY_ROWS     = 32,
-    parameter ARRAY_COLS     = 32
+    parameter ARRAY_ROWS     = 16,  // must equal ARRAY_COLS - the array is
+    parameter ARRAY_COLS     = 16   // square-only, see header note
 )(
     input                                  clk,
     input                                  reset_n,      // active-low
@@ -51,6 +57,20 @@ module accel_top #(
     localparam logic [31:0] WBUF_BASE = 32'h0000_1000, WBUF_SIZE = 32'h0000_4000; // weight_buffer, 14-bit addr
     localparam logic [31:0] IBUF_BASE = 32'h0000_5000, IBUF_SIZE = 32'h0000_2000; // input_buffer,  13-bit addr
     localparam logic [31:0] OBUF_BASE = 32'h0000_7000, OBUF_SIZE = 32'h0000_1000; // output_buffer, 12-bit addr
+
+    // ---- buffer geometry ----
+    // Per-bank depths are fixed by the generated RAM IP; the bank *count*
+    // follows the array, so the flat (software-visible) address width of
+    // each banked buffer scales with ARRAY_ROWS/ARRAY_COLS. The byte map
+    // above is deliberately left at its original sizes so the software ABI
+    // doesn't move when the array is resized - a smaller array simply
+    // leaves the top of each window unused (at 16 banks: IBUF uses 4KB of
+    // its 8KB window, OBUF 2KB of its 4KB).
+    localparam int WBUF_ADDR_WIDTH      = 14;  // weight_buffer is flat, not banked
+    localparam int IBUF_BANK_ADDR_WIDTH = 8;   // input_buffer IP depth  = 256 entries/bank
+    localparam int OBUF_BANK_ADDR_WIDTH = 7;   // output_buffer IP depth = 128 entries/bank
+    localparam int IBUF_ADDR_WIDTH      = $clog2(ARRAY_ROWS) + IBUF_BANK_ADDR_WIDTH;
+    localparam int OBUF_ADDR_WIDTH      = $clog2(ARRAY_COLS) + OBUF_BANK_ADDR_WIDTH;
 
     wire sel_ctrl = (avs_address >= CTRL_BASE) && (avs_address < CTRL_BASE + CTRL_SIZE);
     wire sel_wbuf = (avs_address >= WBUF_BASE) && (avs_address < WBUF_BASE + WBUF_SIZE);
@@ -121,10 +141,10 @@ module accel_top #(
     // weight_buffer - write-only from Avalon
     // ============================================================
     wire        wbuf_wren      = avs_write && sel_wbuf;
-    wire [13:0] wbuf_wraddress = (avs_address - WBUF_BASE);
+    wire [WBUF_ADDR_WIDTH-1:0] wbuf_wraddress = (avs_address - WBUF_BASE);
     wire [7:0]  wbuf_wdata     = be_select_byte(avs_writedata, avs_byteenable);
 
-    logic [13:0] wbuf_rdaddress;
+    logic [WBUF_ADDR_WIDTH-1:0] wbuf_rdaddress;
     logic        wbuf_rden;
     logic [7:0]  wbuf_q;
 
@@ -142,15 +162,19 @@ module accel_top #(
     // input_buffer - write side from Avalon, read side driven by input_dispatch
     // ============================================================
     wire        ibuf_wren      = avs_write && sel_ibuf;
-    wire [12:0] ibuf_wraddress = (avs_address - IBUF_BASE);
+    wire [IBUF_ADDR_WIDTH-1:0] ibuf_wraddress = (avs_address - IBUF_BASE);
     wire [7:0]  ibuf_wdata     = be_select_byte(avs_writedata, avs_byteenable);
 
-    logic [255:0] ibuf_q;
-    logic [ARRAY_ROWS*8-1:0]  ibuf_rdaddress;
-    logic        ibuf_rden;
-    logic [ARRAY_ROWS-1:0] ibuf_byteenable;
+    logic [ARRAY_ROWS*PE_DATA_WIDTH-1:0]       ibuf_q;
+    logic [ARRAY_ROWS*IBUF_BANK_ADDR_WIDTH-1:0] ibuf_rdaddress;
+    logic                                      ibuf_rden;
+    logic [ARRAY_ROWS-1:0]                     ibuf_byteenable;
 
-    input_buffer_32_bank u_input_buffer (
+    input_buffer_32_bank #(
+        .ARRAY_ROWS      (ARRAY_ROWS),
+        .DATA_WIDTH      (PE_DATA_WIDTH),
+        .BANK_ADDR_WIDTH (IBUF_BANK_ADDR_WIDTH)
+    ) u_input_buffer (
         .clock         (clk),
         .data          (ibuf_wdata),
         .rdaddress     (ibuf_rdaddress),
@@ -162,7 +186,7 @@ module accel_top #(
     );
 
     // ============================================================
-    // output_buffer - banked 32-ways (one bank per array column, see
+    // output_buffer - banked ARRAY_COLS-ways (one bank per array column, see
     // output_buffer_32_bank.v). output_loader drives each bank's
     // read+write directly; Avalon reads through a single muxed external
     // port, read-only, one cycle of read latency, stalled with
@@ -171,10 +195,8 @@ module accel_top #(
     // down to int8 before it ever reaches output_buffer (see
     // output_loader.v).
     // ============================================================
-    localparam OBUF_BANK_ADDR_WIDTH = 7;   // 4096-byte OBUF_SIZE / 32 banks = 128 entries/bank
-
     wire        obuf_ext_rden      = (avs_read && sel_obuf) || (rd_burst_on && sel_obuf_r);
-    wire [11:0] obuf_ext_rdaddress = rd_burst_on ? (addr_buf - OBUF_BASE) : (avs_address - OBUF_BASE);
+    wire [OBUF_ADDR_WIDTH-1:0] obuf_ext_rdaddress = rd_burst_on ? (addr_buf - OBUF_BASE) : (avs_address - OBUF_BASE);
     logic [7:0]  obuf_ext_q;
 
     logic obuf_rd_pending;
@@ -195,16 +217,16 @@ module accel_top #(
         obuf_data_valid <= obuf_ext_rden;
 
     logic        output_loader_busy;
-    logic [31:0]                             obuf_bank_rden;
-    logic [32*OBUF_BANK_ADDR_WIDTH-1:0]      obuf_bank_rdaddress;
-    logic [32*PE_DATA_WIDTH-1:0]             obuf_bank_q;
-    logic [31:0]                             obuf_bank_wren;
-    logic [32*OBUF_BANK_ADDR_WIDTH-1:0]      obuf_bank_waddr;
-    logic [32*PE_DATA_WIDTH-1:0]             obuf_bank_wdata;
+    logic [ARRAY_COLS-1:0]                        obuf_bank_rden;
+    logic [ARRAY_COLS*OBUF_BANK_ADDR_WIDTH-1:0]   obuf_bank_rdaddress;
+    logic [ARRAY_COLS*PE_DATA_WIDTH-1:0]          obuf_bank_q;
+    logic [ARRAY_COLS-1:0]                        obuf_bank_wren;
+    logic [ARRAY_COLS*OBUF_BANK_ADDR_WIDTH-1:0]   obuf_bank_waddr;
+    logic [ARRAY_COLS*PE_DATA_WIDTH-1:0]          obuf_bank_wdata;
 
     output_buffer_32_bank #(
         .DATA_WIDTH      (PE_DATA_WIDTH),
-        .NUM_BANKS       (32),
+        .NUM_BANKS       (ARRAY_COLS),
         .BANK_ADDR_WIDTH (OBUF_BANK_ADDR_WIDTH)
     ) u_output_buffer (
         .clock          (clk),
@@ -289,20 +311,21 @@ module accel_top #(
 
     // ============================================================
     // input_dispatch - streams input_buffer into the array's left edge,
-    // one 32-row band at a time, driven by weight_ctrl below
+    // one ARRAY_ROWS-row band at a time, driven by weight_ctrl below
     // ============================================================
     wire [ARRAY_ROWS*PE_DATA_WIDTH-1:0] a_out;
     wire [ARRAY_ROWS-1:0]               a_en;
 
-    wire [7:0] input_band_base_addr;  // weight_ctrl -> input_dispatch: current block's per-bank base offset
+    wire [IBUF_BANK_ADDR_WIDTH-1:0] input_band_base_addr;  // weight_ctrl -> input_dispatch: current block's per-bank base offset
     wire       input_band_start;      // weight_ctrl -> input_dispatch: pulse, begin preloading that band
     wire       input_compute_start;   // weight_ctrl -> input_dispatch: pulse, begin streaming into pe_array
     wire       input_fifos_primed;    // input_dispatch -> weight_ctrl: all row FIFOs hold >=1 element
     wire       input_band_done;       // input_dispatch -> weight_ctrl: current band fully drained
 
     input_dispatch #(
-        .ARRAY_ROWS (ARRAY_ROWS),
-        .DATA_WIDTH (PE_DATA_WIDTH)
+        .ARRAY_ROWS      (ARRAY_ROWS),
+        .DATA_WIDTH      (PE_DATA_WIDTH),
+        .IBUF_ADDR_WIDTH (IBUF_BANK_ADDR_WIDTH)
     ) u_input_dispatch (
         .clock          (clk),
         .rst_n          (reset_n),
@@ -315,7 +338,7 @@ module accel_top #(
         .a_out          (a_out),
         .a_en           (a_en),
 
-        .i_max_addr       (input_max_addr[7:0]),
+        .i_max_addr       (input_max_addr[IBUF_BANK_ADDR_WIDTH-1:0]),
         .i_band_base_addr (input_band_base_addr),
         .i_band_start     (input_band_start),
         .i_start_compute  (input_compute_start),
@@ -325,7 +348,8 @@ module accel_top #(
 
     // ============================================================
     // weight_ctrl - walks the weight matrix column-major (contraction-
-    // dimension blocks fast, output-dimension blocks slow) as 32x32
+    // dimension blocks fast, output-dimension blocks slow) as
+    // ARRAY_ROWS x ARRAY_COLS
     // blocks, prefetching each into pe_array and driving input_dispatch's
     // per-block handshake; matmul_start is the only software trigger,
     // everything else is sequenced internally
@@ -337,15 +361,15 @@ module accel_top #(
     wire [15:0]                              committed_n_blk_idx;    // -> output_loader
     wire [15:0]                              committed_k_blk_idx;
     wire                                      committed_first_k_blk; // -> output_loader
-    wire [$clog2(ARRAY_ROWS+1):0]           valid_row;
-    wire [$clog2(ARRAY_COLS+1):0]           valid_col;
+    wire [$clog2(ARRAY_ROWS+1)-1:0]         valid_row;
+    wire [$clog2(ARRAY_COLS+1)-1:0]         valid_col;
 
     weight_ctrl #(
         .DATA_WIDTH      (PE_DATA_WIDTH),
         .ARRAY_ROWS      (ARRAY_ROWS),
         .ARRAY_COLS      (ARRAY_COLS),
-        .WBUF_ADDR_WIDTH (14),
-        .IBUF_ADDR_WIDTH (8),
+        .WBUF_ADDR_WIDTH (WBUF_ADDR_WIDTH),
+        .IBUF_ADDR_WIDTH (IBUF_BANK_ADDR_WIDTH),
         .DIM_WIDTH       (16)
     ) u_weight_ctrl (
         .clk               (clk),
@@ -367,7 +391,7 @@ module accel_top #(
         .w_en              (w_en),
         .w_load            (w_load),
 
-        .input_max_addr       (input_max_addr[7:0]),
+        .input_max_addr       (input_max_addr[IBUF_BANK_ADDR_WIDTH-1:0]),
         .input_band_start     (input_band_start),
         .input_band_base_addr (input_band_base_addr),
         .input_compute_start  (input_compute_start),
@@ -404,7 +428,7 @@ module accel_top #(
         .p_in  (pe_p_out),
         .b_en  (pe_b_en),
 
-        .a_en_last             (a_en[ARRAY_COLS-1]),
+        .a_en_last             (a_en[ARRAY_ROWS-1]),   // last row's a_en - see output_loader.v header
         .total_rows            (input_cols[OBUF_BANK_ADDR_WIDTH-1:0]),
         .committed_k_blk_idx   (committed_k_blk_idx),
         .committed_n_blk_idx   (committed_n_blk_idx),

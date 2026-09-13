@@ -21,9 +21,9 @@
 // address = n_blk_idx*total_rows + m. That makes the layout row-major
 // *within* a bank, but NOT globally row-major across the whole
 // output_buffer (output row n's data isn't one contiguous run - it's
-// split one-32nd-per-bank).
+// split one-ARRAY_COLS-th-per-bank).
 //
-// Since the contraction dimension may need more than one 32-block pass
+// Since the contraction dimension may need more than one ARRAY_ROWS-block pass
 // (k_blk_idx = 0..num_k_blocks-1) to fully sum, every block's psums must
 // be added to whatever's already at that output position - except the
 // very first k-block for a given n_blk_idx, whose target position is
@@ -76,18 +76,28 @@
 //     by its own free-running counter (0..total_rows-1) - no need to
 //     realign rows to a shared index.
 //
-// a_en_last is row 0's a_en bit (pe_array a_en[0] / input_dispatch a_en[0]);
-// only its first rising edge after reset/completion is used to anchor
-// timing, so later gaps in a_en_last (e.g. input FIFO underrun) don't
-// re-trigger the sequence.
+// a_en_last is the *last* row's a_en bit (pe_array a_en[ARRAY_ROWS-1] /
+// input_dispatch a_en[ARRAY_ROWS-1]) - input_dispatch staggers a_en by one
+// cycle per row, so this bit rises ARRAY_ROWS-1 cycles after row 0's, which
+// is exactly the anchor the elapsed>=r liveness test below expects. Only
+// its first rising edge after reset/completion is used to anchor timing, so
+// later gaps in a_en_last (e.g. input FIFO underrun) don't re-trigger the
+// sequence.
+//
+// DSP: the rescale multiply below is instantiated once per bank
+// (ARRAY_ROWS times) at ACC_WIDTH x SCALE_WIDTH, plus a per-bank address
+// multiply - enough to exhaust a small device's DSP blocks on its own, on
+// top of pe_array's. multstyle="logic" forces all of them into soft logic
+// (see pe.v's header note).
 `timescale 1ps/1ps
 
+(* multstyle = "logic" *)
 module output_loader #(
     parameter DATA_WIDTH     = 8,    // output_buffer entry width (int8, post-rescale)
     parameter ACC_WIDTH      = 32,   // must match pe_array's ACC_WIDTH (p_in - raw pre-rescale accumulator)
     parameter SCALE_WIDTH    = 16,   // output_scale width - Q0.16 fixed point (unsigned, range [0,1))
-    parameter ARRAY_COLS     = 32,
-    parameter ARRAY_ROWS     = 32,
+    parameter ARRAY_COLS     = 16,
+    parameter ARRAY_ROWS     = 16,
     parameter ROW_ADDR_WIDTH = 16,   // per-bank address width - must span num_n_blocks*total_rows
     parameter DIM_WIDTH      = 16,   // width of committed_k_blk_idx (from weight_ctrl)
     parameter COL_SEL_W      = $clog2(ARRAY_COLS+1),
@@ -101,7 +111,7 @@ module output_loader #(
     output     [ARRAY_COLS-1:0]                    b_en,        // pe_array b_en
 
     // ---- timing anchor + block identity (from weight_ctrl) ----
-    input                                           a_en_last,                 // pe_array a_en[0]
+    input                                           a_en_last,             // pe_array a_en[ARRAY_ROWS-1]
     input      [ROW_ADDR_WIDTH-1:0]                 total_rows,            // M: expected valid results per row, per pass
     input      [DIM_WIDTH-1:0]                      committed_k_blk_idx,   // weight_ctrl: output block this pass belongs to
     input      [DIM_WIDTH-1:0]                      committed_n_blk_idx,
@@ -111,8 +121,8 @@ module output_loader #(
     input      [SCALE_WIDTH-1:0]                    output_scale,
 
     // ---- current valid rows and cols for output ----
-    input      [COL_SEL_W:0]                      weight_cols,
-    input      [ROW_SEL_W:0]                      weight_rows,
+    input      [COL_SEL_W-1:0]                      weight_cols,
+    input      [ROW_SEL_W-1:0]                      weight_rows,
 
     // ---- output_buffer read+write ports, one bank per array row ----
     output     [ARRAY_COLS-1:0]                     obuf_rden,
@@ -160,8 +170,8 @@ module output_loader #(
             armed            <= 1'b1;
             running          <= 1'b0;
             elapsed          <= {ELAPSED_W{1'b0}};
-            held_k_blk_idx   <= '0;
-            held_n_blk_idx   <= '0;
+            held_k_blk_idx   <= 0;
+            held_n_blk_idx   <= 0;
             held_first_k_blk <= 1'b0;
         end
         else begin
@@ -213,6 +223,7 @@ module output_loader #(
             // this bank's address for the position row_count[r] currently
             // points at: held_k_blk_idx's segment, appended after every
             // earlier n_blk_idx's total_rows-sized segment in this bank
+            (* multstyle = "logic" *)
             wire [ROW_ADDR_WIDTH-1:0] cur_addr = held_k_blk_idx*total_rows + row_count[r];
 
             assign obuf_rden[r] = row_active;
@@ -247,6 +258,7 @@ module output_loader #(
             // saturated into DATA_WIDTH's signed range. {1'b0,output_scale}
             // keeps the (always non-negative) scale factor signed-safe for
             // the multiply.
+            (* multstyle = "logic" *)
             wire signed [ACC_WIDTH+SCALE_WIDTH:0] scale_product = $signed(psum_d) * $signed({1'b0, output_scale});
             wire signed [ACC_WIDTH+SCALE_WIDTH:0] scale_shifted = scale_product >>> SCALE_WIDTH;
 

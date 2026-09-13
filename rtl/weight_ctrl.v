@@ -41,10 +41,11 @@
 //     position to (0,0) - the only point they're re-sampled.
 `timescale 1ps/1ps
 
+(* multstyle = "logic" *)
 module weight_ctrl #(
     parameter DATA_WIDTH      = 8,
-    parameter ARRAY_ROWS      = 32,
-    parameter ARRAY_COLS      = 32,
+    parameter ARRAY_ROWS      = 16,
+    parameter ARRAY_COLS      = 16,
     parameter WBUF_ADDR_WIDTH = 14,
     parameter IBUF_ADDR_WIDTH = 8,    // input_buffer per-bank address width (input_dispatch)
     parameter DIM_WIDTH       = 16,    // WEIGHT_ROWS/WEIGHT_COLS field width
@@ -76,7 +77,7 @@ module weight_ctrl #(
     // ---- input_dispatch handshake ----
     input      [IBUF_ADDR_WIDTH-1:0] input_max_addr,       // per-band input_buffer bound (input_dispatch i_max_addr)
     output reg                       input_band_start,      // pulse: begin preloading input_band_base_addr's band
-    output     [IBUF_ADDR_WIDTH-1:0] input_band_base_addr,  // this block's 32-row band base address in input_buffer
+    output     [IBUF_ADDR_WIDTH-1:0] input_band_base_addr,  // this block's ARRAY_ROWS-row band base address in input_buffer
     output reg                       input_compute_start,   // pulse: begin streaming the preloaded band into pe_array
     input                             input_fifos_primed,    // level: all row FIFOs hold >=1 element
     input                             input_band_done,       // pulse: current band fully drained, next preload may start
@@ -115,7 +116,8 @@ module weight_ctrl #(
     reg [DIM_WIDTH-1:0] k_latched, n_latched;              // contraction size, output size
     reg [DIM_WIDTH-1:0] k_blk_idx, n_blk_idx;               // current block position (see header note)
 
-    // number of 32-wide blocks spanning the latched contraction/output dims
+    // number of ARRAY_ROWS/ARRAY_COLS-wide blocks spanning the latched
+    // contraction/output dims
     wire [DIM_WIDTH-1:0] num_k_blocks = (k_latched + ARRAY_ROWS - 1) >> K_SHIFT;
     wire [DIM_WIDTH-1:0] num_n_blocks = (n_latched + ARRAY_COLS - 1) >> N_SHIFT;
 
@@ -125,7 +127,7 @@ module weight_ctrl #(
 
     // ---- current block's valid extent - masks a partial last block along
     // either dimension when the contraction/output size isn't a multiple
-    // of 32 ----
+    // of the array size ----
     wire [DIM_WIDTH-1:0] k_rem = k_latched - k_blk_idx*ARRAY_ROWS;
     wire [DIM_WIDTH-1:0] n_rem = n_latched - n_blk_idx*ARRAY_COLS;
     wire [K_CNT_WIDTH-1:0] valid_k = (k_rem < ARRAY_ROWS) ? k_rem[K_CNT_WIDTH-1:0] : ARRAY_ROWS[K_CNT_WIDTH-1:0];
@@ -133,11 +135,14 @@ module weight_ctrl #(
 
     // ---- current block's top-left address in weight_buffer (row-major
     // over the full contraction x output matrix) ----
+    (* multstyle = "logic" *)
     wire [WBUF_ADDR_WIDTH-1:0] base_addr = (k_blk_idx*ARRAY_ROWS)*n_latched + n_blk_idx*ARRAY_COLS;
 
-    // ---- current block's 32-row band base address in input_buffer (also
+    // ---- current block's ARRAY_ROWS-row band base address in input_buffer (also
     // assumed row-major: each band occupies one input_max_addr-sized span) ----
-    assign input_band_base_addr = n_blk_idx[IBUF_ADDR_WIDTH-1:0] * input_max_addr;
+    (* multstyle = "logic" *)
+    wire [IBUF_ADDR_WIDTH-1:0] band_base_addr = n_blk_idx[IBUF_ADDR_WIDTH-1:0] * input_max_addr;
+    assign input_band_base_addr = band_base_addr;
 
     reg loader_start;
     reg commit_pulse;
@@ -151,17 +156,17 @@ module weight_ctrl #(
         if (!rst_n) begin
             wc_state             <= WC_IDLE;
             last_block_pending   <= 1'b0;
-            k_latched            <= '0;
-            n_latched            <= '0;
-            k_blk_idx            <= '0;
-            n_blk_idx            <= '0;
+            k_latched            <= 0;
+            n_latched            <= 0;
+            k_blk_idx            <= 0;
+            n_blk_idx            <= 0;
             loader_start         <= 1'b0;
             commit_pulse         <= 1'b0;
             input_band_start     <= 1'b0;
             input_compute_start  <= 1'b0;
-            committed_n_blk_idx  <= '0;
+            committed_n_blk_idx  <= 0;
             committed_first_k_blk <= 1'b0;
-            committed_k_blk_idx  <= '0;
+            committed_k_blk_idx  <= 0;
             
             valid_row            <= 0;
             valid_col            <= 0;
@@ -179,8 +184,8 @@ module weight_ctrl #(
                 // no difference to when both are actually ready
                 k_latched         <= weight_rows;
                 n_latched         <= weight_cols;
-                k_blk_idx         <= '0;
-                n_blk_idx         <= '0;
+                k_blk_idx         <= 0;
+                n_blk_idx         <= 0;
                 loader_start      <= 1'b1;  // kick block (0,0)'s weight prefetch
                 input_band_start  <= 1'b1;  // kick input band 0's preload
                 wc_state          <= WC_WAIT;
@@ -195,13 +200,13 @@ module weight_ctrl #(
                             last_block_pending   <= is_last_block;
                             committed_n_blk_idx   <= n_blk_idx;
                             committed_k_blk_idx   <= k_blk_idx;
-                            committed_first_k_blk <= (k_blk_idx == '0);
+                            committed_first_k_blk <= (k_blk_idx == 0);
                             valid_row <= valid_k;
                             valid_col <= valid_n;
 
                             if (!is_last_block) begin
                                 if (is_last_k_blk) begin
-                                    k_blk_idx <= '0;
+                                    k_blk_idx <= 0;
                                     n_blk_idx <= n_blk_idx + 1'b1;
                                 end
                                 else begin

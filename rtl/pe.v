@@ -8,8 +8,16 @@
 // b_in is the incoming partial sum from the previous PE in the chain;
 // p_out (the new partial sum) is forwarded on to the next PE.
 // operand a is buffered and also passed on to the next PE (a_out).
+//
+// DSP: the mac below is instantiated ARRAY_ROWS*ARRAY_COLS times, which on
+// a Cyclone V-class part is far more DSP blocks than exist. The
+// multstyle="logic" attribute (on the module and again on the product
+// itself) forces Quartus to build every one of these multipliers out of
+// soft logic instead of mapping them onto DSP blocks. Set it back to "dsp"
+// only on a device with the DSP budget for a full array.
 `timescale 1ps/1ps
 
+(* multstyle = "logic" *)
 module pe #(
     parameter DATA_WIDTH = 8,
     parameter ACC_WIDTH  = 32
@@ -80,12 +88,17 @@ module pe #(
     // ---- ACC_WIDTH-bit signed multiply-accumulate ----
     // weight/a_in are sign-extended from DATA_WIDTH to ACC_WIDTH by Verilog's
     // context-determined sizing rules, since $signed() marks them signed and
-    // the assignment target (p_out) is ACC_WIDTH wide.
+    // the declared width of mult_result is ACC_WIDTH.
+    // Broken out of the accumulate expression purely so the soft-logic
+    // multstyle attribute has a declaration to attach to (see header note).
+    (* multstyle = "logic" *)
+    wire signed [ACC_WIDTH-1:0] mult_result = $signed(weight_reg) * $signed(a_in);
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             p_out <= {ACC_WIDTH{1'b0}};
         else
-            p_out <= ($signed(weight_reg) * $signed(a_in)) + $signed(b_in);
+            p_out <= mult_result + $signed(b_in);
     end
 
 endmodule

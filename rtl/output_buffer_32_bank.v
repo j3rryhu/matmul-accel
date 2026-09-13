@@ -1,4 +1,4 @@
-// output_buffer_32_bank : 32 independent output_buffer banks, one per
+// output_buffer_32_bank : NUM_BANKS independent output_buffer banks, one per
 // pe_array column - mirrors input_buffer_32_bank's split-address-space
 // pattern, but output_loader needs independent read+write per bank
 // (read-modify-write accumulation) rather than input_buffer_32_bank's
@@ -17,12 +17,16 @@
 // ext_rdaddress is a single linear address split the same way
 // input_buffer_32_bank's write address is: upper bits pick the bank,
 // low bits are the offset within it.
+//
+// NB: the "32" in the module name is historical - the bank count is
+// NUM_BANKS and is fully parameterized (kept as-is so the Qsys/Platform
+// Designer fileset and tb/Makefile don't need renaming).
 `timescale 1ps/1ps
 
 module output_buffer_32_bank #(
     parameter DATA_WIDTH      = 8,   // int8 - output_loader rescales pe_array's ACC_WIDTH accumulator down to this before writing (see output_loader.v)
-    parameter NUM_BANKS       = 32,
-    parameter BANK_ADDR_WIDTH = 10    // per-bank address width - match the generated output_buffer IP's depth
+    parameter NUM_BANKS       = 16,
+    parameter BANK_ADDR_WIDTH = 7     // per-bank address width - match the generated output_buffer IP's depth
 )(
     input clock,
 
