@@ -247,7 +247,17 @@ module accel_top #(
     // ============================================================
     // ctrl_rf_rf - control/status register file
     // ============================================================
-    wire        ctrl_valid = ((avs_read || avs_write) && sel_ctrl) || (rd_burst_on && sel_ctrl_r);
+    // `valid` must mark the cycle the access actually COMMITS, not merely
+    // the cycle the master is presenting it. avs_waitrequest is still high
+    // on the first cycle of a read (`accepted` is not set yet), so a raw
+    // `avs_read && sel_ctrl` term asserts the register file's read strobe
+    // one cycle before the master samples avs_readdata. That is harmless
+    // for a plain status bit, but it destroys a read-to-clear field:
+    // STATUS.done would be cleared on that stalled cycle and read back as 0
+    // on the next. The accepted-read path (rd_burst_on && sel_ctrl_r) is
+    // already asserted from the delivering cycle onward - and covers every
+    // beat of a burst - so use only that for reads.
+    wire        ctrl_valid = (avs_write && sel_ctrl) || (rd_burst_on && sel_ctrl_r);
     logic [31:0] ctrl_rdata;
     wire        rf_data_valid = ctrl_valid;
 
@@ -258,7 +268,7 @@ module accel_top #(
     logic [15:0] input_cols;            // number of columns of the input (activation) matrix
     logic [15:0] output_scale;          // Q0.16 rescale factor (value/65536, range [0,1)) for pe_array's ACC_WIDTH accumulator
     logic        weight_ctrl_busy;      // weight_ctrl/weight_loader busy, for STATUS.busy
-    logic        weight_ctrl_done;      // level: last block committed and its input band fully streamed in
+    logic        weight_ctrl_done;      // PULSE: last block committed and its input band fully streamed in
 
     // STATUS.busy: weight/input side sequencing OR output_loader still
     // draining the last block's psums (weight_ctrl_done can go high a few
@@ -266,15 +276,41 @@ module accel_top #(
     // results - see output_loader.v's header note on drain latency).
     wire        matmul_busy = weight_ctrl_busy || output_loader_busy;
 
-    // STATUS.done: weight_ctrl_done only means every block has been
-    // *committed* (weight_ctrl.v's WC_DONE) - output_loader.done pulses
-    // per committed block, not once for the whole matmul (see
-    // output_loader.v), so the real "whole matmul done" level is
-    // weight_ctrl_done still held true once output_loader has also gone
-    // idle (i.e. the last block's drain has finished). Both sides are
-    // levels, so this stays high until the next matmul_start drops
-    // weight_ctrl_done again - safe for software to poll at any time.
-    wire        matmul_done = weight_ctrl_done && !output_loader_busy;
+    // STATUS.done is a read-to-clear sticky bit in the register file (see
+    // rdl/ctrl_reg.rdl), set by a one-cycle write-enable pulse. Producing
+    // that pulse takes two steps, because neither half of "the matmul
+    // finished" is sufficient on its own:
+    //
+    //   - weight_ctrl's done pulse only means every block has been
+    //     *committed*. output_loader is typically still draining the last
+    //     block's psums for a few more cycles at that point (see
+    //     output_loader.v's header note on drain latency), so firing here
+    //     would let software start reading output_buffer before the final
+    //     results have landed.
+    //   - output_loader's own done pulses once *per committed block*, not
+    //     once per matmul, so it can't be used directly either.
+    //
+    // So: latch weight_ctrl's pulse, then emit a single completion pulse on
+    // the rising edge of "all blocks committed AND the drain has finished".
+    logic all_blocks_committed;
+    always_ff @(posedge clk or negedge reset_n) begin
+        if (!reset_n)
+            all_blocks_committed <= 1'b0;
+        else if (matmul_start)          // a new matmul supersedes the old result
+            all_blocks_committed <= 1'b0;
+        else if (weight_ctrl_done)
+            all_blocks_committed <= 1'b1;
+    end
+
+    wire  matmul_complete = all_blocks_committed && !output_loader_busy;
+    logic matmul_complete_d;
+    always_ff @(posedge clk or negedge reset_n) begin
+        if (!reset_n) matmul_complete_d <= 1'b0;
+        else          matmul_complete_d <= matmul_complete;
+    end
+
+    // one cycle, once per matmul
+    wire matmul_done_pulse = matmul_complete && !matmul_complete_d;
 
     ctrl_rf_rf #(
         .ADDR_OFFSET (CTRL_BASE),
@@ -293,7 +329,8 @@ module accel_top #(
         .OUTPUT_SCALE_value_q    (output_scale),  // Q0.16 rescale factor, consumed by output_loader's requantize stage
 
         .STATUS_busy_wdata              (matmul_busy),
-        .STATUS_done_wdata              (matmul_done),
+        .STATUS_done_we                 (matmul_done_pulse),
+        .STATUS_done_wdata              (1'b1),
 
         .valid  (ctrl_valid),
         .read   (avs_read),

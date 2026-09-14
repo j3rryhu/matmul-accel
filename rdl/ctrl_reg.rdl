@@ -76,7 +76,7 @@ addrmap ctrl_rf {
         field {
             sw = r;
             hw = w;
-            reset = 0;
+            rclr = true;
         } done;               // whole matmul finished: all blocks committed and drained
 
     } STATUS;

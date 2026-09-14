@@ -25,6 +25,7 @@ module ctrl_rf_rf #(
 
     // Register STATUS
     input  logic                     [ 0: 0] STATUS_busy_wdata,          //! HW write data
+    input  logic                             STATUS_done_we,             //! Control HW write (active high)
     input  logic                     [ 0: 0] STATUS_done_wdata,          //! HW write data
 
     // Register OUTPUT_SCALE
@@ -373,7 +374,7 @@ module ctrl_rf_rf #(
     assign STATUS_busy_q = STATUS_busy_next;
 
     // ------------------------------------------------------------
-    // Field: done (wire)
+    // Field: done
     // ------------------------------------------------------------
     assign STATUS_done_anded = & STATUS_done_q;
     assign STATUS_done_ored  = | STATUS_done_q;
@@ -381,7 +382,21 @@ module ctrl_rf_rf #(
 
     // next hardware value
     assign STATUS_done_next = STATUS_done_wdata;
-    assign STATUS_done_q = STATUS_done_next;
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        STATUS_done_q <= 0;
+    end else begin
+        // Hardware Write
+        if (STATUS_done_we) begin
+            STATUS_done_q <= STATUS_done_next;
+        end
+        // Software read
+        else if (STATUS_sw_rd) begin
+            STATUS_done_q <= '0;
+        end
+    end
             
         
     // ============================================================

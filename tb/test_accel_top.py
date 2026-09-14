@@ -64,9 +64,15 @@ WEIGHT_ROWS_ADDR    = CTRL_BASE + 0x04
 WEIGHT_COLS_ADDR    = CTRL_BASE + 0x08
 INPUT_MAX_ADDR_ADDR = CTRL_BASE + 0x0C
 INPUT_COLS_ADDR     = CTRL_BASE + 0x10
+STATUS_ADDR         = CTRL_BASE + 0x14
 OUTPUT_SCALE_ADDR   = CTRL_BASE + 0x18
 
 MATMUL_START_BIT = 0
+
+# STATUS field bit positions - assigned by PeakRDL in declaration order,
+# re-check ctrl_rf_rf.sv if ctrl_reg.rdl's field order changes
+STATUS_BUSY_BIT = 0
+STATUS_DONE_BIT = 1
 
 # ---- test-fixed dimensions ----
 ARRAY_ROWS = 16  # must match accel_top.sv's ARRAY_ROWS / input_buffer_32_bank's bank count
@@ -85,13 +91,13 @@ OBUF_BANK_ADDR_WIDTH = 7  # must match accel_top.sv's OBUF_BANK_ADDR_WIDTH
 IBUF_BANK_ADDR_WIDTH = 8  # must match input_buffer_32_bank.v's per-bank address width
 
 CLK_PERIOD_NS = 10
-DONE_TIMEOUT_CYCLES = 8000
 WATCHDOG_CYCLES = 8000
 
-# wait_matmul_done only needs to cover compute (block prefetch/drain, see
-# weight_ctrl.v/weight_loader.v) - 20000 is already generous for a 2x2-block
-# (64x64x64) run.
-MULTIBLOCK_DONE_TIMEOUT_CYCLES = 20000
+# Completion is polled through the STATUS register, so the bound is a count
+# of Avalon read transactions rather than clock cycles - each poll costs
+# several cycles. 10000 reads is generous for any matmul the buffers can
+# hold; the per-test watchdog below is the real backstop against a hang.
+STATUS_POLL_LIMIT = 10000
 
 # The watchdog runs for the *whole* test, start to finish - not just
 # compute. For 64x64x64 that's dominated by the per-byte Avalon loops, not
@@ -207,38 +213,43 @@ async def read_burst_bytes(dut, byte_addr, count):
     return [w & 0xFF for w in words]
 
 
-async def wait_output_done(dut, timeout_cycles=DONE_TIMEOUT_CYCLES):
-    """output_loader.done pulses for one cycle once this block's psums are
-    fully drained into output_buffer - the true completion signal (later
-    than weight_ctrl.done, which only reflects the input side finishing).
-    With a single 32x32 block this is also the whole matmul's completion
-    (STATUS.done, driven from the same two signals - see rdl/README.md -
-    would work here too, but polling the internal signal directly avoids
-    a race with STATUS.done's own one-cycle-later timing)."""
-    for _ in range(timeout_cycles):
-        await RisingEdge(dut.clk)
-        if int(dut.u_output_loader.done.value) == 1:
+async def read_status(dut):
+    """Read the STATUS register over Avalon. Everything the testbench needs
+    to know about completion is visible through the register interface, so
+    nothing here reaches into the DUT hierarchy - that keeps these tests
+    honest about what software can actually observe."""
+    return await avalon_read(dut, STATUS_ADDR)
+
+
+async def wait_matmul_done(dut, timeout_reads=STATUS_POLL_LIMIT):
+    """Poll STATUS.done until the whole matmul has finished: every block
+    committed AND output_loader drained the last one. Both STATUS bits are
+    levels held until the next matmul_start, so a poll can't miss an edge.
+
+    Note this waits on the *whole* matmul, not one block - output_loader's
+    internal done pulses once per committed block, so it is not a usable
+    whole-matmul signal even if we were willing to probe it.
+
+    timeout_reads counts register reads, not clock cycles: each poll is a
+    full Avalon read transaction and so costs several cycles.
+    """
+    for _ in range(timeout_reads):
+        if (await read_status(dut)) & (1 << STATUS_DONE_BIT):
             return
     raise TimeoutError(
-        f"output_loader never asserted done within {timeout_cycles} cycles"
+        f"STATUS.done never asserted within {timeout_reads} register reads"
     )
 
 
-async def wait_matmul_done(dut, timeout_cycles=MULTIBLOCK_DONE_TIMEOUT_CYCLES):
-    """matmul_done (accel_top.sv) is a level that only goes high once every
-    block has been committed (weight_ctrl_done) AND output_loader has
-    drained the last one - the right "whole matmul finished" signal for a
-    multi-block run. output_loader.done isn't usable here the way
-    wait_output_done uses it for a single block: it pulses once *per
-    committed block*, not once for the whole matmul (see output_loader.v /
-    rdl/README.md), so waiting on it once would only catch the first
-    block."""
-    for _ in range(timeout_cycles):
-        await RisingEdge(dut.clk)
-        if int(dut.matmul_done.value) == 1:
+async def wait_matmul_idle(dut, timeout_reads=STATUS_POLL_LIMIT):
+    """Poll STATUS.busy until the accelerator is idle. Used to check that
+    busy actually clears once a matmul finishes, rather than latching high
+    the way it used to when WC_DONE still counted as busy."""
+    for _ in range(timeout_reads):
+        if not ((await read_status(dut)) & (1 << STATUS_BUSY_BIT)):
             return
     raise TimeoutError(
-        f"matmul_done never asserted within {timeout_cycles} cycles"
+        f"STATUS.busy never cleared within {timeout_reads} register reads"
     )
 
 
@@ -340,7 +351,7 @@ async def test_single_block_matmul(dut):
     # weight_ctrl internally (see rtl/weight_ctrl.v) ----
     await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
 
-    await wait_output_done(dut)
+    await wait_matmul_done(dut)
     # give output_buffer's write a cycle to land before reading it back
     await ClockCycles(dut.clk, 2)
 
@@ -695,15 +706,16 @@ async def test_back_to_back_matmul_no_reset(dut):
     """Two matmuls of the same full ARRAY_ROWS x ARRAY_COLS shape, back to
     back, with no reset between them.
 
-    Regression test for the stale STATUS.done/busy levels in weight_ctrl:
-    WC_DONE is a resting state held until the next matmul_start, so
-    `done` stayed asserted from the previous matmul and `busy` never
-    cleared at all. Software (and this testbench) polling STATUS.done
-    straight after writing CONTROL.matmul_start saw the previous run's
-    level and began reading output_buffer before the new matmul had
-    produced anything - the readback then returned the prior run's
-    results. Fixed in rtl/weight_ctrl.v by gating `done` with
-    !matmul_start and excluding WC_DONE from `busy`.
+    Regression test for the stale STATUS.done/busy levels in weight_ctrl.
+    WC_DONE is a resting state held until the next matmul_start, so `busy`
+    (= wc_state != WC_IDLE) latched high forever after the first matmul and
+    `done` stayed asserted from the previous run. A completion poll then
+    returned immediately and readback raced the compute, returning the
+    prior run's results.
+
+    Fixed in rtl/weight_ctrl.v by excluding WC_DONE from `busy` and gating
+    `done` with !matmul_start. Backing either fix out is caught here: with
+    the busy fix removed, wait_matmul_idle below times out.
 
     Every other test in this file resets first and runs exactly one
     matmul, which is why this went unnoticed.
@@ -737,7 +749,19 @@ async def test_back_to_back_matmul_no_reset(dut):
         await avalon_write(dut, INPUT_COLS_ADDR, M)
         await avalon_write(dut, OUTPUT_SCALE_ADDR, q16)
         await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+
+        # STATUS.done must not still be set from the previous matmul.
+        # Through the register interface this is a wide margin rather than a
+        # tight race - weight_ctrl leaves WC_DONE on the edge that samples
+        # matmul_start, which is well before a read transaction can come
+        # back - so this guards against done becoming sticky across
+        # matmul_start, not against the original one-cycle window.
+        assert not ((await read_status(dut)) & (1 << STATUS_DONE_BIT)),             "STATUS.done still set right after matmul_start - stale from the previous matmul"
+
         await wait_matmul_done(dut)
+        # ... and busy must actually clear once idle, rather than latching
+        # high forever the way it did when WC_DONE still counted as busy.
+        await wait_matmul_idle(dut)
         await ClockCycles(dut.clk, 2)
 
         golden = np.clip(((W_int8 @ X_int8) * q16) >> 16, -128, 127)

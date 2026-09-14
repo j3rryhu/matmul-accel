@@ -61,7 +61,11 @@ module weight_ctrl #(
     input      [DIM_WIDTH-1:0]   weight_cols,        // output size (see header note)
 
     output                       busy,               // whole matmul in progress (from matmul_start to done)
-    output                       done,               // last block committed and fully streamed/drained
+    output                       done,               // PULSE: one cycle on entering WC_DONE (last block
+                                                     // committed and fully streamed). NOTE this fires
+                                                     // before output_loader has finished draining that
+                                                     // block - accel_top combines it with the drain
+                                                     // state to decide whole-matmul completion.
 
     // ---- weight_buffer read port ----
     output                       wbuf_rden,
@@ -155,14 +159,15 @@ module weight_ctrl #(
     // would stay high forever after the first matmul.
     assign busy = (wc_state != WC_IDLE) && (wc_state != WC_DONE);
 
-    // ... and `done` must drop the moment a new matmul is kicked off.
-    // wc_state only leaves WC_DONE on the clock edge that samples
-    // matmul_start, so without the !matmul_start term there is a window
-    // where the *previous* matmul's done level is still visible after the
-    // new one has been started - software polling STATUS.done right after
-    // writing CONTROL.matmul_start would see that stale 1 and start
-    // reading output_buffer before this matmul has produced anything.
-    assign done = (wc_state == WC_DONE) && !matmul_start;
+    // `done` is a one-cycle PULSE marking the WC_RUN -> WC_DONE transition,
+    // not a level. A level held in WC_DONE is inherently ambiguous across
+    // back-to-back matmuls: it says "some matmul finished", not "this one
+    // did", so a reader can't tell a fresh completion from the previous
+    // run's leftover. Pulsing the event instead lets the register file
+    // latch it into a read-to-clear STATUS.done bit (see ctrl_reg.rdl),
+    // which is consumed exactly once.
+    reg done_pulse;
+    assign done = done_pulse;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -176,6 +181,7 @@ module weight_ctrl #(
             commit_pulse         <= 1'b0;
             input_band_start     <= 1'b0;
             input_compute_start  <= 1'b0;
+            done_pulse           <= 1'b0;
             committed_n_blk_idx  <= 0;
             committed_first_k_blk <= 1'b0;
             committed_k_blk_idx  <= 0;
@@ -188,6 +194,7 @@ module weight_ctrl #(
             commit_pulse        <= 1'b0;
             input_band_start    <= 1'b0;
             input_compute_start <= 1'b0;
+            done_pulse          <= 1'b0;
 
             if (matmul_start) begin
                 // weight prefetch takes >=1024 cycles regardless, so kicking
@@ -233,7 +240,8 @@ module weight_ctrl #(
                     WC_RUN: begin
                         if (input_band_done) begin
                             if (last_block_pending) begin
-                                wc_state <= WC_DONE;
+                                wc_state   <= WC_DONE;
+                                done_pulse <= 1'b1;
                             end
                             else begin
                                 input_band_start <= 1'b1;  // preload the (already-advanced) next band
