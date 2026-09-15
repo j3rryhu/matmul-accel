@@ -1,79 +1,148 @@
 // Simulation-only behavioral stand-ins for the buffer-RAM IP referenced by
 // rtl/accel_top.sv, rtl/input_buffer_32_bank.v, and rtl/output_buffer_32_bank.v
-// (weight_buffer, input_buffer, output_buffer). Each is a plain flop array:
-// synchronous write, registered (1-cycle-latency) read - matching the
-// "synchronous on-chip RAM" assumption documented throughout weight_ctrl.v/
-// weight_loader.v/output_loader.v.
+// (weight_buffer, input_buffer, output_buffer).
+//
+// All three are MIXED-WIDTH simple dual-port RAMs: the Avalon-facing port is
+// AVS_DATA_WIDTH (32) wide so a host access moves a full word and the byte
+// address advances by 4, while the core-facing port stays byte-wide because
+// weight_loader/input_dispatch read one byte per cycle and output_loader
+// writes one byte per cycle.
+//
+//   weight_buffer : wide WRITE  (Avalon)      / narrow READ  (weight_loader)
+//   input_buffer  : wide WRITE  (Avalon)      / narrow READ  (input_dispatch)
+//   output_buffer : narrow WRITE (output_loader) / wide READ (Avalon)
+//
+// Byte ordering matches Altera's mixed-width altsyncram convention (and
+// Avalon byte lanes): narrow element i of a wide word sits at bit
+// [i*NARROW_WIDTH +: NARROW_WIDTH], so narrow address 4n+0 is the wide
+// word's least significant byte.
 //
 // These are NOT meant for synthesis. Swap this file out of the compile
-// fileset (and drop in the real generated IP, same module names/ports) once
-// that IP exists - nothing elsewhere needs to change, since callers only
-// know these three module names and their clock/data/rdaddress/rden/
-// wraddress/wren/q interface.
+// fileset for the real generated IP (same module names/ports) once it
+// exists - the generated On-Chip Memory must be configured with matching
+// mixed port widths.
 `timescale 1ps/1ps
 
-module flop_ram #(
-    parameter WIDTH      = 8,
-    parameter ADDR_WIDTH = 10
+// Wide write port, narrow read port.
+module mixed_ram_wr_wide #(
+    parameter NARROW_WIDTH = 8,
+    parameter WIDE_WIDTH   = 32,
+    parameter NARROW_DEPTH = 256
 )(
-    input                       clock,
-    input      [WIDTH-1:0]      data,
-    input      [ADDR_WIDTH-1:0] rdaddress,
-    input                       rden,
-    input      [ADDR_WIDTH-1:0] wraddress,
-    input                       wren,
-    output reg [WIDTH-1:0]      q
+    input                                       clock,
+    input      [WIDE_WIDTH-1:0]                 data,
+    input      [$clog2(NARROW_DEPTH)-1:0]       rdaddress,
+    input                                       rden,
+    input      [$clog2(NARROW_DEPTH*NARROW_WIDTH/WIDE_WIDTH)-1:0] wraddress,
+    input                                       wren,
+    output reg [NARROW_WIDTH-1:0]               q
 );
-    reg [WIDTH-1:0] mem [0:(1<<ADDR_WIDTH)-1];
+    localparam RATIO = WIDE_WIDTH / NARROW_WIDTH;
 
+    reg [NARROW_WIDTH-1:0] mem [0:NARROW_DEPTH-1];
+
+    integer i;
     always @(posedge clock) begin
         if (wren)
-            mem[wraddress] <= data;
+            for (i = 0; i < RATIO; i = i + 1)
+                mem[wraddress*RATIO + i] <= data[i*NARROW_WIDTH +: NARROW_WIDTH];
         if (rden)
             q <= mem[rdaddress];
     end
 endmodule
 
-// Stamps out a concretely-named module (matching a real IP's name exactly)
-// as a thin flop_ram wrapper at the given address/data width.
-//
-// NB: the macro argument below is named AW, not ADDR_WIDTH - naive
-// text-substitution macros rewrite *every* matching token, including the
-// ADDR_WIDTH inside ".ADDR_WIDTH(...)"'s named parameter connection, so
-// reusing that exact name here would mangle it into ".14(14)" or similar.
-`define DEFINE_BUFFER_RAM(NAME, AW, DW) \
-module NAME ( \
-    input               clock, \
-    input      [DW-1:0] data, \
-    input      [AW-1:0] rdaddress, \
-    input               rden, \
-    input      [AW-1:0] wraddress, \
-    input               wren, \
-    output     [DW-1:0] q \
-); \
-    flop_ram #( \
-        .WIDTH      (DW), \
-        .ADDR_WIDTH (AW) \
-    ) u_flop_ram ( \
-        .clock     (clock), \
-        .data      (data), \
-        .rdaddress (rdaddress), \
-        .rden      (rden), \
-        .wraddress (wraddress), \
-        .wren      (wren), \
-        .q         (q) \
-    ); \
+// Narrow write port, wide read port.
+module mixed_ram_rd_wide #(
+    parameter NARROW_WIDTH = 8,
+    parameter WIDE_WIDTH   = 32,
+    parameter NARROW_DEPTH = 128
+)(
+    input                                       clock,
+    input      [NARROW_WIDTH-1:0]               data,
+    input      [$clog2(NARROW_DEPTH*NARROW_WIDTH/WIDE_WIDTH)-1:0] rdaddress,
+    input                                       rden,
+    input      [$clog2(NARROW_DEPTH)-1:0]       wraddress,
+    input                                       wren,
+    output reg [WIDE_WIDTH-1:0]                 q
+);
+    localparam RATIO = WIDE_WIDTH / NARROW_WIDTH;
+
+    reg [NARROW_WIDTH-1:0] mem [0:NARROW_DEPTH-1];
+
+    integer i;
+    always @(posedge clock) begin
+        if (wren)
+            mem[wraddress] <= data;
+        if (rden)
+            for (i = 0; i < RATIO; i = i + 1)
+                q[i*NARROW_WIDTH +: NARROW_WIDTH] <= mem[rdaddress*RATIO + i];
+    end
 endmodule
 
-// weight_buffer: WBUF_SIZE=0x4000 (16384 bytes), 14-bit address, 8-bit (int8) entries
-`DEFINE_BUFFER_RAM(weight_buffer, 14, 8)
+// weight_buffer: 16384 bytes. Avalon writes 32-bit words (4096 x 32,
+// 12-bit word address); weight_loader reads bytes (16384 x 8, 14-bit).
+module weight_buffer (
+    input         clock,
+    input  [31:0] data,
+    input  [13:0] rdaddress,
+    input         rden,
+    input  [11:0] wraddress,
+    input         wren,
+    output [ 7:0] q
+);
+    mixed_ram_wr_wide #(
+        .NARROW_WIDTH (8),
+        .WIDE_WIDTH   (32),
+        .NARROW_DEPTH (16384)
+    ) u_ram (
+        .clock (clock), .data (data),
+        .rdaddress (rdaddress), .rden (rden),
+        .wraddress (wraddress), .wren (wren), .q (q)
+    );
+endmodule
 
-// input_buffer: one bank of input_buffer_32_bank, 256 bytes/bank, 8-bit address, 8-bit (int8) entries
-`DEFINE_BUFFER_RAM(input_buffer, 8, 8)
+// input_buffer: one bank of input_buffer_32_bank, 256 bytes. Avalon writes
+// 32-bit words (64 x 32, 6-bit word address); input_dispatch reads bytes
+// (256 x 8, 8-bit).
+module input_buffer (
+    input         clock,
+    input  [31:0] data,
+    input  [ 7:0] rdaddress,
+    input         rden,
+    input  [ 5:0] wraddress,
+    input         wren,
+    output [ 7:0] q
+);
+    mixed_ram_wr_wide #(
+        .NARROW_WIDTH (8),
+        .WIDE_WIDTH   (32),
+        .NARROW_DEPTH (256)
+    ) u_ram (
+        .clock (clock), .data (data),
+        .rdaddress (rdaddress), .rden (rden),
+        .wraddress (wraddress), .wren (wren), .q (q)
+    );
+endmodule
 
-// output_buffer: one bank of output_buffer_32_bank, 128 bytes/bank, 7-bit
-// address, 8-bit (int8) entries - output_loader rescales pe_array's
-// ACC_WIDTH accumulator down to int8 before writing (see output_loader.v)
-`DEFINE_BUFFER_RAM(output_buffer, 7, 8)
-
-`undef DEFINE_BUFFER_RAM
+// output_buffer: one bank of output_buffer_32_bank, 128 bytes.
+// output_loader writes bytes (128 x 8, 7-bit); Avalon reads 32-bit words
+// (32 x 32, 5-bit word address).
+module output_buffer (
+    input         clock,
+    input  [ 7:0] data,
+    input  [ 4:0] rdaddress,
+    input         rden,
+    input  [ 6:0] wraddress,
+    input         wren,
+    output [31:0] q
+);
+    mixed_ram_rd_wide #(
+        .NARROW_WIDTH (8),
+        .WIDE_WIDTH   (32),
+        .NARROW_DEPTH (128)
+    ) u_ram (
+        .clock (clock), .data (data),
+        .rdaddress (rdaddress), .rden (rden),
+        .wraddress (wraddress), .wren (wren), .q (q)
+    );
+endmodule

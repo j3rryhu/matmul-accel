@@ -72,6 +72,19 @@ module accel_top #(
     localparam int IBUF_ADDR_WIDTH      = $clog2(ARRAY_ROWS) + IBUF_BANK_ADDR_WIDTH;
     localparam int OBUF_ADDR_WIDTH      = $clog2(ARRAY_COLS) + OBUF_BANK_ADDR_WIDTH;
 
+    // The buffers' Avalon-facing ports are AVS_DATA_WIDTH wide, so a host
+    // access moves BYTES_PER_WORD bytes and the byte address advances by
+    // BYTES_PER_WORD. Those ports are addressed in words; the core-facing
+    // ports stay byte-addressed (weight_loader/input_dispatch read one byte
+    // per cycle, output_loader writes one byte per cycle).
+    localparam int BYTES_PER_WORD  = AVS_DATA_WIDTH / PE_DATA_WIDTH;
+    localparam int WORD_SHIFT      = $clog2(BYTES_PER_WORD);
+    localparam int WBUF_WADDR_WIDTH      = WBUF_ADDR_WIDTH      - WORD_SHIFT;
+    localparam int IBUF_BANK_WADDR_WIDTH = IBUF_BANK_ADDR_WIDTH - WORD_SHIFT;
+    localparam int OBUF_BANK_RADDR_WIDTH = OBUF_BANK_ADDR_WIDTH - WORD_SHIFT;
+    localparam int IBUF_WADDR_WIDTH      = IBUF_ADDR_WIDTH      - WORD_SHIFT;
+    localparam int OBUF_RADDR_WIDTH      = OBUF_ADDR_WIDTH      - WORD_SHIFT;
+
     wire sel_ctrl = (avs_address >= CTRL_BASE) && (avs_address < CTRL_BASE + CTRL_SIZE);
     wire sel_wbuf = (avs_address >= WBUF_BASE) && (avs_address < WBUF_BASE + WBUF_SIZE);
     wire sel_ibuf = (avs_address >= IBUF_BASE) && (avs_address < IBUF_BASE + IBUF_SIZE);
@@ -87,18 +100,6 @@ module accel_top #(
     assign avs_readdatavalid = rf_data_valid || obuf_data_valid;
     assign avs_waitrequest = (avs_read && !accepted) || burst_busy;
 
-    // pick the enabled byte lane out of a 32-bit avalon write word
-    function automatic logic [7:0] be_select_byte(input logic [31:0] wdata, input logic [3:0] be);
-        logic [7:0] result;
-        begin
-            result = wdata[7:0];
-            if (be[1]) result = wdata[15:8];
-            if (be[2]) result = wdata[23:16];
-            if (be[3]) result = wdata[31:24];
-            be_select_byte = result;
-        end
-    endfunction
-
     always@(posedge clk)begin
         if(!reset_n)begin
             burst_cnt_buf <= 0;
@@ -111,7 +112,7 @@ module accel_top #(
         end
         else begin
             if(avs_read && !rd_burst_on)begin
-                addr_buf <= avs_address + 1;
+                addr_buf <= avs_address + BYTES_PER_WORD;
                 accepted <= 1;
                 burst_cnt_buf <= avs_burstcount == 0 ? 1 : avs_burstcount;
                 sel_ctrl_r <= sel_ctrl;
@@ -125,7 +126,7 @@ module accel_top #(
 
             if(rd_burst_on)begin
                 burst_cnt_buf <= burst_cnt_buf - 1;
-                addr_buf <= addr_buf + 1;
+                addr_buf <= addr_buf + BYTES_PER_WORD;
                 if(burst_cnt_buf == 1)begin
                     sel_ctrl_r <= 0;
                     sel_obuf_r <= 0;
@@ -141,8 +142,8 @@ module accel_top #(
     // weight_buffer - write-only from Avalon
     // ============================================================
     wire        wbuf_wren      = avs_write && sel_wbuf;
-    wire [WBUF_ADDR_WIDTH-1:0] wbuf_wraddress = (avs_address - WBUF_BASE);
-    wire [7:0]  wbuf_wdata     = be_select_byte(avs_writedata, avs_byteenable);
+    wire [WBUF_WADDR_WIDTH-1:0] wbuf_wraddress = (avs_address - WBUF_BASE) >> WORD_SHIFT;
+    wire [AVS_DATA_WIDTH-1:0]   wbuf_wdata      = avs_writedata;
 
     logic [WBUF_ADDR_WIDTH-1:0] wbuf_rdaddress;
     logic        wbuf_rden;
@@ -162,8 +163,8 @@ module accel_top #(
     // input_buffer - write side from Avalon, read side driven by input_dispatch
     // ============================================================
     wire        ibuf_wren      = avs_write && sel_ibuf;
-    wire [IBUF_ADDR_WIDTH-1:0] ibuf_wraddress = (avs_address - IBUF_BASE);
-    wire [7:0]  ibuf_wdata     = be_select_byte(avs_writedata, avs_byteenable);
+    wire [IBUF_WADDR_WIDTH-1:0] ibuf_wraddress = (avs_address - IBUF_BASE) >> WORD_SHIFT;
+    wire [AVS_DATA_WIDTH-1:0]   ibuf_wdata      = avs_writedata;
 
     logic [ARRAY_ROWS*PE_DATA_WIDTH-1:0]       ibuf_q;
     logic [ARRAY_ROWS*IBUF_BANK_ADDR_WIDTH-1:0] ibuf_rdaddress;
@@ -173,7 +174,8 @@ module accel_top #(
     input_buffer_32_bank #(
         .ARRAY_ROWS      (ARRAY_ROWS),
         .DATA_WIDTH      (PE_DATA_WIDTH),
-        .BANK_ADDR_WIDTH (IBUF_BANK_ADDR_WIDTH)
+        .BANK_ADDR_WIDTH (IBUF_BANK_ADDR_WIDTH),
+        .WR_DATA_WIDTH   (AVS_DATA_WIDTH)
     ) u_input_buffer (
         .clock         (clk),
         .data          (ibuf_wdata),
@@ -196,8 +198,9 @@ module accel_top #(
     // output_loader.v).
     // ============================================================
     wire        obuf_ext_rden      = (avs_read && sel_obuf) || (rd_burst_on && sel_obuf_r);
-    wire [OBUF_ADDR_WIDTH-1:0] obuf_ext_rdaddress = rd_burst_on ? (addr_buf - OBUF_BASE) : (avs_address - OBUF_BASE);
-    logic [7:0]  obuf_ext_q;
+    wire [OBUF_RADDR_WIDTH-1:0] obuf_ext_rdaddress =
+        (rd_burst_on ? (addr_buf - OBUF_BASE) : (avs_address - OBUF_BASE)) >> WORD_SHIFT;
+    logic [AVS_DATA_WIDTH-1:0] obuf_ext_q;
 
     logic obuf_rd_pending;
     always_ff @(posedge clk or negedge reset_n)begin
@@ -218,8 +221,8 @@ module accel_top #(
 
     logic        output_loader_busy;
     logic [ARRAY_COLS-1:0]                        obuf_bank_rden;
-    logic [ARRAY_COLS*OBUF_BANK_ADDR_WIDTH-1:0]   obuf_bank_rdaddress;
-    logic [ARRAY_COLS*PE_DATA_WIDTH-1:0]          obuf_bank_q;
+    logic [ARRAY_COLS*OBUF_BANK_RADDR_WIDTH-1:0]  obuf_bank_rdaddress;
+    logic [ARRAY_COLS*AVS_DATA_WIDTH-1:0]         obuf_bank_q;
     logic [ARRAY_COLS-1:0]                        obuf_bank_wren;
     logic [ARRAY_COLS*OBUF_BANK_ADDR_WIDTH-1:0]   obuf_bank_waddr;
     logic [ARRAY_COLS*PE_DATA_WIDTH-1:0]          obuf_bank_wdata;
@@ -227,7 +230,8 @@ module accel_top #(
     output_buffer_32_bank #(
         .DATA_WIDTH      (PE_DATA_WIDTH),
         .NUM_BANKS       (ARRAY_COLS),
-        .BANK_ADDR_WIDTH (OBUF_BANK_ADDR_WIDTH)
+        .BANK_ADDR_WIDTH (OBUF_BANK_ADDR_WIDTH),
+        .RD_DATA_WIDTH   (AVS_DATA_WIDTH)
     ) u_output_buffer (
         .clock          (clk),
 
@@ -344,7 +348,7 @@ module accel_top #(
     // Avalon read mux / waitrequest
     // ============================================================
     // assign avs_waitrequest = avs_read && sel_obuf && !obuf_rd_pending;
-    assign avs_readdata    = obuf_rd_pending ? {4{obuf_ext_q}} : (((sel_ctrl && avs_read) || (rd_burst_on && sel_ctrl_r)) ? ctrl_rdata : 32'h0);
+    assign avs_readdata    = obuf_rd_pending ? obuf_ext_q : (((sel_ctrl && avs_read) || (rd_burst_on && sel_ctrl_r)) ? ctrl_rdata : 32'h0);
 
     // ============================================================
     // input_dispatch - streams input_buffer into the array's left edge,
@@ -457,6 +461,7 @@ module accel_top #(
         .ARRAY_COLS     (ARRAY_COLS),
         .ARRAY_ROWS     (ARRAY_ROWS),
         .ROW_ADDR_WIDTH (OBUF_BANK_ADDR_WIDTH),
+        .RD_DATA_WIDTH  (AVS_DATA_WIDTH),
         .DIM_WIDTH       (16)
     ) u_output_loader (
         .clock (clk),

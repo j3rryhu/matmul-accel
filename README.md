@@ -84,13 +84,21 @@ address drives that region's RAM or register file directly.
 
 Access conventions:
 
-- **Buffer writes are byte-granular.** `accel_top`'s `be_select_byte()`
-  picks whichever lane `avs_byteenable` enables, and `avs_address` is a
-  direct byte address into the buffer. To write byte `v` at byte address
-  `a`: set `avs_writedata = v << (8*(a & 3))` and
-  `avs_byteenable = 1 << (a & 3)`.
-- **Buffer reads return the byte replicated across all four lanes**
-  (`{4{obuf_ext_q}}`), so any lane may be used.
+- **All buffer accesses are full 32-bit words.** The buffers are
+  *mixed-width*: the host-facing port is `AVS_DATA_WIDTH` wide, the
+  core-facing port stays byte-wide. So one access moves 4 bytes and the byte
+  address advances by **4**, not 1. `avs_byteenable` is **not** honoured for
+  buffer accesses - there is no byte-granular write.
+- **Byte order is little-endian within a word**: byte address `4n+j` sits at
+  `avs_writedata[8*j +: 8]`, matching Avalon byte lanes.
+- **Write whole contiguous images.** Because a write commits all 4 bytes,
+  writing a region whose length is not a multiple of 4 will clobber the
+  bytes following it. Build the full byte image for a region (the entire
+  weight matrix, or one input bank across *all* of its bands) and write it
+  as a run of words.
+- **Reads may need covering-word arithmetic.** Output segments start at
+  `k_blk*M`, which is only word-aligned when `M` is a multiple of 4. To read
+  an unaligned run, burst the words that cover it and unpack.
 - **Register file accesses are 32-bit word accesses** at the offsets below.
 - `output_buffer` reads have one cycle of latency and assert
   `avs_waitrequest`; `avs_readdatavalid` marks valid beats.
@@ -321,15 +329,28 @@ Quartus-generated On-Chip Memory IPs.
 [`tb/models/buffer_ram_models.v`](tb/models/buffer_ram_models.v) provides
 simulation-only behavioral stand-ins with matching names and ports.
 
-| Buffer | Instances | Per-instance depth x width | Address width | Total | AVS region |
-|---|---|---|---|---|---|
-| `weight_buffer` | 1 | 16384 x 8 | 14-bit | 16 KB | `WBUF_SIZE = 0x4000` |
-| `input_buffer` | `ARRAY_ROWS` (16) | 256 x 8 | 8-bit | 4 KB used of 8 KB | `IBUF_SIZE = 0x2000` |
-| `output_buffer` | `ARRAY_COLS` (16) | 128 x 8 | 7-bit | 2 KB used of 4 KB | `OBUF_SIZE = 0x1000` |
+All three are **mixed-width simple dual-port** RAMs - independent
+`rdaddress`/`wraddress`, each with its own `rden`/`wren`, one cycle of
+registered read latency - with the host-facing port 32 bits wide and the
+core-facing port byte wide:
 
-All three are byte-wide (8-bit, matching `PE_DATA_WIDTH`/int8) **simple
-dual-port** RAMs - independent `rdaddress`/`wraddress`, each with its own
-`rden`/`wren`, one cycle of registered read latency.
+| Buffer | Instances | Host port (Avalon) | Core port | Total | AVS region |
+|---|---|---|---|---|---|
+| `weight_buffer` | 1 | **write** 4096 x 32, 12-bit | read 16384 x 8, 14-bit (`weight_loader`) | 16 KB | `WBUF_SIZE = 0x4000` |
+| `input_buffer` | `ARRAY_ROWS` (16) | **write** 64 x 32, 6-bit | read 256 x 8, 8-bit (`input_dispatch`) | 4 KB used of 8 KB | `IBUF_SIZE = 0x2000` |
+| `output_buffer` | `ARRAY_COLS` (16) | **read** 32 x 32, 5-bit | write 128 x 8, 7-bit (`output_loader`) | 2 KB used of 4 KB | `OBUF_SIZE = 0x1000` |
+
+The core side stays byte-wide because `weight_loader` and `input_dispatch`
+consume one byte per cycle and `output_loader` produces one byte per cycle.
+Configure each generated On-Chip Memory with these two port widths; byte
+ordering must be little-endian (narrow address `4n+j` = wide bit `8*j`),
+which is altsyncram's default.
+
+> `output_buffer`'s single read port is shared - `output_loader`'s
+> read-modify-write and the Avalon host both use it, muxed by `busy`. Since
+> that port is now 32 bits, `output_loader` reads the *word* containing its
+> byte and selects the lane with the delayed address; its write-back still
+> goes through the byte-wide write port.
 
 Notes:
 

@@ -98,7 +98,15 @@ module output_loader #(
     parameter SCALE_WIDTH    = 16,   // output_scale width - Q0.16 fixed point (unsigned, range [0,1))
     parameter ARRAY_COLS     = 16,
     parameter ARRAY_ROWS     = 16,
-    parameter ROW_ADDR_WIDTH = 16,   // per-bank address width - must span num_n_blocks*total_rows
+    parameter ROW_ADDR_WIDTH = 16,   // per-bank WRITE (byte) address width - must span num_n_blocks*total_rows
+    parameter RD_DATA_WIDTH  = 32,   // output_buffer read port width (wide, shared with Avalon)
+    // The output_buffer read port is wide (one word per access) because the
+    // Avalon host reads through it; this module only ever wants one byte of
+    // that word, so it addresses the RAM in words and selects the lane its
+    // byte actually lives in. The write port stays DATA_WIDTH, so the
+    // read-modify-write still writes back exactly one byte.
+    parameter LANE_SEL_W     = $clog2(RD_DATA_WIDTH/DATA_WIDTH),
+    parameter ROW_RADDR_WIDTH = ROW_ADDR_WIDTH - LANE_SEL_W,
     parameter DIM_WIDTH      = 16,   // width of committed_k_blk_idx (from weight_ctrl)
     parameter COL_SEL_W      = $clog2(ARRAY_COLS+1),
     parameter ROW_SEL_W      = $clog2(ARRAY_ROWS+1)
@@ -126,8 +134,8 @@ module output_loader #(
 
     // ---- output_buffer read+write ports, one bank per array row ----
     output     [ARRAY_COLS-1:0]                     obuf_rden,
-    output     [ARRAY_COLS*ROW_ADDR_WIDTH-1:0]      obuf_rdaddress,
-    input      [ARRAY_COLS*DATA_WIDTH-1:0]          obuf_q,
+    output     [ARRAY_COLS*ROW_RADDR_WIDTH-1:0]     obuf_rdaddress,
+    input      [ARRAY_COLS*RD_DATA_WIDTH-1:0]       obuf_q,
     output     [ARRAY_COLS-1:0]                     obuf_wren,
     output     [ARRAY_COLS*ROW_ADDR_WIDTH-1:0]      obuf_waddr,
     output     [ARRAY_COLS*DATA_WIDTH-1:0]          obuf_wdata,
@@ -227,7 +235,7 @@ module output_loader #(
             wire [ROW_ADDR_WIDTH-1:0] cur_addr = held_k_blk_idx*total_rows + row_count[r];
 
             assign obuf_rden[r] = row_active;
-            assign obuf_rdaddress[r*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH] = cur_addr;
+            assign obuf_rdaddress[r*ROW_RADDR_WIDTH +: ROW_RADDR_WIDTH] = cur_addr[ROW_ADDR_WIDTH-1:LANE_SEL_W];
 
             // one-cycle pipeline so obuf_q[r] (this RAM's own one-cycle
             // synchronous read latency) lines up with the psum it should
@@ -267,7 +275,11 @@ module output_loader #(
                 (scale_shifted < $signed(DATA_MIN)) ? DATA_MIN :
                                                     scale_shifted[DATA_WIDTH-1:0];
 
-            wire [DATA_WIDTH-1:0] old_val = obuf_q[r*DATA_WIDTH +: DATA_WIDTH];
+            // obuf_q holds the word for the address issued last cycle, so the
+            // lane is selected with the *delayed* address (addr_d), matching
+            // the same one-cycle RAM latency the rest of this stage assumes.
+            wire [DATA_WIDTH-1:0] old_val =
+                obuf_q[r*RD_DATA_WIDTH + addr_d[LANE_SEL_W-1:0]*DATA_WIDTH +: DATA_WIDTH];
 
             // k-block accumulate: also saturated, since old_val+scaled_psum
             // can exceed DATA_WIDTH even when each term is already in range
