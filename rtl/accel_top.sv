@@ -100,6 +100,19 @@ module accel_top #(
     assign avs_readdatavalid = rf_data_valid || obuf_data_valid;
     assign avs_waitrequest = (avs_read && !accepted) || burst_busy;
 
+    // An Avalon master holds write/address/writedata stable until
+    // avs_waitrequest drops, so avs_write on its own means "a write is
+    // being presented", not "a write was accepted" - using it directly as
+    // a write enable commits the access once per stalled cycle. That is
+    // invisible for the buffers (the same word is rewritten to the same
+    // address) but not for a pulse field: a CONTROL.matmul_start write
+    // stalled behind an in-flight burst read fires the start strobe once
+    // for every cycle the master held it. Gate every write enable on the
+    // accepting cycle instead. No combinational loop here - avs_waitrequest
+    // depends only on avs_read/accepted/burst_busy, never on the write
+    // enables.
+    wire avs_write_accepted = avs_write && !avs_waitrequest;
+
     always@(posedge clk)begin
         if(!reset_n)begin
             burst_cnt_buf <= 0;
@@ -141,7 +154,7 @@ module accel_top #(
     // ============================================================
     // weight_buffer - write-only from Avalon
     // ============================================================
-    wire        wbuf_wren      = avs_write && sel_wbuf;
+    wire        wbuf_wren      = avs_write_accepted && sel_wbuf;
     wire [WBUF_WADDR_WIDTH-1:0] wbuf_wraddress = (avs_address - WBUF_BASE) >> WORD_SHIFT;
     wire [AVS_DATA_WIDTH-1:0]   wbuf_wdata      = avs_writedata;
 
@@ -162,7 +175,7 @@ module accel_top #(
     // ============================================================
     // input_buffer - write side from Avalon, read side driven by input_dispatch
     // ============================================================
-    wire        ibuf_wren      = avs_write && sel_ibuf;
+    wire        ibuf_wren      = avs_write_accepted && sel_ibuf;
     wire [IBUF_WADDR_WIDTH-1:0] ibuf_wraddress = (avs_address - IBUF_BASE) >> WORD_SHIFT;
     wire [AVS_DATA_WIDTH-1:0]   ibuf_wdata      = avs_writedata;
 
@@ -215,9 +228,19 @@ module accel_top #(
         end
     end
 
+    // The *fetch* enable above is asserted both while the read is still
+    // stalled (`avs_read && sel_obuf`, which issues the first word's fetch)
+    // and on every delivering cycle, so registering it would mark one more
+    // valid beat than the burst actually has - a stray readdatavalid one
+    // cycle after the last beat, with obuf_rd_pending already cleared so
+    // avs_readdata reads back as 0. The delivering window is exactly
+    // `rd_burst_on && sel_obuf_r`: it goes high the cycle the read is
+    // accepted (by which time obuf_ext_q holds the word fetched during the
+    // stall cycle) and drops after burst_cnt_buf beats. Same shape as
+    // rf_data_valid below, and it keeps avs_readdatavalid off any
+    // combinational path from avs_read.
     logic        obuf_data_valid;
-    always_ff @(posedge clk)
-        obuf_data_valid <= obuf_ext_rden;
+    assign       obuf_data_valid = rd_burst_on && sel_obuf_r;
 
     logic        output_loader_busy;
     logic [ARRAY_COLS-1:0]                        obuf_bank_rden;
@@ -261,9 +284,14 @@ module accel_top #(
     // on the next. The accepted-read path (rd_burst_on && sel_ctrl_r) is
     // already asserted from the delivering cycle onward - and covers every
     // beat of a burst - so use only that for reads.
-    wire        ctrl_valid = (avs_write && sel_ctrl) || (rd_burst_on && sel_ctrl_r);
+    wire        ctrl_valid = (avs_write_accepted && sel_ctrl) || (rd_burst_on && sel_ctrl_r);
     logic [31:0] ctrl_rdata;
-    wire        rf_data_valid = ctrl_valid;
+    // ctrl_valid is the register file's *access* strobe, so it also covers
+    // writes - it must not be reused as the read-data valid or every CTRL
+    // write puts a phantom beat on the read channel. A write issued the
+    // cycle after a read is accepted (which Avalon allows) then looks like
+    // that read's valid stretching one cycle longer than the burst.
+    wire        rf_data_valid = rd_burst_on && sel_ctrl_r;
 
     logic        matmul_start;          // pulse: latch WEIGHT_ROWS/WEIGHT_COLS, reset block position
     logic [15:0] weight_rows;           // K: weight rows (contraction dimension)

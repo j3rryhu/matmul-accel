@@ -51,7 +51,7 @@ import numpy as np
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, ClockCycles
+from cocotb.triggers import RisingEdge, FallingEdge, ClockCycles
 
 # ---- memory map (byte addresses, must match rtl/accel_top.sv) ----
 CTRL_BASE = 0x0000
@@ -153,14 +153,21 @@ async def avalon_write(dut, addr, data, byteenable=0xF):
     dut.avs_byteenable.value = 0xF
 
 
-async def avalon_read(dut, addr):
+async def avalon_read(dut, addr, decode_data=True):
+    """Single-word Avalon-MM read.
+
+    decode_data=False returns None instead of the word, for tests that only
+    care about bus timing: the behavioral buffer RAMs come up uninitialized
+    (see models/buffer_ram_models.v), so reading a location nothing has
+    written yields X and int() would raise.
+    """
     dut.avs_address.value = addr
     dut.avs_read.value = 1
     dut.avs_write.value = 0
     await RisingEdge(dut.clk)
     while int(dut.avs_waitrequest.value):
         await RisingEdge(dut.clk)
-    data = int(dut.avs_readdata.value)
+    data = int(dut.avs_readdata.value) if decode_data else None
     dut.avs_read.value = 0
     return data
 
@@ -186,7 +193,7 @@ async def write_bytes(dut, byte_addr, values):
         await avalon_write(dut, byte_addr + i, word)
 
 
-async def avalon_burst_read(dut, addr, count):
+async def avalon_burst_read(dut, addr, count, decode_data=True):
     """Burst-read `count` sequential words starting at addr, using
     accel_top.sv's burst FSM (see its avs_burstcount/rd_burst_on logic).
     Acceptance works exactly like avalon_read's single-word case (hold
@@ -195,7 +202,9 @@ async def avalon_burst_read(dut, addr, count):
     idle yet), and that same accepting edge already carries the first
     beat's data. Each subsequent beat then arrives one avs_readdatavalid
     pulse per cycle, address auto-incrementing, until `count` beats have
-    been collected."""
+    been collected.
+
+    decode_data=False returns a list of Nones - see avalon_read."""
     dut.avs_address.value = addr
     dut.avs_burstcount.value = count
     dut.avs_read.value = 1
@@ -205,11 +214,14 @@ async def avalon_burst_read(dut, addr, count):
         await RisingEdge(dut.clk)
     dut.avs_read.value = 0
     dut.avs_burstcount.value = 1
-    data = [int(dut.avs_readdata.value)]
+    def sample():
+        return int(dut.avs_readdata.value) if decode_data else None
+
+    data = [sample()]
     while len(data) < count:
         await RisingEdge(dut.clk)
         if int(dut.avs_readdatavalid.value):
-            data.append(int(dut.avs_readdata.value))
+            data.append(sample())
     return data
 
 
@@ -885,3 +897,156 @@ async def test_unaligned_m_matmul(dut):
         raise AssertionError(
             f"{len(mismatches)}/{K*M} mismatches (K={K} N={N} M={M}, "
             f"array {ARRAY_ROWS}x{ARRAY_COLS}). First few: {preview}")
+
+@cocotb.test()
+async def test_ctrl_read_then_write(dut):
+    """CTRL read immediately followed by a CTRL write.
+
+    Minimal hardware repro: a CTRL write works as the first bus operation,
+    but the same write after any CTRL read never completes - avs_waitrequest
+    stays high, so the write is never accepted. A 10 ms gap on hardware does
+    not help, so this is latched state in the read path, not a race.
+
+    No test in this file ever puts a CTRL read directly before a CTRL write:
+    read_status is always followed by more reads, then buffer accesses.
+    """
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=2000))
+    await reset_dut(dut)
+
+    # write first, no preceding read - the case that works on hardware
+    await avalon_write(dut, WEIGHT_COLS_ADDR, N)
+
+    # a CTRL read
+    st = await read_status(dut)
+    dut._log.info(f"STATUS = 0x{st:08x}")
+
+    # ... and now the same write again. On hardware this never returns.
+    # If avs_waitrequest latches high, avalon_write spins and the watchdog
+    # fires - that is the failure signature.
+    await avalon_write(dut, WEIGHT_COLS_ADDR, N)
+
+    # and with idle cycles in between, to show the gap does not help
+    await read_status(dut)
+    await ClockCycles(dut.clk, 20)
+    await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
+
+async def rdv_counter(dut, count):
+    """Counts clock cycles in which avs_readdatavalid is high.
+
+    Sampled on the falling edge so the count is of settled, mid-cycle
+    values - what an Avalon master latching on the rising edge would
+    actually see. count is a one-element list so callers can zero it
+    between phases.
+    """
+    while True:
+        await FallingEdge(dut.clk)
+        if int(dut.avs_readdatavalid.value):
+            count[0] += 1
+
+
+@cocotb.test()
+async def test_readdatavalid_one_pulse_per_beat(dut):
+    """avs_readdatavalid must be high for exactly one cycle per read beat.
+
+    Avalon-MM lets a master issue its next transaction the cycle after a
+    read is accepted, so a stray valid lands on top of whatever comes
+    next - the master counts it as an extra beat of the read it just did
+    and the pipelined read channel goes permanently out of step. Writes
+    are the visible case (a CTRL write right behind a CTRL read looks
+    like the read's valid stretching by a cycle), but the pulse is wrong
+    whatever follows it.
+    """
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=2000))
+    await reset_dut(dut)
+
+    count = [0]
+    cocotb.start_soon(rdv_counter(dut, count))
+
+    # a write is not a read - it must never produce read data
+    count[0] = 0
+    await avalon_write(dut, WEIGHT_COLS_ADDR, N)
+    await ClockCycles(dut.clk, 4)
+    assert count[0] == 0, (
+        f"CTRL write asserted avs_readdatavalid for {count[0]} cycle(s)")
+
+    # one CTRL read, with a write immediately behind it
+    count[0] = 0
+    await read_status(dut)
+    await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
+    await ClockCycles(dut.clk, 4)
+    assert count[0] == 1, (
+        f"CTRL read followed by a write gave {count[0]} avs_readdatavalid "
+        f"cycle(s), expected 1")
+
+    # one OBUF read, likewise
+    count[0] = 0
+    await avalon_read(dut, OBUF_BASE, decode_data=False)
+    await ClockCycles(dut.clk, 4)
+    assert count[0] == 1, (
+        f"OBUF single read gave {count[0]} avs_readdatavalid cycle(s), "
+        f"expected 1")
+
+    # an OBUF burst is exactly burstcount beats, no trailing valid
+    beats = 4
+    count[0] = 0
+    await avalon_burst_read(dut, OBUF_BASE, beats, decode_data=False)
+    await ClockCycles(dut.clk, 4)
+    assert count[0] == beats, (
+        f"OBUF burst of {beats} gave {count[0]} avs_readdatavalid "
+        f"cycle(s), expected {beats}")
+
+
+@cocotb.test()
+async def test_stalled_write_commits_once(dut):
+    """A write held across avs_waitrequest must commit exactly once.
+
+    An Avalon master keeps write/address/writedata stable until
+    avs_waitrequest drops, so a write enable built straight from avs_write
+    re-commits the access on every stalled cycle. For the buffers that is
+    invisible - the same word goes back to the same address - so the only
+    place it can be observed is a pulse field, which is why this reaches
+    into the DUT for matmul_start instead of going through the register
+    interface: a repeated write to any *storage* register is idempotent by
+    construction and nothing at the software-visible boundary can tell the
+    two apart.
+
+    avs_waitrequest is only asserted against a write while a read burst is
+    still in flight, so that is how the stall is set up here.
+    """
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=2000))
+    await reset_dut(dut)
+
+    starts = [0]
+
+    async def count_starts():
+        while True:
+            await FallingEdge(dut.clk)
+            if int(dut.matmul_start.value):
+                starts[0] += 1
+
+    cocotb.start_soon(count_starts())
+
+    # baseline: the same write on an idle bus, never stalled
+    starts[0] = 0
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    await ClockCycles(dut.clk, 6)
+    assert starts[0] == 1, (
+        f"unstalled CONTROL.start write pulsed matmul_start {starts[0]} "
+        f"time(s), expected 1")
+
+    await ClockCycles(dut.clk, 40)
+
+    # and now the same write arriving while an OBUF burst still owns the bus
+    starts[0] = 0
+    burst = cocotb.start_soon(
+        avalon_burst_read(dut, OBUF_BASE, 8, decode_data=False))
+    await ClockCycles(dut.clk, 3)
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    await burst
+    await ClockCycles(dut.clk, 6)
+    assert starts[0] == 1, (
+        f"CONTROL.start write stalled by avs_waitrequest pulsed "
+        f"matmul_start {starts[0]} time(s), expected 1")
