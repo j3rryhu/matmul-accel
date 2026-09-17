@@ -899,6 +899,120 @@ async def test_unaligned_m_matmul(dut):
             f"array {ARRAY_ROWS}x{ARRAY_COLS}). First few: {preview}")
 
 @cocotb.test()
+async def test_hw_min_identity_sequence(dut):
+    """Simulation twin of sw/matmul_min.c, the smallest matmul that runs on
+    hardware - same matrices, same register values, same bus sequence, in
+    the same order, so a hardware failure can be reproduced here.
+
+    W = 2*I (16x16) with OUTPUT_SCALE = 32768 (Q0.16 0.5) makes the whole
+    datapath an exact identity: raw = 2*x, and (2*x * 32768) >> 16 == x for
+    every int8 x (the product is exactly x<<16, so the arithmetic shift is
+    lossless and nothing ever saturates). X carries 256 *distinct* values
+    (x[n,m] = n*16 + m - 128, spanning -128..127 with no repeats), so any
+    packing, banking or addressing error shows up as a mismatch whose value
+    names the element it actually came from, instead of two different
+    addresses holding the same byte and hiding the swap. The assertion
+    below re-derives Y from the usual requantize model rather than trusting
+    that argument.
+
+    What this test replicates that the others do not is the *host* sequence
+    matmul_min.c performs, in its order:
+      - a STATUS read as the very first bus transaction, before any write
+        (the CTRL read-then-write ordering of test_ctrl_read_then_write,
+        but here at the head of a full matmul);
+      - the five dimension/scale registers written *before* the buffers,
+        the opposite of every other matmul test here;
+      - readback as single 32-bit OBUF word reads (what the C code's rd32
+        does), not the burst reads read_bytes uses.
+
+    Addressing matches matmul_min.c one for one: the C code's `a` is
+    avs_address, mapped to a CPU byte offset of 4*a by the interconnect, and
+    a word access advances `a` by 4 - the same units this testbench's
+    addresses are already in. So WBUF/IBUF/OBUF bases, the 256-entry input
+    bank stride and the 128-entry output bank stride are literally the same
+    numbers on both sides.
+    """
+    K = N = M = ARRAY_ROWS
+    assert ARRAY_ROWS == 16 and ARRAY_COLS == 16, (
+        f"matmul_min.c is written against a 16x16 array; this build is "
+        f"{ARRAY_ROWS}x{ARRAY_COLS}, so the sequence it replicates would "
+        f"not be the one that runs on hardware")
+
+    OUTPUT_SCALE_HALF = 32768  # Q0.16 0.5, exactly as matmul_min.c writes it
+
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut))
+    await reset_dut(dut)
+
+    # W = 2I; X = 256 distinct int8 values, one per element
+    W_int8 = 2 * np.eye(K, N, dtype=np.int64)
+    X_int8 = np.array([[n * 16 + m - 128 for m in range(M)] for n in range(N)],
+                      dtype=np.int64)
+
+    # same requantize model as every other test here, applied to the actual
+    # OUTPUT_SCALE written below - this is what makes Y == X a *result*
+    # rather than an assumption
+    golden = np.clip(((W_int8 @ X_int8) * OUTPUT_SCALE_HALF) >> 16, -128, 127)
+    assert np.array_equal(golden, X_int8), (
+        "W=2I with OUTPUT_SCALE=0.5 is supposed to be an exact identity - "
+        "if this fails the test's premise is wrong, not the DUT")
+
+    # ---- phase: read STATUS (first bus transaction, a CTRL read) ----
+    dut._log.info(f"STATUS before start = 0x{(await read_status(dut)):08x}")
+
+    # ---- phase: program dimension registers (before the buffers) ----
+    await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
+    await avalon_write(dut, WEIGHT_COLS_ADDR, N)
+    await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
+    await avalon_write(dut, INPUT_COLS_ADDR, M)
+    await avalon_write(dut, OUTPUT_SCALE_ADDR, OUTPUT_SCALE_HALF)
+
+    # ---- phase: write weight buffer (K*N = 256 bytes = 64 words) ----
+    await write_bytes(dut, WBUF_BASE,
+                      [to_uint8(int(W_int8[k, n])) for k in range(K) for n in range(N)])
+
+    # ---- phase: write input buffer (16 banks x 16 bytes). N == ARRAY_COLS,
+    # so there is a single band per bank and bank p is x's row p directly ----
+    for p in range(N):
+        await write_bytes(dut, IBUF_BASE + p * (1 << IBUF_BANK_ADDR_WIDTH),
+                          [to_uint8(int(X_int8[p, m])) for m in range(M)])
+
+    # ---- phase: pulse CONTROL.matmul_start ----
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+
+    # ---- phase: poll STATUS.done (the C code's 1 s / 1e6-poll timeout) ----
+    await wait_matmul_done(dut)
+    await ClockCycles(dut.clk, 2)
+
+    # ---- phase: read output buffer as single 32-bit words, 4 per bank ----
+    Y = np.zeros((K, M), dtype=np.int64)
+    for k in range(K):
+        bank_base = OBUF_BASE + (k << OBUF_BANK_ADDR_WIDTH)
+        for m in range(0, M, BYTES_PER_WORD):
+            word = await avalon_read(dut, bank_base + m)
+            for j in range(BYTES_PER_WORD):
+                Y[k, m + j] = to_int8((word >> (8 * j)) & 0xFF)
+
+    # ---- phase: verify. Mismatches are reported with the avs address the
+    # byte came from, the same way matmul_min.c prints them, so a failure
+    # here and a failure on hardware name the same location. ----
+    mismatches = [
+        (k, m, int(golden[k, m]), int(Y[k, m]),
+         OBUF_BASE + (k << OBUF_BANK_ADDR_WIDTH) + m)
+        for k in range(K) for m in range(M)
+        if int(Y[k, m]) != int(golden[k, m])
+    ]
+    if mismatches:
+        preview = ", ".join(
+            f"y[{k},{m}]: expected {exp}, got {got} (avs 0x{addr:04x})"
+            for k, m, exp, got, addr in mismatches[:10]
+        )
+        raise AssertionError(
+            f"{len(mismatches)}/{K * M} output mismatches. First few: {preview}"
+        )
+
+
+@cocotb.test()
 async def test_ctrl_read_then_write(dut):
     """CTRL read immediately followed by a CTRL write.
 
