@@ -50,9 +50,10 @@
 // scaled psum) is saturated the same way before being written back, since
 // that sum can exceed DATA_WIDTH on its own even when each term doesn't.
 //
-// Read-modify-write per row, as a 3-stage pipeline (the rescale multiply
+// Read-modify-write per row, as a 4-stage pipeline (the rescale multiply
 // is too slow to do combinationally between the RAM read and the write
-// back):
+// back - and a single-cycle ACC_WIDTH x SCALE_WIDTH multiply was itself
+// still the critical path, so it is split across two stages, see below):
 //   stage 0 (cycle C)  : obuf_rdaddress/rden = cur_addr, and p_in[r] holds
 //                        that same position's psum. Both are captured
 //                        (addr_d/active_d/psum_d).
@@ -61,15 +62,29 @@
 //                        i.e. obuf_q is only valid in the cycle where
 //                        addr_d is its address, which is why the lane
 //                        select uses addr_d and the result is registered
-//                        (old_val_d) rather than used two cycles later.
-//                        The rescale multiply registers here too
-//                        (scale_product).
-//   stage 2 (cycle C+2): scale_product, old_val_d and addr_2d all describe
+//                        (old_val_d) rather than used three cycles later.
+//                        The two rescale *partial products* register here
+//                        (prod_hi/prod_lo) - see the split note below.
+//   stage 2 (cycle C+2): the partial products are shifted back into place
+//                        and summed into the full product (scale_product).
+//                        old_val_d/addr_2d/active_2d pipeline alongside.
+//   stage 3 (cycle C+3): scale_product, old_val_2d and addr_3d all describe
 //                        the same position - shift, saturate, accumulate,
 //                        and write back.
 // Each row's read address advances one position per cycle, so the byte
-// being written at C+2 is never the byte being read at C+2 (different
+// being written at C+3 is never the byte being read at C+3 (different
 // lanes of the word), and no read-during-write forwarding is needed.
+//
+// Rescale multiply split (stage 1 -> stage 2): a full ACC_WIDTH x
+// SCALE_WIDTH product in one cycle does not make timing in soft logic
+// (multstyle="logic", see the DSP note below), so psum is cut into a low
+// LO_W-bit unsigned chunk and a high HI_W-bit signed chunk, with
+//     psum        = $signed(hi)*2**LO_W + lo
+// so that
+//     psum*scale  = (($signed(hi)*scale) << LO_W) + (lo*scale)
+// Stage 1 computes those two narrow products independently; stage 2 does
+// only the shift-and-add. LO_W = SCALE_WIDTH, which for ACC_WIDTH=32 /
+// SCALE_WIDTH=16 splits psum evenly and keeps both multiplies at 17x17.
 //
 // Timing model (from pe.v/pe_array.v):
 //   - a_buf/b_buf only update when a_en/b_en pulse; p_out is recomputed
@@ -161,6 +176,11 @@ module output_loader #(
     localparam ELAPSED_MAX = ARRAY_COLS - 1;
     localparam ELAPSED_W   = $clog2(ELAPSED_MAX + 1);
 
+    // psum split point for the two-stage rescale multiply (see header):
+    // LO_W is the unsigned low chunk, HI_W the signed high chunk.
+    localparam LO_W = SCALE_WIDTH;
+    localparam HI_W = ACC_WIDTH - LO_W;
+
     // signed DATA_WIDTH saturation bounds (e.g. -128/127 for DATA_WIDTH=8)
     localparam signed [DATA_WIDTH-1:0] DATA_MAX = {1'b0, {(DATA_WIDTH-1){1'b1}}};
     localparam signed [DATA_WIDTH-1:0] DATA_MIN = {1'b1, {(DATA_WIDTH-1){1'b0}}};
@@ -169,6 +189,7 @@ module output_loader #(
     reg                     a_en_last_d;
     reg                     running;
     reg                     running_d;
+    reg                     running_2d;
     reg  [ELAPSED_W:0]      elapsed;
 
     reg  [ROW_ADDR_WIDTH-1:0] row_count [0:ARRAY_COLS-1];
@@ -197,6 +218,7 @@ module output_loader #(
             held_n_blk_idx   <= 0;
             held_first_k_blk <= 1'b0;
             running_d        <= 0;
+            running_2d       <= 0;
         end
         else begin
             if (running) begin
@@ -219,7 +241,8 @@ module output_loader #(
                     held_first_k_blk <= committed_first_k_blk;
                 end
             end
-            running_d <= running;
+            running_d  <= running;
+            running_2d <= running_d;
         end
     end
 
@@ -253,46 +276,79 @@ module output_loader #(
             assign obuf_rden[r] = row_active;
             assign obuf_rdaddress[r*ROW_RADDR_WIDTH +: ROW_RADDR_WIDTH] = cur_addr[ROW_ADDR_WIDTH-1:LANE_SEL_W];
 
-            // one-cycle pipeline so obuf_q[r] (this RAM's own one-cycle
-            // synchronous read latency) lines up with the psum it should
-            // be added to
+            // three-cycle pipeline: the first stage lines obuf_q[r] (this
+            // RAM's own one-cycle synchronous read latency) up with the psum
+            // it should be added to, the next two carry that pair alongside
+            // the split rescale multiply
             reg                      active_d;
             reg                      active_2d;
+            reg                      active_3d;
             reg [ROW_ADDR_WIDTH-1:0] addr_d;
             reg [ROW_ADDR_WIDTH-1:0] addr_2d;
+            reg [ROW_ADDR_WIDTH-1:0] addr_3d;
             reg [ACC_WIDTH-1:0]      psum_d;   // raw pre-rescale accumulator, captured this cycle
             reg [DATA_WIDTH-1:0]     old_val_d;
+            reg [DATA_WIDTH-1:0]     old_val_2d;
+            // stage-1 partial products: prod_hi is signed (psum's high chunk
+            // carries the sign), prod_lo unsigned (a raw bit field).
+            reg signed [HI_W+SCALE_WIDTH:0]      prod_hi;
+            reg        [LO_W+SCALE_WIDTH-1:0]    prod_lo;
             reg signed [ACC_WIDTH+SCALE_WIDTH:0] scale_product;
+
+            // stage 2's only arithmetic: line the two partial products back
+            // up and add. prod_hi<<LO_W spans HI_W+SCALE_WIDTH+1+LO_W =
+            // ACC_WIDTH+SCALE_WIDTH+1 bits, exactly scale_product's width,
+            // so the shift can't drop the top of the high product.
+            wire signed [ACC_WIDTH+SCALE_WIDTH:0] prod_hi_ext = $signed(prod_hi);
+            wire signed [ACC_WIDTH+SCALE_WIDTH:0] prod_sum =
+                (prod_hi_ext <<< LO_W) + $signed({1'b0, prod_lo});
 
             always @(posedge clock) begin
                 if (~rst_n) begin
-                    active_d <= 1'b0;
-                    addr_d   <= {ROW_ADDR_WIDTH{1'b0}};
-                    psum_d   <= {ACC_WIDTH{1'b0}};
+                    active_d  <= 1'b0;
+                    addr_d    <= {ROW_ADDR_WIDTH{1'b0}};
+                    psum_d    <= {ACC_WIDTH{1'b0}};
                     active_2d <= 1'b0;
-                    addr_2d  <= {ROW_ADDR_WIDTH{1'b0}};
-                    scale_product <= 0;
+                    addr_2d   <= {ROW_ADDR_WIDTH{1'b0}};
+                    prod_hi   <= 0;
+                    prod_lo   <= 0;
                     old_val_d <= 0;
+                    active_3d <= 1'b0;
+                    addr_3d   <= {ROW_ADDR_WIDTH{1'b0}};
+                    scale_product <= 0;
+                    old_val_2d    <= 0;
                 end
                 else begin
+                    // stage 0 -> 1
                     active_d <= row_active;
                     addr_d   <= cur_addr;
                     psum_d   <= p_in[r*ACC_WIDTH +: ACC_WIDTH];
-                    (* multstyle = "logic" *)
-                    scale_product <= $signed(psum_d) * $signed({1'b0, output_scale});
 
-                    addr_2d  <= addr_d;
+                    // stage 1 -> 2 : the two narrow partial products
+                    (* multstyle = "logic" *)
+                    prod_hi   <= $signed(psum_d[ACC_WIDTH-1 -: HI_W]) *
+                                 $signed({1'b0, output_scale});
+                    (* multstyle = "logic" *)
+                    prod_lo   <= psum_d[LO_W-1:0] * output_scale;
+                    addr_2d   <= addr_d;
                     active_2d <= active_d;
                     old_val_d <= old_val;
+
+                    // stage 2 -> 3 : shift-and-add into the full product
+                    scale_product <= prod_sum;
+                    addr_3d       <= addr_2d;
+                    active_3d     <= active_2d;
+                    old_val_2d    <= old_val_d;
                 end
             end
 
             // rescale: psum_d (ACC_WIDTH) * output_scale (Q0.16) >> 16,
             // saturated into DATA_WIDTH's signed range. {1'b0,output_scale}
             // keeps the (always non-negative) scale factor signed-safe for
-            // the multiply. The multiply itself is registered (scale_product
-            // above) - it was the critical path - so everything it's combined
-            // with here has to be delayed by that same cycle.
+            // the multiply. The multiply itself is split across two
+            // registered stages (prod_hi/prod_lo -> scale_product above) -
+            // it was the critical path - so everything it's combined with
+            // here has to be delayed by those same two cycles.
             wire signed [ACC_WIDTH+SCALE_WIDTH:0] scale_shifted = scale_product >>> SCALE_WIDTH;
 
             wire [DATA_WIDTH-1:0] scaled_psum =
@@ -308,10 +364,12 @@ module output_loader #(
 
             // k-block accumulate: also saturated, since old_val+scaled_psum
             // can exceed DATA_WIDTH even when each term is already in range.
-            // old_val_d, not old_val: obuf_q is only valid in the addr_d
-            // cycle, so it has to be pipelined alongside scale_product to
-            // reach this (addr_2d) stage.
-            wire signed [DATA_WIDTH:0] acc_sum = running_d ? $signed(old_val_d) + $signed(scaled_psum) : 0;
+            // old_val_2d, not old_val: obuf_q is only valid in the addr_d
+            // cycle, so it has to be pipelined alongside the split multiply
+            // to reach this (addr_3d) stage. running_2d rather than
+            // running_d for the same reason - the gate has to describe the
+            // same cycle relative to the read that the write back does.
+            wire signed [DATA_WIDTH:0] acc_sum = running_2d ? $signed(old_val_2d) + $signed(scaled_psum) : 0;
             wire [DATA_WIDTH-1:0] acc_sat =
                 (acc_sum > $signed(DATA_MAX)) ? DATA_MAX :
                 (acc_sum < $signed(DATA_MIN)) ? DATA_MIN :
@@ -319,8 +377,8 @@ module output_loader #(
 
             wire [DATA_WIDTH-1:0] new_val = (held_n_blk_idx == 0) ? scaled_psum : acc_sat;
 
-            assign obuf_wren[r] = active_2d;
-            assign obuf_waddr[r*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH]  = addr_2d;
+            assign obuf_wren[r] = active_3d;
+            assign obuf_waddr[r*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH]  = addr_3d;
             assign obuf_wdata[r*DATA_WIDTH +: DATA_WIDTH]         = new_val;
         end
     endgenerate
@@ -331,10 +389,11 @@ module output_loader #(
     // file's header), so it must already be high on the pass's very first
     // read cycle, i.e. rise with `running`; and accel_top gates
     // matmul_complete on !busy, so it must not drop until the last write has
-    // left the stage-2 pipeline, i.e. fall with `running_d`. Using running_d
-    // alone throws away the first read of every pass (obuf_q then still
-    // holds the previous pass's word, and m=0 accumulates onto garbage).
-    assign busy = running || running_d;
+    // left the stage-3 pipeline, i.e. fall with `running_2d`. Using the
+    // delayed copies alone throws away the first read of every pass (obuf_q
+    // then still holds the previous pass's word, and m=0 accumulates onto
+    // garbage).
+    assign busy = running || running_d || running_2d;
     assign done = running && &(row_done | ~((1 << weight_rows) - 1));
 
 endmodule
