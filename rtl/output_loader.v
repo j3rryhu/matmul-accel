@@ -325,10 +325,10 @@ module output_loader #(
                     psum_d   <= p_in[r*ACC_WIDTH +: ACC_WIDTH];
 
                     // stage 1 -> 2 : the two narrow partial products
-                    (* multstyle = "logic" *)
+                    // (* multstyle = "logic" *)
                     prod_hi   <= $signed(psum_d[ACC_WIDTH-1 -: HI_W]) *
                                  $signed({1'b0, output_scale});
-                    (* multstyle = "logic" *)
+                    // (* multstyle = "logic" *)
                     prod_lo   <= psum_d[LO_W-1:0] * output_scale;
                     addr_2d   <= addr_d;
                     active_2d <= active_d;
