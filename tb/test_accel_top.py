@@ -490,7 +490,9 @@ async def test_multiblock_matmul(dut):
         f.write(f"W_real (K x N) =\n{np.array2string(W_real, threshold=np.inf, max_line_width=200)}\n\n")
         f.write(f"W_int8 (K x N) =\n{np.array2string(W_int8, threshold=np.inf, max_line_width=200)}\n\n")
         f.write(f"X_real (K x M) =\n{np.array2string(X_real, threshold=np.inf, max_line_width=200)}\n\n")
-        f.write(f"X_int8 (K x M) =\n{np.array2string(X_int8, threshold=np.inf, max_line_width=200)}\n")
+        f.write(f"X_int8 (K x M) =\n{np.array2string(X_int8, threshold=np.inf, max_line_width=200)}\n\n")
+        f.write(f"W_int8 hex (K x N), one row per line, each byte 2's-complement =\n{format_int8_hex(W_int8)}\n\n")
+        f.write(f"X_int8 hex (K x M), one row per line, each byte 2's-complement =\n{format_int8_hex(X_int8)}\n")
 
     # ---- write weights: row-major over the *full* K x N matrix - this
     # layout doesn't change for multi-block (weight_ctrl.v's base_addr

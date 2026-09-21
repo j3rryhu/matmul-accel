@@ -50,12 +50,26 @@
 // scaled psum) is saturated the same way before being written back, since
 // that sum can exceed DATA_WIDTH on its own even when each term doesn't.
 //
-// Read-modify-write per row: output_buffer is a synchronous on-chip
-// RAM (q valid one cycle after rdaddress/rden), so the read for a
-// position is issued one cycle *before* p_in[r] holds the psum for that
-// same position - by the cycle the psum actually arrives, the old value
-// is already sitting in obuf_q[r], ready to add and write back that same
-// cycle.
+// Read-modify-write per row, as a 3-stage pipeline (the rescale multiply
+// is too slow to do combinationally between the RAM read and the write
+// back):
+//   stage 0 (cycle C)  : obuf_rdaddress/rden = cur_addr, and p_in[r] holds
+//                        that same position's psum. Both are captured
+//                        (addr_d/active_d/psum_d).
+//   stage 1 (cycle C+1): output_buffer is a synchronous RAM, so obuf_q[r]
+//                        is now the word for the address issued at C -
+//                        i.e. obuf_q is only valid in the cycle where
+//                        addr_d is its address, which is why the lane
+//                        select uses addr_d and the result is registered
+//                        (old_val_d) rather than used two cycles later.
+//                        The rescale multiply registers here too
+//                        (scale_product).
+//   stage 2 (cycle C+2): scale_product, old_val_d and addr_2d all describe
+//                        the same position - shift, saturate, accumulate,
+//                        and write back.
+// Each row's read address advances one position per cycle, so the byte
+// being written at C+2 is never the byte being read at C+2 (different
+// lanes of the word), and no read-during-write forwarding is needed.
 //
 // Timing model (from pe.v/pe_array.v):
 //   - a_buf/b_buf only update when a_en/b_en pulse; p_out is recomputed
@@ -154,6 +168,7 @@ module output_loader #(
     reg                     armed;      // ready to latch the next a_en_last rising edge
     reg                     a_en_last_d;
     reg                     running;
+    reg                     running_d;
     reg  [ELAPSED_W:0]      elapsed;
 
     reg  [ROW_ADDR_WIDTH-1:0] row_count [0:ARRAY_COLS-1];
@@ -181,6 +196,7 @@ module output_loader #(
             held_k_blk_idx   <= 0;
             held_n_blk_idx   <= 0;
             held_first_k_blk <= 1'b0;
+            running_d        <= 0;
         end
         else begin
             if (running) begin
@@ -203,7 +219,7 @@ module output_loader #(
                     held_first_k_blk <= committed_first_k_blk;
                 end
             end
-            
+            running_d <= running;
         end
     end
 
@@ -245,29 +261,38 @@ module output_loader #(
             reg [ROW_ADDR_WIDTH-1:0] addr_d;
             reg [ROW_ADDR_WIDTH-1:0] addr_2d;
             reg [ACC_WIDTH-1:0]      psum_d;   // raw pre-rescale accumulator, captured this cycle
+            reg [DATA_WIDTH-1:0]     old_val_d;
+            reg signed [ACC_WIDTH+SCALE_WIDTH:0] scale_product;
 
             always @(posedge clock) begin
                 if (~rst_n) begin
                     active_d <= 1'b0;
                     addr_d   <= {ROW_ADDR_WIDTH{1'b0}};
                     psum_d   <= {ACC_WIDTH{1'b0}};
+                    active_2d <= 1'b0;
+                    addr_2d  <= {ROW_ADDR_WIDTH{1'b0}};
+                    scale_product <= 0;
+                    old_val_d <= 0;
                 end
                 else begin
                     active_d <= row_active;
                     addr_d   <= cur_addr;
                     psum_d   <= p_in[r*ACC_WIDTH +: ACC_WIDTH];
+                    (* multstyle = "logic" *)
+                    scale_product <= $signed(psum_d) * $signed({1'b0, output_scale});
 
                     addr_2d  <= addr_d;
                     active_2d <= active_d;
+                    old_val_d <= old_val;
                 end
             end
 
             // rescale: psum_d (ACC_WIDTH) * output_scale (Q0.16) >> 16,
             // saturated into DATA_WIDTH's signed range. {1'b0,output_scale}
             // keeps the (always non-negative) scale factor signed-safe for
-            // the multiply.
-            (* multstyle = "logic" *)
-            wire signed [ACC_WIDTH+SCALE_WIDTH:0] scale_product = $signed(psum_d) * $signed({1'b0, output_scale});
+            // the multiply. The multiply itself is registered (scale_product
+            // above) - it was the critical path - so everything it's combined
+            // with here has to be delayed by that same cycle.
             wire signed [ACC_WIDTH+SCALE_WIDTH:0] scale_shifted = scale_product >>> SCALE_WIDTH;
 
             wire [DATA_WIDTH-1:0] scaled_psum =
@@ -282,8 +307,11 @@ module output_loader #(
                 obuf_q[r*RD_DATA_WIDTH + addr_d[LANE_SEL_W-1:0]*DATA_WIDTH +: DATA_WIDTH];
 
             // k-block accumulate: also saturated, since old_val+scaled_psum
-            // can exceed DATA_WIDTH even when each term is already in range
-            wire signed [DATA_WIDTH:0] acc_sum = running ? $signed(old_val) + $signed(scaled_psum) : 0;
+            // can exceed DATA_WIDTH even when each term is already in range.
+            // old_val_d, not old_val: obuf_q is only valid in the addr_d
+            // cycle, so it has to be pipelined alongside scale_product to
+            // reach this (addr_2d) stage.
+            wire signed [DATA_WIDTH:0] acc_sum = running_d ? $signed(old_val_d) + $signed(scaled_psum) : 0;
             wire [DATA_WIDTH-1:0] acc_sat =
                 (acc_sum > $signed(DATA_MAX)) ? DATA_MAX :
                 (acc_sum < $signed(DATA_MIN)) ? DATA_MIN :
@@ -291,13 +319,22 @@ module output_loader #(
 
             wire [DATA_WIDTH-1:0] new_val = (held_n_blk_idx == 0) ? scaled_psum : acc_sat;
 
-            assign obuf_wren[r] = active_d;
-            assign obuf_waddr[r*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH]  = addr_d;
+            assign obuf_wren[r] = active_2d;
+            assign obuf_waddr[r*ROW_ADDR_WIDTH +: ROW_ADDR_WIDTH]  = addr_2d;
             assign obuf_wdata[r*DATA_WIDTH +: DATA_WIDTH]         = new_val;
         end
     endgenerate
 
-    assign busy = running;
+    // busy has to span the *union* of the read window and the write drain,
+    // because it does two jobs: output_buffer_32_bank muxes each bank's read
+    // port with it (loader wins while busy, Avalon once idle - see that
+    // file's header), so it must already be high on the pass's very first
+    // read cycle, i.e. rise with `running`; and accel_top gates
+    // matmul_complete on !busy, so it must not drop until the last write has
+    // left the stage-2 pipeline, i.e. fall with `running_d`. Using running_d
+    // alone throws away the first read of every pass (obuf_q then still
+    // holds the previous pass's word, and m=0 accumulates onto garbage).
+    assign busy = running || running_d;
     assign done = running && &(row_done | ~((1 << weight_rows) - 1));
 
 endmodule
