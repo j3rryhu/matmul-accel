@@ -83,16 +83,16 @@ endmodule
 // 12-bit word address); weight_loader reads bytes (16384 x 8, 14-bit).
 module weight_buffer (
     input         clock,
-    input  [31:0] data,
+    input  [127:0] data,
     input  [13:0] rdaddress,
     input         rden,
-    input  [11:0] wraddress,
+    input  [ 9:0] wraddress,
     input         wren,
     output [ 7:0] q
 );
     mixed_ram_wr_wide #(
         .NARROW_WIDTH (8),
-        .WIDE_WIDTH   (32),
+        .WIDE_WIDTH   (128),
         .NARROW_DEPTH (16384)
     ) u_ram (
         .clock (clock), .data (data),
@@ -106,16 +106,16 @@ endmodule
 // (256 x 8, 8-bit).
 module input_buffer (
     input         clock,
-    input  [31:0] data,
+    input  [127:0] data,
     input  [ 7:0] rdaddress,
     input         rden,
-    input  [ 5:0] wraddress,
+    input  [ 3:0] wraddress,
     input         wren,
     output [ 7:0] q
 );
     mixed_ram_wr_wide #(
         .NARROW_WIDTH (8),
-        .WIDE_WIDTH   (32),
+        .WIDE_WIDTH   (128),
         .NARROW_DEPTH (256)
     ) u_ram (
         .clock (clock), .data (data),
@@ -130,15 +130,15 @@ endmodule
 module output_buffer (
     input         clock,
     input  [ 7:0] data,
-    input  [ 4:0] rdaddress,
+    input  [ 2:0] rdaddress,
     input         rden,
     input  [ 6:0] wraddress,
     input         wren,
-    output [31:0] q
+    output [127:0] q
 );
     mixed_ram_rd_wide #(
         .NARROW_WIDTH (8),
-        .WIDE_WIDTH   (32),
+        .WIDE_WIDTH   (128),
         .NARROW_DEPTH (128)
     ) u_ram (
         .clock (clock), .data (data),

@@ -24,7 +24,7 @@
 
 module accel_top #(
     parameter AVS_ADDR_WIDTH = 32,
-    parameter AVS_DATA_WIDTH = 32,   // byte-lane mux below assumes 32
+    parameter AVS_DATA_WIDTH = 128,   // byte-lane mux below assumes 32
     parameter PE_DATA_WIDTH  = 8,    // activation/weight operand width (int8)
     parameter ACC_DATA_WIDTH = 32,   // pe_array accumulator width - kept wider
                                       // than PE_DATA_WIDTH so a full contraction
@@ -285,7 +285,7 @@ module accel_top #(
     // already asserted from the delivering cycle onward - and covers every
     // beat of a burst - so use only that for reads.
     wire        ctrl_valid = (avs_write_accepted && sel_ctrl) || (rd_burst_on && sel_ctrl_r);
-    logic [31:0] ctrl_rdata;
+    logic [AVS_DATA_WIDTH-1:0] ctrl_rdata;
     // ctrl_valid is the register file's *access* strobe, so it also covers
     // writes - it must not be reused as the read-data valid or every CTRL
     // write puts a phantom beat on the read channel. A write issued the

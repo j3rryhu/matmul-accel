@@ -93,7 +93,7 @@ IBUF_BANK_ADDR_WIDTH = 8  # must match input_buffer_32_bank.v's per-bank address
 # Avalon data port width in bytes: the buffers' host-facing ports are this
 # wide, so every host access moves a whole word and byte addresses advance
 # by this much (accel_top.sv's BYTES_PER_WORD).
-BYTES_PER_WORD = 4
+BYTES_PER_WORD = 16
 
 CLK_PERIOD_NS = 10
 WATCHDOG_CYCLES = 8000
@@ -143,7 +143,7 @@ async def avalon_write(dut, addr, data, byteenable=0xF):
     """Word-granular Avalon-MM write (used for ctrl_rf, which is 32-bit)."""
     dut.avs_address.value = addr
     dut.avs_write.value = 1
-    dut.avs_writedata.value = data & 0xFFFFFFFF
+    dut.avs_writedata.value = data & ((1 << (BYTES_PER_WORD * 8)) - 1)
     dut.avs_byteenable.value = byteenable
     dut.avs_read.value = 0
     await RisingEdge(dut.clk)
@@ -190,7 +190,7 @@ async def write_bytes(dut, byte_addr, values):
         word = 0
         for j in range(BYTES_PER_WORD):
             word |= vals[i + j] << (8 * j)
-        await avalon_write(dut, byte_addr + i, word)
+        await avalon_write(dut, byte_addr + i, word, byteenable=((1 << BYTES_PER_WORD) - 1))
 
 
 async def avalon_burst_read(dut, addr, count, decode_data=True):
