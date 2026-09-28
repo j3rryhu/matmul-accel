@@ -28,6 +28,7 @@ VERILOG_SOURCES += $(RTL_DIR)/pe.v
 VERILOG_SOURCES += $(RTL_DIR)/pe_array.v
 VERILOG_SOURCES += $(RTL_DIR)/weight_loader.v
 VERILOG_SOURCES += $(RTL_DIR)/weight_ctrl.v
+VERILOG_SOURCES += $(RTL_DIR)/weight_buffer_32_bank.v
 VERILOG_SOURCES += $(RTL_DIR)/input_dispatch.v
 VERILOG_SOURCES += $(RTL_DIR)/input_buffer_32_bank.v
 VERILOG_SOURCES += $(RTL_DIR)/output_loader.v

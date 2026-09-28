@@ -46,7 +46,7 @@ module weight_ctrl #(
     parameter DATA_WIDTH      = 8,
     parameter ARRAY_ROWS      = 16,
     parameter ARRAY_COLS      = 16,
-    parameter WBUF_ADDR_WIDTH = 14,
+    parameter WBUF_BANK_ADDR_WIDTH = 10,  // weight_buffer_32_bank per-bank address width
     parameter IBUF_ADDR_WIDTH = 8,    // input_buffer per-bank address width (input_dispatch)
     parameter DIM_WIDTH       = 16,    // WEIGHT_ROWS/WEIGHT_COLS field width
     parameter K_CNT_WIDTH = $clog2(ARRAY_ROWS+1),
@@ -67,16 +67,17 @@ module weight_ctrl #(
                                                      // block - accel_top combines it with the drain
                                                      // state to decide whole-matmul completion.
 
-    // ---- weight_buffer read port ----
-    output                       wbuf_rden,
-    output [WBUF_ADDR_WIDTH-1:0] wbuf_rdaddress,
-    input      [DATA_WIDTH-1:0]  wbuf_q,
+    // ---- weight_buffer_32_bank read port, one bank per PE row ----
+    output                                       wbuf_rden,
+    output [ARRAY_ROWS*WBUF_BANK_ADDR_WIDTH-1:0] wbuf_rdaddress,
+    output [ARRAY_ROWS-1:0]                      wbuf_byteenable,
+    input  [ARRAY_ROWS*DATA_WIDTH-1:0]           wbuf_q,
 
-    // ---- pe_array weight-load port ----
-    output [$clog2(ARRAY_ROWS*ARRAY_COLS)-1:0] w_addr,
-    output [DATA_WIDTH-1:0]                     w_data,
-    output                                      w_en,
-    output                                      w_load,
+    // ---- pe_array weight-load ports, one per PE row ----
+    output [ARRAY_ROWS*$clog2(ARRAY_ROWS*ARRAY_COLS)-1:0] w_addr,
+    output [ARRAY_ROWS*DATA_WIDTH-1:0]                     w_data,
+    output                                                 w_en,
+    output                                                 w_load,
 
     // ---- input_dispatch handshake ----
     input      [IBUF_ADDR_WIDTH-1:0] input_max_addr,       // per-band input_buffer bound (input_dispatch i_max_addr)
@@ -85,6 +86,9 @@ module weight_ctrl #(
     output reg                       input_compute_start,   // pulse: begin streaming the preloaded band into pe_array
     input                             input_fifos_primed,    // level: all row FIFOs hold >=1 element
     input                             input_band_done,       // pulse: current band fully drained, next preload may start
+
+    // ---- array drain (output_loader's busy) ----
+    input                             output_drain_busy,     // previous block's psums still leaving the array - see WC_WAIT
 
     // ---- output_loader handshake ----
     // Latched at commit time (not live k_blk_idx/n_blk_idx!), since those
@@ -137,10 +141,12 @@ module weight_ctrl #(
     wire [K_CNT_WIDTH-1:0] valid_k = (k_rem < ARRAY_ROWS) ? k_rem[K_CNT_WIDTH-1:0] : ARRAY_ROWS[K_CNT_WIDTH-1:0];
     wire [N_CNT_WIDTH-1:0] valid_n = (n_rem < ARRAY_COLS) ? n_rem[N_CNT_WIDTH-1:0] : ARRAY_COLS[N_CNT_WIDTH-1:0];
 
-    // ---- current block's top-left address in weight_buffer (row-major
-    // over the full contraction x output matrix) ----
+    // ---- current block's first column, as an offset into every bank of
+    // weight_buffer_32_bank: bank r holds W's rows r, r+ARRAY_ROWS, ... back
+    // to back, each n_latched long, so the block starts at the same offset
+    // in every bank (see weight_buffer_32_bank.v) ----
     (* multstyle = "logic" *)
-    wire [WBUF_ADDR_WIDTH-1:0] base_addr = (k_blk_idx*ARRAY_ROWS)*n_latched + n_blk_idx*ARRAY_COLS;
+    wire [WBUF_BANK_ADDR_WIDTH-1:0] base_addr = k_blk_idx*n_latched + n_blk_idx*ARRAY_COLS;
 
     // ---- current block's ARRAY_ROWS-row band base address in input_buffer (also
     // assumed row-major: each band occupies one input_max_addr-sized span) ----
@@ -197,10 +203,9 @@ module weight_ctrl #(
             done_pulse          <= 1'b0;
 
             if (matmul_start) begin
-                // weight prefetch takes >=1024 cycles regardless, so kicking
-                // it and the input band-0 preload the same cycle (rather
-                // than strictly weight-then-input, one cycle apart) makes
-                // no difference to when both are actually ready
+                // block (0,0)'s weight prefetch and input band 0's preload
+                // are independent, so kick both the same cycle - WC_WAIT
+                // waits for whichever finishes last
                 k_latched         <= weight_rows;
                 n_latched         <= weight_cols;
                 k_blk_idx         <= 0;
@@ -213,7 +218,15 @@ module weight_ctrl #(
 
                 case (wc_state)
                     WC_WAIT: begin
-                        if (loader_ready && input_fifos_primed) begin
+                        // w_load swaps every PE's weight in one cycle, so the
+                        // previous block must be fully out of the array
+                        // first: its last activations still walk down all
+                        // ARRAY_ROWS rows after input_band_done. output_loader
+                        // is busy until its last valid result is written
+                        // back, which covers that (and keeps valid_row/
+                        // valid_col stable while it drains). The old serial
+                        // prefetch hid this - loader_ready alone came later.
+                        if (loader_ready && input_fifos_primed && !output_drain_busy) begin
                             commit_pulse         <= 1'b1;  // pe_array.w_load
                             input_compute_start  <= 1'b1;  // input_dispatch PRELOAD -> OFFLOAD
                             last_block_pending   <= is_last_block;
@@ -264,15 +277,13 @@ module weight_ctrl #(
         .DATA_WIDTH      (DATA_WIDTH),
         .ARRAY_ROWS      (ARRAY_ROWS),
         .ARRAY_COLS      (ARRAY_COLS),
-        .WBUF_ADDR_WIDTH (WBUF_ADDR_WIDTH),
-        .DIM_WIDTH       (DIM_WIDTH)
+        .BANK_ADDR_WIDTH (WBUF_BANK_ADDR_WIDTH)
     ) u_weight_loader (
         .clk            (clk),
         .rst_n          (rst_n),
 
         .wbuf_rdy       (loader_start),
         .base_addr      (base_addr),
-        .row_stride     (n_latched),
         .valid_rows     (valid_k),
         .valid_cols     (valid_n),
         .commit         (commit_pulse),
@@ -280,9 +291,10 @@ module weight_ctrl #(
         .ready          (loader_ready),
         .done           (),
 
-        .wbuf_rden      (wbuf_rden),
-        .wbuf_rdaddress (wbuf_rdaddress),
-        .wbuf_q         (wbuf_q),
+        .wbuf_rden       (wbuf_rden),
+        .wbuf_rdaddress  (wbuf_rdaddress),
+        .wbuf_byteenable (wbuf_byteenable),
+        .wbuf_q          (wbuf_q),
 
         .w_addr         (w_addr),
         .w_data         (w_data),

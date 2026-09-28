@@ -79,21 +79,22 @@ module mixed_ram_rd_wide #(
     end
 endmodule
 
-// weight_buffer: 16384 bytes. Avalon writes 32-bit words (4096 x 32,
-// 12-bit word address); weight_loader reads bytes (16384 x 8, 14-bit).
+// weight_buffer: one bank of weight_buffer_32_bank (one per PE row), 1024
+// bytes. Avalon writes 128-bit words (64 x 128, 6-bit word address);
+// weight_loader reads bytes (1024 x 8, 10-bit).
 module weight_buffer (
     input         clock,
     input  [127:0] data,
-    input  [13:0] rdaddress,
+    input  [ 9:0] rdaddress,
     input         rden,
-    input  [ 9:0] wraddress,
+    input  [ 5:0] wraddress,
     input         wren,
     output [ 7:0] q
 );
     mixed_ram_wr_wide #(
         .NARROW_WIDTH (8),
         .WIDE_WIDTH   (128),
-        .NARROW_DEPTH (16384)
+        .NARROW_DEPTH (1024)
     ) u_ram (
         .clock (clock), .data (data),
         .rdaddress (rdaddress), .rden (rden),

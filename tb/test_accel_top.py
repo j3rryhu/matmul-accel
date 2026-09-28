@@ -28,8 +28,9 @@ stage multiplies the raw accumulator by it, shifts, and saturates (see
 output_loader.v) to produce exactly that.
 
 Everything is addressed per the RTL's own documented conventions:
-  - weight_buffer: row-major over the (contraction x output) matrix,
-    address = k*WEIGHT_COLS + n (see weight_ctrl.v's base_addr).
+  - weight_buffer: banked one bank per PE row; W[k, n] lives in bank
+    k % ARRAY_ROWS at offset (k // ARRAY_ROWS)*WEIGHT_COLS + n (see
+    rtl/weight_buffer_32_bank.v and write_weights below).
   - input_buffer: banked one bank per array row (see input_buffer_32_bank.v
     / input_dispatch.v); bank k, offset m holds x[k,m] - with a single
     32-row block, k_blk_idx=0, so bank k is x's row k directly, laid out at
@@ -89,6 +90,7 @@ REAL_VAL_STD = 1.0
 
 OBUF_BANK_ADDR_WIDTH = 7  # must match accel_top.sv's OBUF_BANK_ADDR_WIDTH
 IBUF_BANK_ADDR_WIDTH = 8  # must match input_buffer_32_bank.v's per-bank address width
+WBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's WBUF_BANK_ADDR_WIDTH
 
 # Avalon data port width in bytes: the buffers' host-facing ports are this
 # wide, so every host access moves a whole word and byte addresses advance
@@ -191,6 +193,25 @@ async def write_bytes(dut, byte_addr, values):
         for j in range(BYTES_PER_WORD):
             word |= vals[i + j] << (8 * j)
         await avalon_write(dut, byte_addr + i, word, byteenable=((1 << BYTES_PER_WORD) - 1))
+
+
+async def write_weights(dut, W_int8):
+    """Write a (K x N) int8 weight matrix into weight_buffer_32_bank.
+
+    One bank per PE row: row k of W goes to bank k % ARRAY_ROWS, at offset
+    (k // ARRAY_ROWS)*N, so each bank holds its own rows back to back and
+    every block starts at the same offset in every bank. Each bank's rows
+    are written as one contiguous image, for the same reason as the input
+    banks (a row boundary need not be word aligned).
+    """
+    K, N = W_int8.shape
+    assert ((K + ARRAY_ROWS - 1) // ARRAY_ROWS) * N <= (1 << WBUF_BANK_ADDR_WIDTH), \
+        "weight_buffer per-bank depth too small for ceil(K/ARRAY_ROWS)*N"
+    for bank in range(min(K, ARRAY_ROWS)):
+        img = []
+        for k in range(bank, K, ARRAY_ROWS):
+            img += [to_uint8(int(W_int8[k, n])) for n in range(N)]
+        await write_bytes(dut, WBUF_BASE + bank * (1 << WBUF_BANK_ADDR_WIDTH), img)
 
 
 async def avalon_burst_read(dut, addr, count, decode_data=True):
@@ -361,9 +382,8 @@ async def test_single_block_matmul(dut):
         f.write(f"X_real (K x M) =\n{np.array2string(X_real, threshold=np.inf, max_line_width=200)}\n\n")
         f.write(f"X_int8 (K x M) =\n{np.array2string(X_int8, threshold=np.inf, max_line_width=200)}\n")
 
-    # ---- write quantized weights: row-major (k*N+n) into weight_buffer ----
-    await write_bytes(dut, WBUF_BASE,
-                      [to_uint8(int(W_int8[k, n])) for k in range(K) for n in range(N)])
+    # ---- write quantized weights: one weight_buffer bank per PE row ----
+    await write_weights(dut, W_int8)
 
     # ---- write quantized input: banked one bank per array row (bank =
     # k % ARRAY_ROWS, offset = k_blk_idx*M + m, matching weight_ctrl's
@@ -494,11 +514,11 @@ async def test_multiblock_matmul(dut):
         f.write(f"W_int8 hex (K x N), one row per line, each byte 2's-complement =\n{format_int8_hex(W_int8)}\n\n")
         f.write(f"X_int8 hex (K x M), one row per line, each byte 2's-complement =\n{format_int8_hex(X_int8)}\n")
 
-    # ---- write weights: row-major over the *full* K x N matrix - this
-    # layout doesn't change for multi-block (weight_ctrl.v's base_addr
-    # walks it with row_stride=N regardless of block count) ----
-    await write_bytes(dut, WBUF_BASE,
-                      [to_uint8(int(W_int8[k, n])) for k in range(K) for n in range(N)])
+    # ---- write weights: one bank per PE row, each holding its rows of the
+    # *full* K x N matrix back to back - weight_ctrl.v's base_addr
+    # (k_blk_idx*N + n_blk_idx*ARRAY_COLS) finds every block at the same
+    # offset in every bank, whatever the block count ----
+    await write_weights(dut, W_int8)
 
     # ---- write input: banked one bank per array row (bank = k %
     # ARRAY_ROWS); k_blk_idx's M-sized band is appended after the previous
@@ -587,9 +607,10 @@ async def test_partial_row_block_matmul(dut):
 
     Actual PE dataflow (from pe.v/pe_array.v directly, NOT weight_ctrl.v's
     header comment, which describes the wrong axis): weight is loaded
-    straight into PE(row,col) with no transpose (w_addr = row*ARRAY_COLS+col,
-    weight_loader walks weight_buffer row-major into the same row/col
-    layout). Partial sums (b_in) cascade *across columns within a row*
+    straight into PE(row,col) with no transpose (weight_buffer bank `row`
+    feeds PE row `row` through its own weight port, w_addr[row] =
+    row*ARRAY_COLS+col, so W's row/col layout carries over as-is). Partial
+    sums (b_in) cascade *across columns within a row*
     (pe_array.v: pe_b_in = ROW[r].COL[c-1].pe_p_out) - so contraction
     happens over the weight's COLUMN axis (WEIGHT_COLS/N), and each PE ROW
     independently produces one full output row, taken from its rightmost
@@ -692,11 +713,10 @@ async def test_partial_row_block_matmul(dut):
         f.write(f"X_int8 hex (N x M), one row per line, each byte 2's-complement =\n{format_int8_hex(X_int8)}\n\n")
         f.write(f"golden Y_int8 hex (K x M), one row per line, each byte 2's-complement =\n{format_int8_hex(golden)}\n")
 
-    # ---- write weights exactly as written on paper: row-major over the
-    # K x N matrix (address = k*N+n, see weight_ctrl.v's base_addr; PE(row,col)
-    # is loaded directly from this with no transpose - see docstring) ----
-    await write_bytes(dut, WBUF_BASE,
-                      [to_uint8(int(W_int8[k, n])) for k in range(K) for n in range(N)])
+    # ---- write weights exactly as written on paper, no transpose: row k
+    # goes to bank k % ARRAY_ROWS (see write_weights), and PE(row,col) is
+    # loaded directly from it - see docstring ----
+    await write_weights(dut, W_int8)
 
     # ---- write input: banked one bank per PE column (the contraction
     # axis) - the whole (32,64) input is loaded into input_buffer once, up
@@ -776,8 +796,7 @@ async def test_back_to_back_matmul_no_reset(dut):
         assert 0.0 <= ws * xs / os_ < 1.0
         q16 = round(ws * xs / os_ * 65536)
 
-        await write_bytes(dut, WBUF_BASE,
-                          [to_uint8(int(W_int8[k, n])) for k in range(K) for n in range(N)])
+        await write_weights(dut, W_int8)
         # input_buffer bank c feeds PE column c, i.e. the contraction axis
         for c in range(N):
             await write_bytes(dut, IBUF_BASE + c * (1 << IBUF_BANK_ADDR_WIDTH),
@@ -863,8 +882,7 @@ async def test_unaligned_m_matmul(dut):
     assert 0.0 <= ws * xs / os_ < 1.0
     q16 = round(ws * xs / os_ * 65536)
 
-    await write_bytes(dut, WBUF_BASE,
-                      [to_uint8(int(W_int8[k, n])) for k in range(K) for n in range(N)])
+    await write_weights(dut, W_int8)
     for c in range(N):
         await write_bytes(dut, IBUF_BASE + c * (1 << IBUF_BANK_ADDR_WIDTH),
                           [to_uint8(int(X_int8[c, m])) for m in range(M)])
@@ -969,9 +987,9 @@ async def test_hw_min_identity_sequence(dut):
     await avalon_write(dut, INPUT_COLS_ADDR, M)
     await avalon_write(dut, OUTPUT_SCALE_ADDR, OUTPUT_SCALE_HALF)
 
-    # ---- phase: write weight buffer (K*N = 256 bytes = 64 words) ----
-    await write_bytes(dut, WBUF_BASE,
-                      [to_uint8(int(W_int8[k, n])) for k in range(K) for n in range(N)])
+    # ---- phase: write weight buffer (one bank per PE row; at 16x16 row k
+    # of W is the whole of bank k, one word each) ----
+    await write_weights(dut, W_int8)
 
     # ---- phase: write input buffer (16 banks x 16 bytes). N == ARRAY_COLS,
     # so there is a single band per bank and bank p is x's row p directly ----
