@@ -49,6 +49,7 @@ module weight_ctrl #(
     parameter WBUF_BANK_ADDR_WIDTH = 10,  // weight_buffer_32_bank per-bank address width
     parameter IBUF_ADDR_WIDTH = 8,    // input_buffer per-bank address width (input_dispatch)
     parameter DIM_WIDTH       = 16,    // WEIGHT_ROWS/WEIGHT_COLS field width
+    parameter ROW_ALIGN       = 16,    // host write word in bytes: buffer rows are padded to this (see buf_addr_remap.v)
     parameter K_CNT_WIDTH = $clog2(ARRAY_ROWS+1),
     parameter N_CNT_WIDTH = $clog2(ARRAY_COLS+1)
 )(
@@ -143,15 +144,18 @@ module weight_ctrl #(
 
     // ---- current block's first column, as an offset into every bank of
     // weight_buffer_32_bank: bank r holds W's rows r, r+ARRAY_ROWS, ... back
-    // to back, each n_latched long, so the block starts at the same offset
-    // in every bank (see weight_buffer_32_bank.v) ----
+    // to back, each padded to w_pitch = roundup(N, ROW_ALIGN) bytes by the
+    // host remap, so the block starts at the same offset in every bank ----
+    wire [DIM_WIDTH:0] w_pitch = (({1'b0, n_latched} + ROW_ALIGN - 1) / ROW_ALIGN) * ROW_ALIGN;
     (* multstyle = "logic" *)
-    wire [WBUF_BANK_ADDR_WIDTH-1:0] base_addr = k_blk_idx*n_latched + n_blk_idx*ARRAY_COLS;
+    wire [WBUF_BANK_ADDR_WIDTH-1:0] base_addr = k_blk_idx*w_pitch + n_blk_idx*ARRAY_COLS;
 
     // ---- current block's ARRAY_ROWS-row band base address in input_buffer (also
     // assumed row-major: each band occupies one input_max_addr-sized span) ----
     (* multstyle = "logic" *)
-    wire [IBUF_ADDR_WIDTH-1:0] band_base_addr = n_blk_idx[IBUF_ADDR_WIDTH-1:0] * input_max_addr;
+    // bands are padded to i_pitch = roundup(M, ROW_ALIGN) bytes by the host remap
+    wire [IBUF_ADDR_WIDTH:0] i_pitch = (({1'b0, input_max_addr} + ROW_ALIGN - 1) / ROW_ALIGN) * ROW_ALIGN;
+    wire [IBUF_ADDR_WIDTH-1:0] band_base_addr = n_blk_idx[IBUF_ADDR_WIDTH-1:0] * i_pitch;
     assign input_band_base_addr = band_base_addr;
 
     reg loader_start;

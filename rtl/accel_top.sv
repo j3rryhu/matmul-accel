@@ -156,13 +156,55 @@ module accel_top #(
     end
 
     // ============================================================
-    // weight_buffer - banked ARRAY_ROWS-ways (one bank per PE row, see
-    // weight_buffer_32_bank.v). Write-only from Avalon; the read side is
-    // driven by weight_ctrl, every bank in parallel
+    // Host-side address remap for the two banked write-only buffers.
+    // Software writes each matrix as ONE contiguous row-major image, every
+    // row zero-padded up to a whole number of AVS_DATA_WIDTH words:
+    //   WBUF: W (K x N), row pitch = roundup(WEIGHT_COLS,    BYTES_PER_WORD)
+    //   IBUF: X (N x M), row pitch = roundup(INPUT_MAX_ADDR, BYTES_PER_WORD)
+    // Every host word then belongs to one row, so it lands whole in one
+    // bank at a word-aligned offset: one RAM write per host write, no
+    // stall. buf_addr_remap scatters row r to bank r % ARRAY_ROWS using
+    // those live register values, so WEIGHT_COLS / INPUT_MAX_ADDR must be
+    // programmed BEFORE the buffers are written. Inside a bank, rows keep
+    // the padded pitch (weight_ctrl's block/band bases use it too). Writes
+    // land two cycles after they are accepted (see buf_addr_remap.v).
     // ============================================================
-    wire        wbuf_wren      = avs_write_accepted && sel_wbuf;
-    wire [WBUF_WADDR_WIDTH-1:0] wbuf_wraddress = (avs_address - WBUF_BASE) >> WORD_SHIFT;
-    wire [AVS_DATA_WIDTH-1:0]   wbuf_wdata      = avs_writedata;
+    logic [15:0] weight_cols;           // N: weight cols (from ctrl_rf, below)
+    logic [9:0]  input_max_addr;        // M: per-band input reads (from ctrl_rf, below)
+
+    localparam int WBUF_ROWW_WIDTH = WBUF_BANK_ADDR_WIDTH - WORD_SHIFT + 1;  // row pitch up to a whole bank
+    localparam int IBUF_ROWW_WIDTH = IBUF_BANK_ADDR_WIDTH - WORD_SHIFT + 1;
+
+    wire [16:0] wbuf_pitch_words = ({1'b0, weight_cols} + (BYTES_PER_WORD-1)) >> WORD_SHIFT;
+    wire [IBUF_BANK_ADDR_WIDTH:0] ibuf_pitch_words =
+        ({1'b0, input_max_addr[IBUF_BANK_ADDR_WIDTH-1:0]} + (BYTES_PER_WORD-1)) >> WORD_SHIFT;
+
+    // ============================================================
+    // weight_buffer - banked ARRAY_ROWS-ways (one bank per PE row, see
+    // weight_buffer_32_bank.v). Write-only from Avalon through the remap;
+    // the read side is driven by weight_ctrl, every bank in parallel
+    // ============================================================
+    wire [WBUF_WADDR_WIDTH-1:0] wbuf_host_waddr = (avs_address - WBUF_BASE) >> WORD_SHIFT;
+    wire [WBUF_WADDR_WIDTH-1:0] wbuf_wraddress;
+    wire [AVS_DATA_WIDTH-1:0]   wbuf_wdata;
+    wire                        wbuf_wren;
+
+    buf_addr_remap #(
+        .DATA_WIDTH       (AVS_DATA_WIDTH),
+        .HOST_WADDR_WIDTH (WBUF_WADDR_WIDTH),
+        .ROWW_WIDTH       (WBUF_ROWW_WIDTH),
+        .BANK_SEL_WIDTH   ($clog2(ARRAY_ROWS)),
+        .BANK_WADDR_WIDTH (WBUF_BANK_ADDR_WIDTH - WORD_SHIFT)
+    ) u_wbuf_remap (
+        .clk        (clk),
+        .host_waddr (wbuf_host_waddr),
+        .host_wdata (avs_writedata),
+        .host_wren  (avs_write_accepted && sel_wbuf),
+        .row_words  (wbuf_pitch_words[WBUF_ROWW_WIDTH-1:0]),
+        .bank_waddr (wbuf_wraddress),
+        .bank_wdata (wbuf_wdata),
+        .bank_wren  (wbuf_wren)
+    );
 
     logic [ARRAY_ROWS*WBUF_BANK_ADDR_WIDTH-1:0] wbuf_rdaddress;
     logic                                       wbuf_rden;
@@ -186,11 +228,30 @@ module accel_top #(
     );
 
     // ============================================================
-    // input_buffer - write side from Avalon, read side driven by input_dispatch
+    // input_buffer - write side from Avalon through the remap, read side
+    // driven by input_dispatch
     // ============================================================
-    wire        ibuf_wren      = avs_write_accepted && sel_ibuf;
-    wire [IBUF_WADDR_WIDTH-1:0] ibuf_wraddress = (avs_address - IBUF_BASE) >> WORD_SHIFT;
-    wire [AVS_DATA_WIDTH-1:0]   ibuf_wdata      = avs_writedata;
+    wire [IBUF_WADDR_WIDTH-1:0] ibuf_host_waddr = (avs_address - IBUF_BASE) >> WORD_SHIFT;
+    wire [IBUF_WADDR_WIDTH-1:0] ibuf_wraddress;
+    wire [AVS_DATA_WIDTH-1:0]   ibuf_wdata;
+    wire                        ibuf_wren;
+
+    buf_addr_remap #(
+        .DATA_WIDTH       (AVS_DATA_WIDTH),
+        .HOST_WADDR_WIDTH (IBUF_WADDR_WIDTH),
+        .ROWW_WIDTH       (IBUF_ROWW_WIDTH),
+        .BANK_SEL_WIDTH   ($clog2(ARRAY_ROWS)),
+        .BANK_WADDR_WIDTH (IBUF_BANK_ADDR_WIDTH - WORD_SHIFT)
+    ) u_ibuf_remap (
+        .clk        (clk),
+        .host_waddr (ibuf_host_waddr),
+        .host_wdata (avs_writedata),
+        .host_wren  (avs_write_accepted && sel_ibuf),
+        .row_words  (ibuf_pitch_words[IBUF_ROWW_WIDTH-1:0]),
+        .bank_waddr (ibuf_wraddress),
+        .bank_wdata (ibuf_wdata),
+        .bank_wren  (ibuf_wren)
+    );
 
     logic [ARRAY_ROWS*PE_DATA_WIDTH-1:0]       ibuf_q;
     logic [ARRAY_ROWS*IBUF_BANK_ADDR_WIDTH-1:0] ibuf_rdaddress;
@@ -308,8 +369,7 @@ module accel_top #(
 
     logic        matmul_start;          // pulse: latch WEIGHT_ROWS/WEIGHT_COLS, reset block position
     logic [15:0] weight_rows;           // K: weight rows (contraction dimension)
-    logic [15:0] weight_cols;           // N: weight cols
-    logic [9:0]  input_max_addr;        // max input_buffer read address
+    // weight_cols / input_max_addr are declared above, with the buffer remap
     logic [15:0] input_cols;            // number of columns of the input (activation) matrix
     logic [15:0] output_scale;          // Q0.16 rescale factor (value/65536, range [0,1)) for pe_array's ACC_WIDTH accumulator
     logic        weight_ctrl_busy;      // weight_ctrl/weight_loader busy, for STATUS.busy
@@ -451,6 +511,7 @@ module accel_top #(
         .ARRAY_ROWS      (ARRAY_ROWS),
         .ARRAY_COLS      (ARRAY_COLS),
         .WBUF_BANK_ADDR_WIDTH (WBUF_BANK_ADDR_WIDTH),
+        .ROW_ALIGN       (BYTES_PER_WORD),
         .IBUF_ADDR_WIDTH (IBUF_BANK_ADDR_WIDTH),
         .DIM_WIDTH       (16)
     ) u_weight_ctrl (

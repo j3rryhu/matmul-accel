@@ -103,7 +103,7 @@ module weight_buffer (
 endmodule
 
 // input_buffer: one bank of input_buffer_32_bank, 256 bytes. Avalon writes
-// 32-bit words (64 x 32, 6-bit word address); input_dispatch reads bytes
+// 128-bit words (16 x 128, 4-bit word address); input_dispatch reads bytes
 // (256 x 8, 8-bit).
 module input_buffer (
     input         clock,

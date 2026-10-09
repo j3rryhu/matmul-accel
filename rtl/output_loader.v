@@ -201,6 +201,7 @@ module output_loader #(
     reg                 held_first_k_blk;
 
     wire start_edge = armed && a_en_last && !a_en_last_d;
+    wire pass_start = !running && a_en_last;   // same condition that sets `running` below
 
     always @(posedge clock) begin
         if (~rst_n)
@@ -256,8 +257,14 @@ module output_loader #(
             wire row_active = row_live && (row_count[r] < total_rows);
             wire [ROW_ADDR_WIDTH-1:0] per_row_cnt = row_count[r];
 
+            // cleared at the start of every pass, not only on &row_done: a
+            // partial pass (weight_rows < ARRAY_ROWS) never counts its dead
+            // rows, so &row_done stays low and the live rows would keep
+            // row_count == total_rows into the next pass and skip it
             always @(posedge clock) begin
                 if (~rst_n)
+                    row_count[r] <= {ROW_ADDR_WIDTH{1'b0}};
+                else if (pass_start)
                     row_count[r] <= {ROW_ADDR_WIDTH{1'b0}};
                 else if (row_active)
                     row_count[r] <= row_count[r] + 1'b1;

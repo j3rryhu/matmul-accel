@@ -28,13 +28,12 @@ stage multiplies the raw accumulator by it, shifts, and saturates (see
 output_loader.v) to produce exactly that.
 
 Everything is addressed per the RTL's own documented conventions:
-  - weight_buffer: banked one bank per PE row; W[k, n] lives in bank
-    k % ARRAY_ROWS at offset (k // ARRAY_ROWS)*WEIGHT_COLS + n (see
-    rtl/weight_buffer_32_bank.v and write_weights below).
-  - input_buffer: banked one bank per array row (see input_buffer_32_bank.v
-    / input_dispatch.v); bank k, offset m holds x[k,m] - with a single
-    32-row block, k_blk_idx=0, so bank k is x's row k directly, laid out at
-    IBUF_BASE + k*(1<<IBUF_BANK_ADDR_WIDTH) + m.
+  - weight_buffer / input_buffer: written as one contiguous row-major image
+    each, every row zero-padded to a whole BYTES_PER_WORD word:
+    WBUF_BASE + k*pitch(N) + n and IBUF_BASE + p*pitch(M) + m. Hardware
+    (rtl/buf_addr_remap.v) scatters row r to bank r % ARRAY_ROWS using the
+    WEIGHT_COLS / INPUT_MAX_ADDR registers, so those are programmed first
+    (program_dims, write_weights, write_inputs below).
   - output_buffer: banked one row per array column; bank c, offset m holds
     y[row=n_blk_idx*ARRAY_COLS+c, col=m] (see output_loader.v). With a
     single 32x32 output block, n_blk_idx=0, so bank c holds row c directly,
@@ -195,23 +194,51 @@ async def write_bytes(dut, byte_addr, values):
         await avalon_write(dut, byte_addr + i, word, byteenable=((1 << BYTES_PER_WORD) - 1))
 
 
-async def write_weights(dut, W_int8):
-    """Write a (K x N) int8 weight matrix into weight_buffer_32_bank.
+def row_pitch(ncols):
+    """Host row pitch in bytes: every row is padded to a whole word."""
+    return -(-ncols // BYTES_PER_WORD) * BYTES_PER_WORD
 
-    One bank per PE row: row k of W goes to bank k % ARRAY_ROWS, at offset
-    (k // ARRAY_ROWS)*N, so each bank holds its own rows back to back and
-    every block starts at the same offset in every bank. Each bank's rows
-    are written as one contiguous image, for the same reason as the input
-    banks (a row boundary need not be word aligned).
-    """
+
+def padded_image(A):
+    """Row-major byte image of A with every row padded to row_pitch."""
+    rows, cols = A.shape
+    pad = [0] * (row_pitch(cols) - cols)
+    img = []
+    for r in range(rows):
+        img += [to_uint8(int(A[r, c])) for c in range(cols)] + pad
+    return img
+
+
+async def program_dims(dut, K, N, M, output_scale_q16):
+    """Dimension + scale registers. Must come BEFORE write_weights /
+    write_inputs: the host-side remap (rtl/buf_addr_remap.v) uses
+    WEIGHT_COLS and INPUT_MAX_ADDR to place each word in its bank."""
+    await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
+    await avalon_write(dut, WEIGHT_COLS_ADDR, N)
+    await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
+    await avalon_write(dut, INPUT_COLS_ADDR, M)
+    await avalon_write(dut, OUTPUT_SCALE_ADDR, output_scale_q16)
+
+
+async def write_weights(dut, W_int8):
+    """Write a (K x N) int8 weight matrix as ONE contiguous row-major image
+    at WBUF_BASE, rows padded to row_pitch(N). Hardware scatters row k to
+    bank k % ARRAY_ROWS (see rtl/buf_addr_remap.v)."""
     K, N = W_int8.shape
-    assert ((K + ARRAY_ROWS - 1) // ARRAY_ROWS) * N <= (1 << WBUF_BANK_ADDR_WIDTH), \
-        "weight_buffer per-bank depth too small for ceil(K/ARRAY_ROWS)*N"
-    for bank in range(min(K, ARRAY_ROWS)):
-        img = []
-        for k in range(bank, K, ARRAY_ROWS):
-            img += [to_uint8(int(W_int8[k, n])) for n in range(N)]
-        await write_bytes(dut, WBUF_BASE + bank * (1 << WBUF_BANK_ADDR_WIDTH), img)
+    assert ((K + ARRAY_ROWS - 1) // ARRAY_ROWS) * row_pitch(N) <= (1 << WBUF_BANK_ADDR_WIDTH), \
+        "weight_buffer per-bank depth too small for ceil(K/ARRAY_ROWS)*pitch(N)"
+    await write_bytes(dut, WBUF_BASE, padded_image(W_int8))
+
+
+async def write_inputs(dut, X_int8):
+    """Write an (N x M) int8 input matrix (N = contraction) as ONE contiguous
+    row-major image at IBUF_BASE, every row zero-padded to row_pitch(M).
+    Hardware (rtl/buf_addr_remap.v) scatters row p to bank p % ARRAY_ROWS,
+    band p // ARRAY_ROWS, keeping the padded pitch inside the bank."""
+    N, M = X_int8.shape
+    assert ((N + ARRAY_ROWS - 1) // ARRAY_ROWS) * row_pitch(M) <= (1 << IBUF_BANK_ADDR_WIDTH), \
+        "input_buffer per-bank depth too small for ceil(N/ARRAY_ROWS)*pitch(M)"
+    await write_bytes(dut, IBUF_BASE, padded_image(X_int8))
 
 
 async def avalon_burst_read(dut, addr, count, decode_data=True):
@@ -382,29 +409,11 @@ async def test_single_block_matmul(dut):
         f.write(f"X_real (K x M) =\n{np.array2string(X_real, threshold=np.inf, max_line_width=200)}\n\n")
         f.write(f"X_int8 (K x M) =\n{np.array2string(X_int8, threshold=np.inf, max_line_width=200)}\n")
 
-    # ---- write quantized weights: one weight_buffer bank per PE row ----
+    # ---- program dimensions + rescale factor (before the buffers - the
+    # host remap needs them), then write W and X as contiguous images ----
+    await program_dims(dut, K, N, M, output_scale_q16)
     await write_weights(dut, W_int8)
-
-    # ---- write quantized input: banked one bank per array row (bank =
-    # k % ARRAY_ROWS, offset = k_blk_idx*M + m, matching weight_ctrl's
-    # input_band_base_addr) ----
-    # one whole bank image at a time: bands are appended head-to-tail
-    # within a bank, and a 32-bit write covers 4 consecutive bytes, so a
-    # band boundary that isn't word aligned must not be written piecemeal
-    num_bands = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
-    for bank in range(min(K, ARRAY_ROWS)):
-        img = []
-        for kb in range(num_bands):
-            k = kb * ARRAY_ROWS + bank
-            img += [to_uint8(int(X_int8[k, m])) for m in range(M)] if k < K else [0] * M
-        await write_bytes(dut, IBUF_BASE + bank * (1 << IBUF_BANK_ADDR_WIDTH), img)
-
-    # ---- program dimensions + rescale factor ----
-    await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
-    await avalon_write(dut, WEIGHT_COLS_ADDR, N)
-    await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
-    await avalon_write(dut, INPUT_COLS_ADDR, M)
-    await avalon_write(dut, OUTPUT_SCALE_ADDR, output_scale_q16)
+    await write_inputs(dut, X_int8)
 
     # ---- kick off the matmul: everything past this is sequenced by
     # weight_ctrl internally (see rtl/weight_ctrl.v) ----
@@ -514,32 +523,11 @@ async def test_multiblock_matmul(dut):
         f.write(f"W_int8 hex (K x N), one row per line, each byte 2's-complement =\n{format_int8_hex(W_int8)}\n\n")
         f.write(f"X_int8 hex (K x M), one row per line, each byte 2's-complement =\n{format_int8_hex(X_int8)}\n")
 
-    # ---- write weights: one bank per PE row, each holding its rows of the
-    # *full* K x N matrix back to back - weight_ctrl.v's base_addr
-    # (k_blk_idx*N + n_blk_idx*ARRAY_COLS) finds every block at the same
-    # offset in every bank, whatever the block count ----
+    # ---- dims first, then W (full K x N) and X as contiguous row-major
+    # images - the host remap scatters rows to banks/bands ----
+    await program_dims(dut, K, N, M, output_scale_q16)
     await write_weights(dut, W_int8)
-
-    # ---- write input: banked one bank per array row (bank = k %
-    # ARRAY_ROWS); k_blk_idx's M-sized band is appended after the previous
-    # k_blk's within the same bank, matching weight_ctrl's
-    # input_band_base_addr = k_blk_idx*input_max_addr ----
-    # one whole bank image at a time: bands are appended head-to-tail
-    # within a bank, and a 32-bit write covers 4 consecutive bytes, so a
-    # band boundary that isn't word aligned must not be written piecemeal
-    num_bands = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
-    for bank in range(min(K, ARRAY_ROWS)):
-        img = []
-        for kb in range(num_bands):
-            k = kb * ARRAY_ROWS + bank
-            img += [to_uint8(int(X_int8[k, m])) for m in range(M)] if k < K else [0] * M
-        await write_bytes(dut, IBUF_BASE + bank * (1 << IBUF_BANK_ADDR_WIDTH), img)
-
-    await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
-    await avalon_write(dut, WEIGHT_COLS_ADDR, N)
-    await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
-    await avalon_write(dut, INPUT_COLS_ADDR, M)
-    await avalon_write(dut, OUTPUT_SCALE_ADDR, output_scale_q16)
+    await write_inputs(dut, X_int8)
 
     await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
 
@@ -713,24 +701,12 @@ async def test_partial_row_block_matmul(dut):
         f.write(f"X_int8 hex (N x M), one row per line, each byte 2's-complement =\n{format_int8_hex(X_int8)}\n\n")
         f.write(f"golden Y_int8 hex (K x M), one row per line, each byte 2's-complement =\n{format_int8_hex(golden)}\n")
 
-    # ---- write weights exactly as written on paper, no transpose: row k
-    # goes to bank k % ARRAY_ROWS (see write_weights), and PE(row,col) is
-    # loaded directly from it - see docstring ----
+    # ---- dims first, then W exactly as written on paper (no transpose)
+    # and X, each as one contiguous row-major image. X has a single band
+    # (N == ARRAY_COLS), reused by both k-block passes ----
+    await program_dims(dut, K, N, M, output_scale_q16)
     await write_weights(dut, W_int8)
-
-    # ---- write input: banked one bank per PE column (the contraction
-    # axis) - the whole (32,64) input is loaded into input_buffer once, up
-    # front (N == ARRAY_COLS exactly, a single band reused by both
-    # k-block passes, since input doesn't depend on k_blk_idx) ----
-    for c in range(N):
-        await write_bytes(dut, IBUF_BASE + c * (1 << IBUF_BANK_ADDR_WIDTH),
-                          [to_uint8(int(X_int8[c, m])) for m in range(M)])
-
-    await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
-    await avalon_write(dut, WEIGHT_COLS_ADDR, N)
-    await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
-    await avalon_write(dut, INPUT_COLS_ADDR, M)
-    await avalon_write(dut, OUTPUT_SCALE_ADDR, output_scale_q16)
+    await write_inputs(dut, X_int8)
 
     await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
 
@@ -796,17 +772,9 @@ async def test_back_to_back_matmul_no_reset(dut):
         assert 0.0 <= ws * xs / os_ < 1.0
         q16 = round(ws * xs / os_ * 65536)
 
+        await program_dims(dut, K, N, M, q16)
         await write_weights(dut, W_int8)
-        # input_buffer bank c feeds PE column c, i.e. the contraction axis
-        for c in range(N):
-            await write_bytes(dut, IBUF_BASE + c * (1 << IBUF_BANK_ADDR_WIDTH),
-                              [to_uint8(int(X_int8[c, m])) for m in range(M)])
-
-        await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
-        await avalon_write(dut, WEIGHT_COLS_ADDR, N)
-        await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
-        await avalon_write(dut, INPUT_COLS_ADDR, M)
-        await avalon_write(dut, OUTPUT_SCALE_ADDR, q16)
+        await write_inputs(dut, X_int8)
         await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
 
         # STATUS.done must not still be set from the previous matmul.
@@ -882,16 +850,9 @@ async def test_unaligned_m_matmul(dut):
     assert 0.0 <= ws * xs / os_ < 1.0
     q16 = round(ws * xs / os_ * 65536)
 
+    await program_dims(dut, K, N, M, q16)
     await write_weights(dut, W_int8)
-    for c in range(N):
-        await write_bytes(dut, IBUF_BASE + c * (1 << IBUF_BANK_ADDR_WIDTH),
-                          [to_uint8(int(X_int8[c, m])) for m in range(M)])
-
-    await avalon_write(dut, WEIGHT_ROWS_ADDR, K)
-    await avalon_write(dut, WEIGHT_COLS_ADDR, N)
-    await avalon_write(dut, INPUT_MAX_ADDR_ADDR, M)
-    await avalon_write(dut, INPUT_COLS_ADDR, M)
-    await avalon_write(dut, OUTPUT_SCALE_ADDR, q16)
+    await write_inputs(dut, X_int8)   # M unaligned: each row zero-padded to a whole word
     await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
     await wait_matmul_done(dut)
     await ClockCycles(dut.clk, 2)
@@ -987,15 +948,13 @@ async def test_hw_min_identity_sequence(dut):
     await avalon_write(dut, INPUT_COLS_ADDR, M)
     await avalon_write(dut, OUTPUT_SCALE_ADDR, OUTPUT_SCALE_HALF)
 
-    # ---- phase: write weight buffer (one bank per PE row; at 16x16 row k
-    # of W is the whole of bank k, one word each) ----
+    # ---- phase: write weight buffer (one contiguous 256-byte image,
+    # 16 words; hardware sends row k to bank k) ----
     await write_weights(dut, W_int8)
 
-    # ---- phase: write input buffer (16 banks x 16 bytes). N == ARRAY_COLS,
-    # so there is a single band per bank and bank p is x's row p directly ----
-    for p in range(N):
-        await write_bytes(dut, IBUF_BASE + p * (1 << IBUF_BANK_ADDR_WIDTH),
-                          [to_uint8(int(X_int8[p, m])) for m in range(M)])
+    # ---- phase: write input buffer (one contiguous 256-byte image,
+    # 16 words; hardware sends row p to bank p) ----
+    await write_inputs(dut, X_int8)
 
     # ---- phase: pulse CONTROL.matmul_start ----
     await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
@@ -1184,3 +1143,72 @@ async def test_stalled_write_commits_once(dut):
     assert starts[0] == 1, (
         f"CONTROL.start write stalled by avs_waitrequest pulsed "
         f"matmul_start {starts[0]} time(s), expected 1")
+
+
+@cocotb.test()
+async def test_padded_input_multiband_matmul(dut):
+    """Padded input rows (M not a multiple of the word size) AND more than
+    one contraction band.
+
+    With N = 2*ARRAY_COLS there are two bands per bank, and band 1 starts at
+    roundup(M, BYTES_PER_WORD), not at M. That is the one case where the
+    writer (buf_addr_remap's padded pitch) and the reader (weight_ctrl's
+    band base, n_blk*i_pitch) must agree on the padding - a single-band or
+    aligned-M test passes either way. K is also a partial second output
+    block, and the second contraction block accumulates into output
+    segments that start mid-word.
+
+    Also the regression test for output_loader's row counters: a partial
+    output block followed by another pass (here block (k1,n0) -> (k0,n1))
+    used to leave rows 0..3's counters at "done", so (k0,n1) silently
+    skipped accumulating into them.
+    """
+    K = ARRAY_ROWS + 4              # 2 output-row blocks, second partial
+    N = 2 * ARRAY_COLS              # 2 contraction bands
+    M = ARRAY_ROWS + 2              # not a multiple of BYTES_PER_WORD
+
+    assert M % BYTES_PER_WORD != 0 and N // ARRAY_COLS > 1
+    num_k_blocks = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
+    assert num_k_blocks * M <= (1 << OBUF_BANK_ADDR_WIDTH)
+
+    rng = np.random.default_rng(23)
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=MULTIBLOCK_WATCHDOG_CYCLES))
+    await reset_dut(dut)
+
+    W_real = rng.normal(0.0, REAL_VAL_STD, size=(K, N))
+    X_real = rng.normal(0.0, REAL_VAL_STD, size=(N, M))
+    W_int8, ws = quantize_symmetric_int8(W_real)
+    X_int8, xs = quantize_symmetric_int8(X_real)
+    _, os_ = quantize_symmetric_int8(W_real @ X_real)
+    assert 0.0 <= ws * xs / os_ < 1.0
+    q16 = round(ws * xs / os_ * 65536)
+
+    await program_dims(dut, K, N, M, q16)
+    await write_weights(dut, W_int8)
+    await write_inputs(dut, X_int8)
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    await wait_matmul_done(dut)
+    await ClockCycles(dut.clk, 2)
+
+    # per-contraction-block rescale + saturating accumulate, as in
+    # test_multiblock_matmul
+    golden = None
+    for nb in range(N // ARRAY_COLS):
+        lo, hi = nb * ARRAY_COLS, (nb + 1) * ARRAY_COLS
+        blk = np.clip(((W_int8[:, lo:hi] @ X_int8[lo:hi, :]) * q16) >> 16, -128, 127)
+        golden = blk if golden is None else np.clip(golden + blk, -128, 127)
+
+    mismatches = []
+    for k in range(K):
+        base = OBUF_BASE + ((k % ARRAY_ROWS) << OBUF_BANK_ADDR_WIDTH) + (k // ARRAY_ROWS) * M
+        row = await read_bytes(dut, base, M)
+        for m in range(M):
+            got = to_int8(row[m])
+            if got != int(golden[k, m]):
+                mismatches.append((k, m, int(golden[k, m]), got))
+
+    if mismatches:
+        preview = ", ".join(f"y[{k},{m}]: exp {e}, got {g}" for k, m, e, g in mismatches[:8])
+        raise AssertionError(
+            f"{len(mismatches)}/{K*M} mismatches (K={K} N={N} M={M}). First few: {preview}")
