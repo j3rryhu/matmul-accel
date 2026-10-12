@@ -141,10 +141,10 @@ module ctrl_rf_tb #(
             temp = (1 << IDX);
             value = '0;
 
-            `SW_WRITE( 4, (1 << IDX) )
+            `SW_WRITE( 16, (1 << IDX) )
             #1 `CHECK_EQUAL(WEIGHT_ROWS_value_q, temp[15: 0])
 
-            `SW_WRITE( 4, 0 )
+            `SW_WRITE( 16, 0 )
             #1 `CHECK_EQUAL(WEIGHT_ROWS_value_q, value[15: 0])
 
         end
@@ -158,10 +158,10 @@ module ctrl_rf_tb #(
             temp = (1 << IDX);
             value = '0;
 
-            `SW_WRITE( 8, (1 << IDX) )
+            `SW_WRITE( 32, (1 << IDX) )
             #1 `CHECK_EQUAL(WEIGHT_COLS_value_q, temp[15: 0])
 
-            `SW_WRITE( 8, 0 )
+            `SW_WRITE( 32, 0 )
             #1 `CHECK_EQUAL(WEIGHT_COLS_value_q, value[15: 0])
 
         end
@@ -175,10 +175,10 @@ module ctrl_rf_tb #(
             temp = (1 << IDX);
             value = '0;
 
-            `SW_WRITE( 12, (1 << IDX) )
+            `SW_WRITE( 48, (1 << IDX) )
             #1 `CHECK_EQUAL(INPUT_MAX_ADDR_value_q, temp[ 9: 0])
 
-            `SW_WRITE( 12, 0 )
+            `SW_WRITE( 48, 0 )
             #1 `CHECK_EQUAL(INPUT_MAX_ADDR_value_q, value[ 9: 0])
 
         end
@@ -192,10 +192,10 @@ module ctrl_rf_tb #(
             temp = (1 << IDX);
             value = '0;
 
-            `SW_WRITE( 16, (1 << IDX) )
+            `SW_WRITE( 64, (1 << IDX) )
             #1 `CHECK_EQUAL(INPUT_COLS_value_q, temp[15: 0])
 
-            `SW_WRITE( 16, 0 )
+            `SW_WRITE( 64, 0 )
             #1 `CHECK_EQUAL(INPUT_COLS_value_q, value[15: 0])
 
         end
@@ -205,11 +205,11 @@ module ctrl_rf_tb #(
         for (int IDX = 0; IDX <= 0; ++IDX) begin
 
             `HW_WRITE( STATUS_busy, , (1 << (IDX-0)) )
-            `SW_READ( 20 )
+            `SW_READ( 80 )
             `CHECK_EQUAL(rdata[ 0: 0], (1 << (IDX-0)))
 
             `HW_WRITE( STATUS_busy, , 0 )
-            `SW_READ( 20 )
+            `SW_READ( 80 )
             `CHECK_EQUAL(rdata[ 0: 0], 0)
 
         end
@@ -219,11 +219,11 @@ module ctrl_rf_tb #(
         for (int IDX = 1; IDX <= 1; ++IDX) begin
 
             `HW_WRITE( STATUS_done, , (1 << (IDX-1)) )
-            `SW_READ( 20 )
+            `SW_READ( 80 )
             `CHECK_EQUAL(rdata[ 1: 1], (1 << (IDX-1)))
 
             `HW_WRITE( STATUS_done, , 0 )
-            `SW_READ( 20 )
+            `SW_READ( 80 )
             `CHECK_EQUAL(rdata[ 1: 1], 0)
 
         end
@@ -237,10 +237,10 @@ module ctrl_rf_tb #(
             temp = (1 << IDX);
             value = '0;
 
-            `SW_WRITE( 24, (1 << IDX) )
+            `SW_WRITE( 96, (1 << IDX) )
             #1 `CHECK_EQUAL(OUTPUT_SCALE_value_q, temp[15: 0])
 
-            `SW_WRITE( 24, 0 )
+            `SW_WRITE( 96, 0 )
             #1 `CHECK_EQUAL(OUTPUT_SCALE_value_q, value[15: 0])
 
         end

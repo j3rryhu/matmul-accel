@@ -99,7 +99,9 @@ Access conventions:
 - **Reads may need covering-word arithmetic.** Output segments start at
   `k_blk*M`, which is only word-aligned when `M` is a multiple of 4. To read
   an unaligned run, burst the words that cover it and unpack.
-- **Register file accesses are 32-bit word accesses** at the offsets below.
+- **Each register is its own 128-bit bus word** at the 16-byte-aligned
+  offsets below; its value sits in the low bytes (lanes 0..3), so a write
+  needs `avs_byteenable` bits 0..3 set.
 - `output_buffer` reads have one cycle of latency and assert
   `avs_waitrequest`; `avs_readdatavalid` marks valid beats.
 - **Burst reads are supported** for `CTRL` and `OBUF`: drive
@@ -122,13 +124,13 @@ Defined in [`rdl/ctrl_reg.rdl`](rdl/ctrl_reg.rdl), compiled to
 | Offset | Register | Field | Bits | Access | Description |
 |---|---|---|---|---|---|
 | `0x00` | `CONTROL` | `matmul_start` | `[0]` | W, **self-clearing pulse** | Starts a matmul: latches `WEIGHT_ROWS`/`WEIGHT_COLS` and resets the block position to (0,0). |
-| `0x04` | `WEIGHT_ROWS` | `value` | `[15:0]` | W | `K` - **output rows**. May be any value; a non-multiple of `ARRAY_ROWS` is handled by masking. |
-| `0x08` | `WEIGHT_COLS` | `value` | `[15:0]` | W | `N` - **contraction size**. **Must be a multiple of `ARRAY_COLS`** (see [Known issues](#known-issues)). |
-| `0x0C` | `INPUT_MAX_ADDR` | `value` | `[9:0]` | W | `M` - number of reads issued per input band. Set equal to `INPUT_COLS`. |
-| `0x10` | `INPUT_COLS` | `value` | `[15:0]` | W | `M` - output/activation column count. Becomes `output_loader.total_rows`, the per-bank segment stride. |
-| `0x14` | `STATUS` | `busy` | `[0]` | R | Live level. Compute in progress: `weight_ctrl` sequencing **or** `output_loader` still draining. |
-| `0x14` | `STATUS` | `done` | `[1]` | R, **read-to-clear** | Sticky. Set once per matmul, when every block is committed **and** the last one has drained. Cleared by the read that observes it. |
-| `0x18` | `OUTPUT_SCALE` | `value` | `[15:0]` | W | Q0.16 unsigned rescale factor; actual scale = `value/65536`, range `[0,1)`. |
+| `0x10` | `WEIGHT_ROWS` | `value` | `[15:0]` | W | `K` - **output rows**. May be any value; a non-multiple of `ARRAY_ROWS` is handled by masking. |
+| `0x20` | `WEIGHT_COLS` | `value` | `[15:0]` | W | `N` - **contraction size**. **Must be a multiple of `ARRAY_COLS`** (see [Known issues](#known-issues)). |
+| `0x30` | `INPUT_MAX_ADDR` | `value` | `[9:0]` | W | `M` - number of reads issued per input band. Set equal to `INPUT_COLS`. |
+| `0x40` | `INPUT_COLS` | `value` | `[15:0]` | W | `M` - output/activation column count. Becomes `output_loader.total_rows`, the per-bank segment stride. |
+| `0x50` | `STATUS` | `busy` | `[0]` | R | Live level. Compute in progress: `weight_ctrl` sequencing **or** `output_loader` still draining. |
+| `0x50` | `STATUS` | `done` | `[1]` | R, **read-to-clear** | Sticky. Set once per matmul, when every block is committed **and** the last one has drained. Cleared by the read that observes it. |
+| `0x60` | `OUTPUT_SCALE` | `value` | `[15:0]` | W | Q0.16 unsigned rescale factor; actual scale = `value/65536`, range `[0,1)`. |
 
 The two bits behave differently, and the difference matters:
 

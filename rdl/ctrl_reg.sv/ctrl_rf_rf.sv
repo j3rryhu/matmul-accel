@@ -180,7 +180,7 @@ module ctrl_rf_rf #(
     logic                  WEIGHT_ROWS_sw_rd;
     logic [DATA_WIDTH-1:0] WEIGHT_ROWS_q;
 
-    assign WEIGHT_ROWS_decode = (addr == (ADDR_OFFSET+'h0+'h4));
+    assign WEIGHT_ROWS_decode = (addr == (ADDR_OFFSET+'h0+'h10));
     assign WEIGHT_ROWS_sw_wr = sw_wr && WEIGHT_ROWS_decode;
     assign WEIGHT_ROWS_sw_rd = sw_rd && WEIGHT_ROWS_decode;
 
@@ -222,7 +222,7 @@ module ctrl_rf_rf #(
     logic                  WEIGHT_COLS_sw_rd;
     logic [DATA_WIDTH-1:0] WEIGHT_COLS_q;
 
-    assign WEIGHT_COLS_decode = (addr == (ADDR_OFFSET+'h0+'h8));
+    assign WEIGHT_COLS_decode = (addr == (ADDR_OFFSET+'h0+'h20));
     assign WEIGHT_COLS_sw_wr = sw_wr && WEIGHT_COLS_decode;
     assign WEIGHT_COLS_sw_rd = sw_rd && WEIGHT_COLS_decode;
 
@@ -264,7 +264,7 @@ module ctrl_rf_rf #(
     logic                  INPUT_MAX_ADDR_sw_rd;
     logic [DATA_WIDTH-1:0] INPUT_MAX_ADDR_q;
 
-    assign INPUT_MAX_ADDR_decode = (addr == (ADDR_OFFSET+'h0+'hc));
+    assign INPUT_MAX_ADDR_decode = (addr == (ADDR_OFFSET+'h0+'h30));
     assign INPUT_MAX_ADDR_sw_wr = sw_wr && INPUT_MAX_ADDR_decode;
     assign INPUT_MAX_ADDR_sw_rd = sw_rd && INPUT_MAX_ADDR_decode;
 
@@ -306,7 +306,7 @@ module ctrl_rf_rf #(
     logic                  INPUT_COLS_sw_rd;
     logic [DATA_WIDTH-1:0] INPUT_COLS_q;
 
-    assign INPUT_COLS_decode = (addr == (ADDR_OFFSET+'h0+'h10));
+    assign INPUT_COLS_decode = (addr == (ADDR_OFFSET+'h0+'h40));
     assign INPUT_COLS_sw_wr = sw_wr && INPUT_COLS_decode;
     assign INPUT_COLS_sw_rd = sw_rd && INPUT_COLS_decode;
 
@@ -349,7 +349,7 @@ module ctrl_rf_rf #(
     logic                  STATUS_sw_rd;
     logic [DATA_WIDTH-1:0] STATUS_q;
 
-    assign STATUS_decode = (addr == (ADDR_OFFSET+'h0+'h14));
+    assign STATUS_decode = (addr == (ADDR_OFFSET+'h0+'h50));
     assign STATUS_sw_wr = sw_wr && STATUS_decode;
     assign STATUS_sw_rd = sw_rd && STATUS_decode;
 
@@ -393,6 +393,9 @@ module ctrl_rf_rf #(
             STATUS_done_q <= STATUS_done_next;
         end
         // Software read
+        // NB hand edit, re-apply after regenerating: `else` so a hardware
+        // set on the same cycle as a read-to-clear wins and the done event
+        // isn't lost (PeakRDL emits a plain `if`, letting the clear win)
         else if (STATUS_sw_rd) begin
             STATUS_done_q <= '0;
         end
@@ -408,7 +411,7 @@ module ctrl_rf_rf #(
     logic                  OUTPUT_SCALE_sw_rd;
     logic [DATA_WIDTH-1:0] OUTPUT_SCALE_q;
 
-    assign OUTPUT_SCALE_decode = (addr == (ADDR_OFFSET+'h0+'h18));
+    assign OUTPUT_SCALE_decode = (addr == (ADDR_OFFSET+'h0+'h60));
     assign OUTPUT_SCALE_sw_wr = sw_wr && OUTPUT_SCALE_decode;
     assign OUTPUT_SCALE_sw_rd = sw_rd && OUTPUT_SCALE_decode;
 

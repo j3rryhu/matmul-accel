@@ -102,10 +102,10 @@ int main(int argc, char** argv) {
         temp = (1 << IDX);
         value = 0;
 
-        SW_WRITE( 4, (1 << IDX) )
+        SW_WRITE( 16, (1 << IDX) )
         CHECK_EQUAL(top->WEIGHT_ROWS_value_q, RANGE(temp, 16, 0))
 
-        SW_WRITE( 4, 0 )
+        SW_WRITE( 16, 0 )
         CHECK_EQUAL(top->WEIGHT_ROWS_value_q, RANGE(value, 16, 0))
 
     }
@@ -120,10 +120,10 @@ int main(int argc, char** argv) {
         temp = (1 << IDX);
         value = 0;
 
-        SW_WRITE( 8, (1 << IDX) )
+        SW_WRITE( 32, (1 << IDX) )
         CHECK_EQUAL(top->WEIGHT_COLS_value_q, RANGE(temp, 16, 0))
 
-        SW_WRITE( 8, 0 )
+        SW_WRITE( 32, 0 )
         CHECK_EQUAL(top->WEIGHT_COLS_value_q, RANGE(value, 16, 0))
 
     }
@@ -138,10 +138,10 @@ int main(int argc, char** argv) {
         temp = (1 << IDX);
         value = 0;
 
-        SW_WRITE( 12, (1 << IDX) )
+        SW_WRITE( 48, (1 << IDX) )
         CHECK_EQUAL(top->INPUT_MAX_ADDR_value_q, RANGE(temp, 10, 0))
 
-        SW_WRITE( 12, 0 )
+        SW_WRITE( 48, 0 )
         CHECK_EQUAL(top->INPUT_MAX_ADDR_value_q, RANGE(value, 10, 0))
 
     }
@@ -156,10 +156,10 @@ int main(int argc, char** argv) {
         temp = (1 << IDX);
         value = 0;
 
-        SW_WRITE( 16, (1 << IDX) )
+        SW_WRITE( 64, (1 << IDX) )
         CHECK_EQUAL(top->INPUT_COLS_value_q, RANGE(temp, 16, 0))
 
-        SW_WRITE( 16, 0 )
+        SW_WRITE( 64, 0 )
         CHECK_EQUAL(top->INPUT_COLS_value_q, RANGE(value, 16, 0))
 
     }
@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
         top->ctrl_rf_rf__DOT__STATUS_busy_q = (1 << (IDX-0));
         HW_WRITE( STATUS_busy, , (1 << (IDX-0)) )
         cycle(top);
-        SW_READ( 20 )
+        SW_READ( 80 )
         CHECK_EQUAL(RANGE(rdata, 1, 0), (1 << (IDX-0)))
     }
     cycle(top);
@@ -202,7 +202,7 @@ int main(int argc, char** argv) {
         top->ctrl_rf_rf__DOT__STATUS_done_q = (1 << (IDX-1));
         HW_WRITE( STATUS_done, , (1 << (IDX-1)) )
         cycle(top);
-        SW_READ( 20 )
+        SW_READ( 80 )
         CHECK_EQUAL(RANGE(rdata, 1, 1), (1 << (IDX-1)))
     }
     cycle(top);
@@ -216,10 +216,10 @@ int main(int argc, char** argv) {
         temp = (1 << IDX);
         value = 0;
 
-        SW_WRITE( 24, (1 << IDX) )
+        SW_WRITE( 96, (1 << IDX) )
         CHECK_EQUAL(top->OUTPUT_SCALE_value_q, RANGE(temp, 16, 0))
 
-        SW_WRITE( 24, 0 )
+        SW_WRITE( 96, 0 )
         CHECK_EQUAL(top->OUTPUT_SCALE_value_q, RANGE(value, 16, 0))
 
     }

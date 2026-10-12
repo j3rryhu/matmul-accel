@@ -1,4 +1,11 @@
 addrmap ctrl_rf {
+    // Register stride: every register sits at its own 16-byte (128-bit)
+    // aligned address, matching accel_top's 128-bit Avalon data bus. A
+    // 128-bit master only ever presents word-aligned addresses (byte lanes
+    // are picked with byteenable), so registers packed 4 bytes apart could
+    // not be addressed individually. Each register's value is in the low
+    // bits of its word (byte lanes 0..3). Offsets are pinned with @ below.
+    //
     // Control Register (0x00) - single sw-pulsed start bit. The rest of the
     // weight/input control sequencing (weight block prefetch, input preload,
     // compute start) is still TODO - it'll be driven some other way, not
@@ -13,9 +20,9 @@ addrmap ctrl_rf {
                                 // WEIGHT_COLS and reset weight_ctrl's block
                                 // position to (0,0)
 
-    } CONTROL;
+    } CONTROL @ 0x00;
 
-    // Weight matrix dimensions (0x04/0x08). weight_buffer can hold more than
+    // Weight matrix dimensions (0x10/0x20). weight_buffer can hold more than
     // one 32x32 tile's worth of weights; these describe the full extent so
     // future multi-tile loads know how many tiles to prefetch.
     //
@@ -35,7 +42,7 @@ addrmap ctrl_rf {
             hw = r;
             reset = 0;
         } value [15:0];   // contraction (reduction) dimension size
-    } WEIGHT_ROWS;
+    } WEIGHT_ROWS @ 0x10;
 
     reg {
         field {
@@ -43,9 +50,9 @@ addrmap ctrl_rf {
             hw = r;
             reset = 0;
         } value [15:0];   // output dimension size
-    } WEIGHT_COLS;
+    } WEIGHT_COLS @ 0x20;
 
-    // Input dimensions (0x0C/0x10). No separate row-count register: the
+    // Input dimensions (0x30/0x40). No separate row-count register: the
     // valid row range for the block currently in the array is derived by
     // weight_ctrl from WEIGHT_ROWS and the current block position, since
     // weight rows (K) and activation rows share the same array-row extent.
@@ -55,7 +62,7 @@ addrmap ctrl_rf {
             hw = r;
             reset = 0;
         } value [9:0];    // max input_buffer read address (input_dispatch i_max_addr)
-    } INPUT_MAX_ADDR;
+    } INPUT_MAX_ADDR @ 0x30;
 
     reg {
         field {
@@ -63,9 +70,9 @@ addrmap ctrl_rf {
             hw = r;
             reset = 0;
         } value [15:0];   // number of columns of the input (activation) matrix
-    } INPUT_COLS;
+    } INPUT_COLS @ 0x40;
 
-    // Status Register (0x14)
+    // Status Register (0x50)
     reg {
         field {
             sw = r;
@@ -79,9 +86,9 @@ addrmap ctrl_rf {
             rclr = true;
         } done;               // whole matmul finished: all blocks committed and drained
 
-    } STATUS;
+    } STATUS @ 0x50;
 
-    // Output rescale factor (0x18). Q0.16 fixed point: unsigned, 0 integer
+    // Output rescale factor (0x60). Q0.16 fixed point: unsigned, 0 integer
     // bits + 16 fractional bits, representable range [0, 1) - value/65536
     // is the actual scale. Meant to rescale pe_array's 32-bit accumulator
     // (see pe.v's ACC_WIDTH) back down to int8 under the quantization
@@ -93,5 +100,5 @@ addrmap ctrl_rf {
             hw = r;
             reset = 0;
         } value [15:0];
-    } OUTPUT_SCALE;
+    } OUTPUT_SCALE @ 0x60;
 };
