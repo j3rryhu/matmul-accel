@@ -55,26 +55,39 @@ module accel_top #(
     // ============================================================
     localparam logic [31:0] CTRL_BASE = 32'h0000_0000, CTRL_SIZE = 32'h0000_0100;
     localparam logic [31:0] WBUF_BASE = 32'h0000_1000, WBUF_SIZE = 32'h0000_4000; // weight_buffer (banked), 14-bit addr
-    localparam logic [31:0] IBUF_BASE = 32'h0000_5000, IBUF_SIZE = 32'h0000_2000; // input_buffer,  13-bit addr
-    localparam logic [31:0] OBUF_BASE = 32'h0000_7000, OBUF_SIZE = 32'h0000_1000; // output_buffer, 12-bit addr
+    localparam logic [31:0] IBUF_BASE = 32'h0000_5000, IBUF_SIZE = 32'h0000_4000; // input_buffer (banked),  14-bit addr
+    localparam logic [31:0] OBUF_BASE = 32'h0000_9000, OBUF_SIZE = 32'h0000_4000; // output_buffer (banked), 14-bit addr
 
     // ---- buffer geometry ----
     // Per-bank depths are fixed by the generated RAM IP; the bank *count*
     // follows the array, so the flat (software-visible) address width of
-    // each banked buffer scales with ARRAY_ROWS/ARRAY_COLS. The byte map
-    // above is deliberately left at its original sizes so the software ABI
-    // doesn't move when the array is resized - a smaller array simply
-    // leaves the top of each window unused (at 16 banks: IBUF uses 4KB of
-    // its 8KB window, OBUF 2KB of its 4KB). WBUF is the exception: its 1KB
-    // banks fill the whole 16KB window at 16 rows (the capacity the flat
-    // weight_buffer had), so a 32-row array needs a 512-entry weight_buffer
-    // IP or a bigger WBUF window.
+    // each banked buffer scales with ARRAY_ROWS/ARRAY_COLS. All three
+    // buffers use 1KB banks, which at 16 banks fill each 16KB window
+    // exactly - enough for a 128x128 W times a 128x128 X (8 output-row
+    // blocks x 128 columns per output bank, 8 contraction bands x 128
+    // columns per input bank, 8 rows of 128 weights per weight bank).
+    // Growing a depth or the array means growing the matching *_SIZE
+    // window above (the check below catches a window that is too small).
     localparam int WBUF_BANK_ADDR_WIDTH = 10;  // weight_buffer IP depth = 1024 entries/bank
-    localparam int IBUF_BANK_ADDR_WIDTH = 8;   // input_buffer IP depth  = 256 entries/bank
-    localparam int OBUF_BANK_ADDR_WIDTH = 7;   // output_buffer IP depth = 128 entries/bank
+    localparam int IBUF_BANK_ADDR_WIDTH = 10;  // input_buffer IP depth  = 1024 entries/bank
+    localparam int OBUF_BANK_ADDR_WIDTH = 10;  // output_buffer IP depth = 1024 entries/bank
     localparam int WBUF_ADDR_WIDTH      = $clog2(ARRAY_ROWS) + WBUF_BANK_ADDR_WIDTH;
     localparam int IBUF_ADDR_WIDTH      = $clog2(ARRAY_ROWS) + IBUF_BANK_ADDR_WIDTH;
     localparam int OBUF_ADDR_WIDTH      = $clog2(ARRAY_COLS) + OBUF_BANK_ADDR_WIDTH;
+
+    // Each window must cover every bank, or the top banks are unreachable
+    // from the host. Elaboration-time check; fails the build, not the sim.
+    generate
+        if ((1 << WBUF_ADDR_WIDTH) > WBUF_SIZE) begin : g_wbuf_window_too_small
+            WBUF_SIZE_smaller_than_weight_buffer u_err();
+        end
+        if ((1 << IBUF_ADDR_WIDTH) > IBUF_SIZE) begin : g_ibuf_window_too_small
+            IBUF_SIZE_smaller_than_input_buffer u_err();
+        end
+        if ((1 << OBUF_ADDR_WIDTH) > OBUF_SIZE) begin : g_obuf_window_too_small
+            OBUF_SIZE_smaller_than_output_buffer u_err();
+        end
+    endgenerate
 
     // The buffers' Avalon-facing ports are AVS_DATA_WIDTH wide, so a host
     // access moves BYTES_PER_WORD bytes and the byte address advances by
@@ -101,7 +114,8 @@ module accel_top #(
 
     logic [10:0] burst_cnt_buf;
     logic [AVS_ADDR_WIDTH-1:0] addr_buf;
-    assign avs_readdatavalid = rf_data_valid || obuf_data_valid;
+    wire  read_valid;
+    assign read_valid = rf_data_valid || obuf_data_valid;
     assign avs_waitrequest = (avs_read && !accepted) || burst_busy;
 
     // An Avalon master holds write/address/writedata stable until
@@ -126,8 +140,18 @@ module accel_top #(
             sel_ctrl_r <= 0;
             sel_obuf_r <= 0;
             rd_burst_on <= 0;
+            avs_readdatavalid <= 0;
+            avs_readdata <= 0;
         end
         else begin
+            // Avalon forbids readdatavalid in the cycle a read is accepted
+            // (at least one cycle of latency), so every beat leaves through
+            // these registers one cycle after read_valid/read_data. They
+            // update every cycle, not only while rd_burst_on is set -
+            // otherwise the last beat's valid stays high after the burst.
+            avs_readdatavalid <= read_valid;
+            avs_readdata      <= read_data;
+
             if(avs_read && !rd_burst_on)begin
                 addr_buf <= avs_address + BYTES_PER_WORD;
                 accepted <= 1;
@@ -449,7 +473,8 @@ module accel_top #(
     // Avalon read mux / waitrequest
     // ============================================================
     // assign avs_waitrequest = avs_read && sel_obuf && !obuf_rd_pending;
-    assign avs_readdata    = obuf_rd_pending ? obuf_ext_q : (((sel_ctrl && avs_read) || (rd_burst_on && sel_ctrl_r)) ? ctrl_rdata : 32'h0);
+    wire [AVS_DATA_WIDTH-1:0] read_data;
+    assign read_data    = obuf_rd_pending ? obuf_ext_q : (((sel_ctrl && avs_read) || (rd_burst_on && sel_ctrl_r)) ? ctrl_rdata : 32'h0);
 
     // ============================================================
     // input_dispatch - streams input_buffer into the array's left edge,

@@ -31,7 +31,7 @@
 module output_buffer_32_bank #(
     parameter DATA_WIDTH      = 8,   // int8 - output_loader rescales pe_array's ACC_WIDTH accumulator down to this before writing (see output_loader.v)
     parameter NUM_BANKS       = 16,
-    parameter BANK_ADDR_WIDTH = 7,    // per-bank WRITE (byte) address width - match the generated output_buffer IP's depth
+    parameter BANK_ADDR_WIDTH = 10,   // per-bank WRITE (byte) address width - match the generated output_buffer IP's depth (1024)
     parameter RD_DATA_WIDTH   = 32,   // Avalon-side read width
     // per-bank READ (word) address width: the same region addressed in
     // RD_DATA_WIDTH/DATA_WIDTH-sized words instead of bytes

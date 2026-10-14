@@ -78,27 +78,29 @@ address drives that region's RAM or register file directly.
 | Region | Base | Size | Access | Contents |
 |---|---|---|---|---|
 | `CTRL_BASE` | `0x0000_0000` | `0x100` | R/W, 32-bit words | Control/status register file (`ctrl_rf`) |
-| `WBUF_BASE` | `0x0000_1000` | `0x4000` (16 KB) | **write-only**, byte | `weight_buffer` |
-| `IBUF_BASE` | `0x0000_5000` | `0x2000` (8 KB) | **write-only**, byte | `input_buffer` (banked) |
-| `OBUF_BASE` | `0x0000_7000` | `0x1000` (4 KB) | **read-only**, byte | `output_buffer` (banked) |
+| `WBUF_BASE` | `0x0000_1000` | `0x4000` (16 KB) | **write-only**, byte | `weight_buffer` (banked) |
+| `IBUF_BASE` | `0x0000_5000` | `0x4000` (16 KB) | **write-only**, byte | `input_buffer` (banked) |
+| `OBUF_BASE` | `0x0000_9000` | `0x4000` (16 KB) | **read-only**, byte | `output_buffer` (banked) |
+
+The whole map spans `0x0000_0000`-`0x0000_CFFF`, so the slave needs at
+least a 16-bit byte address. `OBUF_BASE` moved from `0x7000` to `0x9000`
+when `IBUF` grew to 16 KB.
 
 Access conventions:
 
-- **All buffer accesses are full 32-bit words.** The buffers are
-  *mixed-width*: the host-facing port is `AVS_DATA_WIDTH` wide, the
-  core-facing port stays byte-wide. So one access moves 4 bytes and the byte
-  address advances by **4**, not 1. `avs_byteenable` is **not** honoured for
-  buffer accesses - there is no byte-granular write.
-- **Byte order is little-endian within a word**: byte address `4n+j` sits at
-  `avs_writedata[8*j +: 8]`, matching Avalon byte lanes.
-- **Write whole contiguous images.** Because a write commits all 4 bytes,
-  writing a region whose length is not a multiple of 4 will clobber the
-  bytes following it. Build the full byte image for a region (the entire
-  weight matrix, or one input bank across *all* of its bands) and write it
-  as a run of words.
+- **All buffer accesses are full 128-bit words.** The buffers are
+  *mixed-width*: the host-facing port is `AVS_DATA_WIDTH` (128) wide, the
+  core-facing port stays byte-wide. So one access moves 16 bytes and the
+  byte address advances by **16**, not 1. `avs_byteenable` is **not**
+  honoured for buffer accesses - there is no byte-granular write.
+- **Byte order is little-endian within a word**: byte address `16n+j` sits
+  at `avs_writedata[8*j +: 8]`, matching Avalon byte lanes.
+- **Write whole contiguous images.** Write `W` and `X` each as one
+  row-major image with every row zero-padded to a multiple of 16 bytes (see
+  [Buffer layouts](#buffer-layouts)); hardware scatters the rows to banks.
 - **Reads may need covering-word arithmetic.** Output segments start at
-  `k_blk*M`, which is only word-aligned when `M` is a multiple of 4. To read
-  an unaligned run, burst the words that cover it and unpack.
+  `k_blk*M`, which is only word-aligned when `M` is a multiple of 16. To
+  read an unaligned run, burst the words that cover it and unpack.
 - **Each register is its own 128-bit bus word** at the 16-byte-aligned
   offsets below; its value sits in the low bytes (lanes 0..3), so a write
   needs `avs_byteenable` bits 0..3 set.
@@ -108,10 +110,10 @@ Access conventions:
   `avs_burstcount`, hold `avs_read` until `avs_waitrequest` drops (that
   accepting cycle already carries the first beat), then take one beat per
   `avs_readdatavalid` pulse, address auto-incrementing.
-- At 16x16 only the lower half of the `IBUF` window (16 banks x 256 B = 4 KB)
-  and the lower half of the `OBUF` window (16 x 128 B = 2 KB) are in use. The
-  byte map is deliberately held fixed across array resizes so the software
-  ABI does not move.
+- At 16x16 every buffer is 16 banks x 1 KB, which fills its 16 KB window
+  exactly. Growing a bank depth or the array means growing the matching
+  window in `rtl/accel_top.sv`; elaboration fails if a window is too small
+  to reach every bank.
 
 ---
 
@@ -217,28 +219,24 @@ step 4, because `matmul_start` latches the dimension registers.
 ## Buffer layouts
 
 `ARRAY_ROWS`/`ARRAY_COLS` below are the array dimensions (16), and
-`IBUF_BANK_DEPTH` = 256, `OBUF_BANK_DEPTH` = 128 are the per-bank RAM depths.
+`OBUF_BANK_DEPTH` = 1024 is the per-bank output RAM depth. All three
+buffers have 1024-byte banks. `pitch(c) = roundup(c, 16)` is a row padded
+to whole 128-bit words.
 
-### `weight_buffer` - flat, row-major
+### `weight_buffer` and `input_buffer` - contiguous padded images
 
-`W` is stored exactly as written on paper, row-major with stride `N`:
-
-```
-addr(k, n) = WBUF_BASE + k*N + n            k in [0,K), n in [0,N)
-```
-
-### `input_buffer` - banked by contraction index
-
-One bank per PE column. Contraction index `p` goes to bank `p % ARRAY_COLS`;
-when `N` spans several contraction blocks, block `p / ARRAY_COLS` occupies an
-`M`-sized band appended within that same bank:
+Software writes each matrix as one row-major image, rows padded to whole
+words. `W` is stored exactly as written on paper, with no transpose:
 
 ```
-addr(p, m) = IBUF_BASE
-           + (p % ARRAY_COLS) * IBUF_BANK_DEPTH     # bank select
-           + (p / ARRAY_COLS) * M                   # contraction-block band
-           + m                                      # column within the band
+addr(k, n) = WBUF_BASE + k*pitch(N) + n     k in [0,K), n in [0,N)
+addr(p, m) = IBUF_BASE + p*pitch(M) + m     p in [0,N), m in [0,M)
 ```
+
+[`rtl/buf_addr_remap.v`](rtl/buf_addr_remap.v) scatters row `r` to bank
+`r % 16`, at offset `(r / 16) * pitch` within the bank. It uses the live
+`WEIGHT_COLS` and `INPUT_MAX_ADDR` values, so program those registers
+**before** writing either buffer.
 
 ### `output_buffer` - banked by output row
 
@@ -268,13 +266,14 @@ programming a matmul:
 
 | Constraint | Bound |
 |---|---|
-| `K * N <= 16384` | weight_buffer total |
-| `ceil(N / ARRAY_COLS) * M <= 256` | input_buffer per-bank depth |
-| `ceil(K / ARRAY_ROWS) * M <= 128` | output_buffer per-bank depth |
+| `ceil(K / ARRAY_ROWS) * pitch(N) <= 1024` | weight_buffer per-bank depth |
+| `ceil(N / ARRAY_COLS) * pitch(M) <= 1024` | input_buffer per-bank depth |
+| `ceil(K / ARRAY_ROWS) * M <= 1024` | output_buffer per-bank depth |
+| `M <= 1023` | `INPUT_MAX_ADDR` is a 10-bit field |
 
-The output_buffer bound is the tightest in practice: it caps
-`num_output_blocks * M`, so large `K` and large `M` trade off against each
-other.
+`K = N = M = 128` fills all three buffers exactly
+(`test_128x128x128_matmul`). Beyond that the bounds trade off against each
+other: larger `K` or `N` needs a smaller `M`, and vice versa.
 
 ---
 
@@ -333,38 +332,41 @@ simulation-only behavioral stand-ins with matching names and ports.
 
 All three are **mixed-width simple dual-port** RAMs - independent
 `rdaddress`/`wraddress`, each with its own `rden`/`wren`, one cycle of
-registered read latency - with the host-facing port 32 bits wide and the
-core-facing port byte wide:
+registered read latency - with the host-facing port 128 bits wide and the
+core-facing port byte wide. Port shapes below are per bank:
 
 | Buffer | Instances | Host port (Avalon) | Core port | Total | AVS region |
 |---|---|---|---|---|---|
-| `weight_buffer` | 1 | **write** 4096 x 32, 12-bit | read 16384 x 8, 14-bit (`weight_loader`) | 16 KB | `WBUF_SIZE = 0x4000` |
-| `input_buffer` | `ARRAY_ROWS` (16) | **write** 64 x 32, 6-bit | read 256 x 8, 8-bit (`input_dispatch`) | 4 KB used of 8 KB | `IBUF_SIZE = 0x2000` |
-| `output_buffer` | `ARRAY_COLS` (16) | **read** 32 x 32, 5-bit | write 128 x 8, 7-bit (`output_loader`) | 2 KB used of 4 KB | `OBUF_SIZE = 0x1000` |
+| `weight_buffer` | `ARRAY_ROWS` (16) | **write** 64 x 128, 6-bit | read 1024 x 8, 10-bit (`weight_loader`) | 16 KB | `WBUF_SIZE = 0x4000` |
+| `input_buffer` | `ARRAY_ROWS` (16) | **write** 64 x 128, 6-bit | read 1024 x 8, 10-bit (`input_dispatch`) | 16 KB | `IBUF_SIZE = 0x4000` |
+| `output_buffer` | `ARRAY_COLS` (16) | **read** 64 x 128, 6-bit | write 1024 x 8, 10-bit (`output_loader`) | 16 KB | `OBUF_SIZE = 0x4000` |
+
+> The `input_buffer` and `output_buffer` IPs grew from 256 B and 128 B per
+> bank to 1024 B. Regenerate both On-Chip Memory IPs at the depths above
+> before building in Quartus.
 
 The core side stays byte-wide because `weight_loader` and `input_dispatch`
 consume one byte per cycle and `output_loader` produces one byte per cycle.
 Configure each generated On-Chip Memory with these two port widths; byte
-ordering must be little-endian (narrow address `4n+j` = wide bit `8*j`),
+ordering must be little-endian (narrow address `16n+j` = wide bit `8*j`),
 which is altsyncram's default.
 
 > `output_buffer`'s single read port is shared - `output_loader`'s
 > read-modify-write and the Avalon host both use it, muxed by `busy`. Since
-> that port is now 32 bits, `output_loader` reads the *word* containing its
+> that port is 128 bits, `output_loader` reads the *word* containing its
 > byte and selects the lane with the delayed address; its write-back still
 > goes through the byte-wide write port.
 
 Notes:
 
 - The banked wrappers' flat addresses are derived, not hardcoded:
-  `IBUF_ADDR_WIDTH = $clog2(ARRAY_ROWS) + 8` (12 bits at 16 banks) and
-  `OBUF_ADDR_WIDTH = $clog2(ARRAY_COLS) + 7` (11 bits), split as bank-select
-  in the upper bits and per-bank offset in the lower.
+  `*_ADDR_WIDTH = $clog2(16) + 10` (14 bits at 16 banks), split as
+  bank-select in the upper bits and per-bank offset in the lower.
 - The `_32_bank` in `input_buffer_32_bank` / `output_buffer_32_bank` is
   historical; both are fully parameterized on bank count.
-- `output_buffer_32_bank`'s `BANK_ADDR_WIDTH` module default is **not** the
-  value in use - `accel_top` overrides it to 7. Size the generated IP from
-  the override.
+- `accel_top` overrides every wrapper's `BANK_ADDR_WIDTH`. Size the
+  generated IPs from the `*_BANK_ADDR_WIDTH` localparams there, not from
+  the module defaults.
 - Regenerating any IP at a different depth means updating the matching
   `*_SIZE` / `*_BANK_ADDR_WIDTH` localparams in `rtl/accel_top.sv`.
 
@@ -393,6 +395,7 @@ make clean
 | `test_multiblock_matmul` | 2x2 blocks - multi-contraction-block accumulation and multi-output-block addressing |
 | `test_partial_row_block_matmul` | Partial last **output-row** block (`K` not a multiple of `ARRAY_ROWS`): `valid_row` masking, `weight_loader` zero-padding, `output_loader` row gating |
 | `test_back_to_back_matmul_no_reset` | Two matmuls with no reset between - regression test for stale `STATUS.done`/`busy` |
+| `test_128x128x128_matmul` | `W` (128x128) @ `X` (128x128): 64 blocks, fills every buffer bank to its full 1 KB, and is the only test with `M` larger than the 32-entry input FIFOs. Reads the result back in one 2047-beat burst, the 11-bit `avs_burstcount` maximum, which runs past the 1024-word output window and wraps to its start. Logs cycles from `matmul_start` to `STATUS.done`. Takes about a minute in Icarus. |
 
 Test dimensions derive from `ARRAY_ROWS`/`ARRAY_COLS` (top of
 `tb/test_accel_top.py`, which must match `accel_top.sv`), so the suite

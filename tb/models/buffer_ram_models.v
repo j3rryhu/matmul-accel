@@ -3,8 +3,8 @@
 // (weight_buffer, input_buffer, output_buffer).
 //
 // All three are MIXED-WIDTH simple dual-port RAMs: the Avalon-facing port is
-// AVS_DATA_WIDTH (32) wide so a host access moves a full word and the byte
-// address advances by 4, while the core-facing port stays byte-wide because
+// AVS_DATA_WIDTH (128) wide so a host access moves a full word and the byte
+// address advances by 16, while the core-facing port stays byte-wide because
 // weight_loader/input_dispatch read one byte per cycle and output_loader
 // writes one byte per cycle.
 //
@@ -14,7 +14,7 @@
 //
 // Byte ordering matches Altera's mixed-width altsyncram convention (and
 // Avalon byte lanes): narrow element i of a wide word sits at bit
-// [i*NARROW_WIDTH +: NARROW_WIDTH], so narrow address 4n+0 is the wide
+// [i*NARROW_WIDTH +: NARROW_WIDTH], so narrow address 16n+0 is the wide
 // word's least significant byte.
 //
 // These are NOT meant for synthesis. Swap this file out of the compile
@@ -102,22 +102,22 @@ module weight_buffer (
     );
 endmodule
 
-// input_buffer: one bank of input_buffer_32_bank, 256 bytes. Avalon writes
-// 128-bit words (16 x 128, 4-bit word address); input_dispatch reads bytes
-// (256 x 8, 8-bit).
+// input_buffer: one bank of input_buffer_32_bank, 1024 bytes. Avalon writes
+// 128-bit words (64 x 128, 6-bit word address); input_dispatch reads bytes
+// (1024 x 8, 10-bit).
 module input_buffer (
     input         clock,
     input  [127:0] data,
-    input  [ 7:0] rdaddress,
+    input  [ 9:0] rdaddress,
     input         rden,
-    input  [ 3:0] wraddress,
+    input  [ 5:0] wraddress,
     input         wren,
     output [ 7:0] q
 );
     mixed_ram_wr_wide #(
         .NARROW_WIDTH (8),
         .WIDE_WIDTH   (128),
-        .NARROW_DEPTH (256)
+        .NARROW_DEPTH (1024)
     ) u_ram (
         .clock (clock), .data (data),
         .rdaddress (rdaddress), .rden (rden),
@@ -125,22 +125,22 @@ module input_buffer (
     );
 endmodule
 
-// output_buffer: one bank of output_buffer_32_bank, 128 bytes.
-// output_loader writes bytes (128 x 8, 7-bit); Avalon reads 32-bit words
-// (32 x 32, 5-bit word address).
+// output_buffer: one bank of output_buffer_32_bank, 1024 bytes.
+// output_loader writes bytes (1024 x 8, 10-bit); Avalon reads 128-bit words
+// (64 x 128, 6-bit word address).
 module output_buffer (
     input         clock,
     input  [ 7:0] data,
-    input  [ 2:0] rdaddress,
+    input  [ 5:0] rdaddress,
     input         rden,
-    input  [ 6:0] wraddress,
+    input  [ 9:0] wraddress,
     input         wren,
     output [127:0] q
 );
     mixed_ram_rd_wide #(
         .NARROW_WIDTH (8),
         .WIDE_WIDTH   (128),
-        .NARROW_DEPTH (128)
+        .NARROW_DEPTH (1024)
     ) u_ram (
         .clock (clock), .data (data),
         .rdaddress (rdaddress), .rden (rden),

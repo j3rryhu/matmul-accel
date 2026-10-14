@@ -24,7 +24,7 @@
 module input_buffer_32_bank #(
     parameter ARRAY_ROWS      = 16,
     parameter DATA_WIDTH      = 8,   // int8 activation entries
-    parameter BANK_ADDR_WIDTH = 8,   // per-bank READ (byte) address width - match the generated input_buffer IP's depth (256)
+    parameter BANK_ADDR_WIDTH = 10,  // per-bank READ (byte) address width - match the generated input_buffer IP's depth (1024)
     parameter WR_DATA_WIDTH   = 32,  // Avalon-side write width
     parameter BANK_SEL_WIDTH  = $clog2(ARRAY_ROWS),
     // per-bank WRITE (word) address width: the same region addressed in

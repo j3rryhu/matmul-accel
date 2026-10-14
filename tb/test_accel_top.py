@@ -57,7 +57,7 @@ from cocotb.triggers import RisingEdge, FallingEdge, ClockCycles
 CTRL_BASE = 0x0000
 WBUF_BASE = 0x1000
 IBUF_BASE = 0x5000
-OBUF_BASE = 0x7000
+OBUF_BASE = 0x9000
 
 # one register per 128-bit bus word (16-byte stride, value in byte lanes
 # 0..3) - see rdl/ctrl_reg.rdl
@@ -89,9 +89,9 @@ M = ARRAY_ROWS   # input/output column count (INPUT_COLS == INPUT_MAX_ADDR here)
 # either matrix to be degenerate (all-zero, etc).
 REAL_VAL_STD = 1.0
 
-OBUF_BANK_ADDR_WIDTH = 7  # must match accel_top.sv's OBUF_BANK_ADDR_WIDTH
-IBUF_BANK_ADDR_WIDTH = 8  # must match input_buffer_32_bank.v's per-bank address width
-WBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's WBUF_BANK_ADDR_WIDTH
+OBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's OBUF_BANK_ADDR_WIDTH (1024 B/bank)
+IBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's IBUF_BANK_ADDR_WIDTH (1024 B/bank)
+WBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's WBUF_BANK_ADDR_WIDTH (1024 B/bank)
 
 # Avalon data port width in bytes: the buffers' host-facing ports are this
 # wide, so every host access moves a whole word and byte addresses advance
@@ -156,8 +156,36 @@ async def avalon_write(dut, addr, data, byteenable=0xF):
     dut.avs_byteenable.value = 0xF
 
 
+# Cycles a read may go without a readdatavalid beat before the testbench
+# calls it a hang. A pipelined master has no timeout - it waits forever.
+READ_RESPONSE_LIMIT = 64
+
+
+async def collect_read_beats(dut, count, decode_data=True):
+    """Call right after a read is accepted. Collects `count` beats, one per
+    cycle with avs_readdatavalid high, the way a pipelined Avalon master
+    does. Never samples the acceptance cycle itself: Avalon requires at
+    least one cycle of latency between acceptance and readdatavalid."""
+    data = []
+    idle = 0
+    while len(data) < count:
+        await RisingEdge(dut.clk)
+        if int(dut.avs_readdatavalid.value):
+            data.append(int(dut.avs_readdata.value) if decode_data else None)
+            idle = 0
+        else:
+            idle += 1
+            if idle > READ_RESPONSE_LIMIT:
+                raise TimeoutError(
+                    f"read accepted but beat {len(data) + 1} of {count} never got "
+                    f"avs_readdatavalid within {READ_RESPONSE_LIMIT} cycles - a "
+                    f"pipelined master would hang here")
+    return data
+
+
 async def avalon_read(dut, addr, decode_data=True):
-    """Single-word Avalon-MM read.
+    """Single-word Avalon-MM read: hold avs_read until avs_waitrequest
+    drops, then wait for the beat's avs_readdatavalid.
 
     decode_data=False returns None instead of the word, for tests that only
     care about bus timing: the behavioral buffer RAMs come up uninitialized
@@ -170,9 +198,8 @@ async def avalon_read(dut, addr, decode_data=True):
     await RisingEdge(dut.clk)
     while int(dut.avs_waitrequest.value):
         await RisingEdge(dut.clk)
-    data = int(dut.avs_readdata.value) if decode_data else None
     dut.avs_read.value = 0
-    return data
+    return (await collect_read_beats(dut, 1, decode_data))[0]
 
 
 async def write_bytes(dut, byte_addr, values):
@@ -249,10 +276,9 @@ async def avalon_burst_read(dut, addr, count, decode_data=True):
     Acceptance works exactly like avalon_read's single-word case (hold
     avs_read/address/burstcount until avs_waitrequest drops - this also
     self-corrects if a previous transaction's burst FSM hasn't fully gone
-    idle yet), and that same accepting edge already carries the first
-    beat's data. Each subsequent beat then arrives one avs_readdatavalid
-    pulse per cycle, address auto-incrementing, until `count` beats have
-    been collected.
+    idle yet). Every beat, the first included, then arrives on its own
+    avs_readdatavalid pulse from the cycle after acceptance on, address
+    auto-incrementing, until `count` beats have been collected.
 
     decode_data=False returns a list of Nones - see avalon_read."""
     dut.avs_address.value = addr
@@ -264,15 +290,7 @@ async def avalon_burst_read(dut, addr, count, decode_data=True):
         await RisingEdge(dut.clk)
     dut.avs_read.value = 0
     dut.avs_burstcount.value = 1
-    def sample():
-        return int(dut.avs_readdata.value) if decode_data else None
-
-    data = [sample()]
-    while len(data) < count:
-        await RisingEdge(dut.clk)
-        if int(dut.avs_readdatavalid.value):
-            data.append(sample())
-    return data
+    return await collect_read_beats(dut, count, decode_data)
 
 
 async def read_bytes(dut, byte_addr, count):
@@ -643,9 +661,8 @@ async def test_partial_row_block_matmul(dut):
     symmetric int8 -> OUTPUT_SCALE combines weight_scale*input_scale/output_scale.
 
     Buffer capacity check: output_buffer's per-bank depth
-    (1<<OBUF_BANK_ADDR_WIDTH = 128 entries) must hold num_k_blocks*M
-    entries; here that's 2*64 = 128, exactly at capacity (same margin as
-    test_64x64_multiblock_matmul).
+    (1<<OBUF_BANK_ADDR_WIDTH entries) must hold num_k_blocks*M entries -
+    asserted below.
     """
     # K: output rows, deliberately NOT a multiple of ARRAY_ROWS so the last
     # k-block is partial. N: the true contraction size - must be exactly
@@ -908,12 +925,11 @@ async def test_hw_min_identity_sequence(dut):
       - readback as single 32-bit OBUF word reads (what the C code's rd32
         does), not the burst reads read_bytes uses.
 
-    Addressing matches matmul_min.c one for one: the C code's `a` is
-    avs_address, mapped to a CPU byte offset of 4*a by the interconnect, and
-    a word access advances `a` by 4 - the same units this testbench's
-    addresses are already in. So WBUF/IBUF/OBUF bases, the 256-entry input
-    bank stride and the 128-entry output bank stride are literally the same
-    numbers on both sides.
+    Addressing must match matmul_min.c one for one: the WBUF/IBUF/OBUF
+    bases and the output bank stride (1 << OBUF_BANK_ADDR_WIDTH = 1024
+    bytes) are the same numbers on both sides. NB: the buffer expansion
+    moved OBUF_BASE from 0x7000 to 0x9000 and the output bank stride from
+    128 to 1024 bytes, so matmul_min.c needs the same update.
     """
     K = N = M = ARRAY_ROWS
     assert ARRAY_ROWS == 16 and ARRAY_COLS == 16, (
@@ -1214,3 +1230,302 @@ async def test_padded_input_multiband_matmul(dut):
         preview = ", ".join(f"y[{k},{m}]: exp {e}, got {g}" for k, m, e, g in mismatches[:8])
         raise AssertionError(
             f"{len(mismatches)}/{K*M} mismatches (K={K} N={N} M={M}). First few: {preview}")
+
+
+# Whole-test cycle budget for test_128x128x128_matmul. 64 array blocks of
+# ~M+50 cycles each is ~12k cycles of compute; the 2048 buffer writes and
+# 16 bank-sized readback bursts add a few thousand more. Generous margin.
+BIG_MATMUL_WATCHDOG_CYCLES = 150000
+
+
+def golden_blocked(W_int8, X_int8, q16):
+    """Golden model for any N: output_loader rescales and saturates each
+    contraction block's psum separately, then saturating-accumulates the
+    int8 results in contraction-block order (see test_multiblock_matmul)."""
+    N = W_int8.shape[1]
+    golden = None
+    for lo in range(0, N, ARRAY_COLS):
+        hi = min(lo + ARRAY_COLS, N)
+        blk = np.clip(((W_int8[:, lo:hi] @ X_int8[lo:hi, :]) * q16) >> 16, -128, 127)
+        golden = blk if golden is None else np.clip(golden + blk, -128, 127)
+    return golden
+
+
+@cocotb.test()
+async def test_128x128x128_matmul(dut):
+    """W (128 x 128) @ X (128 x 128) = Y (128 x 128).
+
+    At a 16x16 array that is 8 output-row blocks x 8 contraction blocks =
+    64 array blocks, and it fills all three buffers to exactly their 1KB
+    per-bank depth:
+      - weight bank r: rows r, r+16, ... = 8 rows x 128 B
+      - input bank p:  contraction bands 0..7 = 8 bands x 128 B
+      - output bank r: output-row blocks 0..7 = 8 segments x 128 B
+    Every other test here stays within the old 256 B input / 128 B output
+    banks, so this is the one that exercises the top of each bank. It is
+    also the only test with M larger than input_dispatch's 32-entry row
+    FIFOs, so each band has to be refilled while it streams.
+
+    Readback is ONE burst of 2047 beats, the largest count the 11-bit
+    avs_burstcount port can carry. That is twice the 1024-word output
+    window, so it reads every output bank and then runs past the end of
+    the window, where the burst address wraps back to word 0 - see the
+    readback comment below.
+    """
+    K = N = M = 128
+
+    num_k_blocks = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
+    num_n_blocks = (N + ARRAY_COLS - 1) // ARRAY_COLS
+    assert num_k_blocks * row_pitch(N) <= (1 << WBUF_BANK_ADDR_WIDTH), "weight bank too small"
+    assert num_n_blocks * row_pitch(M) <= (1 << IBUF_BANK_ADDR_WIDTH), "input bank too small"
+    assert num_k_blocks * M <= (1 << OBUF_BANK_ADDR_WIDTH), "output bank too small"
+
+    rng = np.random.default_rng(31)
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=BIG_MATMUL_WATCHDOG_CYCLES))
+    await reset_dut(dut)
+
+    W_real = rng.normal(0.0, REAL_VAL_STD, size=(K, N))
+    X_real = rng.normal(0.0, REAL_VAL_STD, size=(N, M))
+    W_int8, ws = quantize_symmetric_int8(W_real)
+    X_int8, xs = quantize_symmetric_int8(X_real)
+    _, os_ = quantize_symmetric_int8(W_real @ X_real)
+    assert 0.0 <= ws * xs / os_ < 1.0
+    q16 = round(ws * xs / os_ * 65536)
+
+    golden = golden_blocked(W_int8, X_int8, q16)
+
+    await program_dims(dut, K, N, M, q16)
+    await write_weights(dut, W_int8)
+    await write_inputs(dut, X_int8)
+
+    # count clock cycles from the start write to the poll that sees done
+    # (a coroutine rather than get_sim_time, whose units argument was
+    # renamed between cocotb 1.x and 2.x)
+    elapsed = [0]
+
+    async def count_cycles():
+        while True:
+            await RisingEdge(dut.clk)
+            elapsed[0] += 1
+
+    timer = cocotb.start_soon(count_cycles())
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    await wait_matmul_done(dut, timeout_reads=BIG_MATMUL_WATCHDOG_CYCLES)
+    timer.cancel()
+    cycles = elapsed[0]
+    dut._log.info(
+        f"{K}x{N} @ {N}x{M}: {num_k_blocks * num_n_blocks} blocks, "
+        f"matmul_start -> STATUS.done in {cycles} cycles "
+        f"({K * N * M / cycles:.1f} MAC/cycle)")
+    await ClockCycles(dut.clk, 2)
+
+    # ---- readback: ONE burst at the largest count the 11-bit
+    # avs_burstcount port can encode, 2047 beats, to run the slave's burst
+    # counters to their limit. (The Avalon spec caps an n-bit burstcount
+    # at 2**(n-1) = 1024 beats, so a Platform Designer master would not
+    # issue this - it tests this slave's counters, not the interconnect.)
+    #
+    # The output window is only obuf_words = 1024 words (16 banks x 64),
+    # so beats 0..1023 read every bank in order and beats 1024..2046 run
+    # past the end of the window. accel_top truncates the burst address to
+    # the window's word-address width, so those beats wrap back to word 0.
+    # The wrap is checked too: it shows the address counter stayed in step
+    # with the beat counter all the way to the last beat.
+    max_burst = (1 << len(dut.avs_burstcount)) - 1          # 2047
+    obuf_words = (ARRAY_COLS << OBUF_BANK_ADDR_WIDTH) // BYTES_PER_WORD
+    assert max_burst > obuf_words, "burst no longer runs past the output window"
+
+    beats = [0]
+    rdv = cocotb.start_soon(rdv_counter(dut, beats))
+    words = await avalon_burst_read(dut, OBUF_BASE, max_burst)
+    await ClockCycles(dut.clk, 4)
+    rdv.cancel()
+    assert beats[0] == max_burst, (
+        f"{max_burst}-beat burst gave {beats[0]} avs_readdatavalid cycles")
+
+    # the bus must still accept a new transaction after a max-length burst
+    await read_status(dut)
+
+    # beats 0..obuf_words-1 are the whole output buffer, byte for byte:
+    # bank r at byte offset r << OBUF_BANK_ADDR_WIDTH holds output rows
+    # r, r+16, ..., output-row block kb at offset kb*M within the bank
+    image = []
+    for w in words[:obuf_words]:
+        image += [(w >> (8 * j)) & 0xFF for j in range(BYTES_PER_WORD)]
+    bank_bytes = 1 << OBUF_BANK_ADDR_WIDTH
+    Y = np.zeros((K, M), dtype=np.int64)
+    for r in range(ARRAY_ROWS):
+        bank = image[r * bank_bytes:(r + 1) * bank_bytes]
+        for kb in range(num_k_blocks):
+            k = kb * ARRAY_ROWS + r
+            if k < K:
+                Y[k, :] = [to_int8(b) for b in bank[kb * M:(kb + 1) * M]]
+
+    mismatches = [(k, m, int(golden[k, m]), int(Y[k, m]))
+                  for k in range(K) for m in range(M) if Y[k, m] != golden[k, m]]
+    if mismatches:
+        preview = ", ".join(f"y[{k},{m}]: exp {e}, got {g}" for k, m, e, g in mismatches[:8])
+        raise AssertionError(
+            f"{len(mismatches)}/{K*M} mismatches (K={K} N={N} M={M}). First few: {preview}")
+
+    wrap_bad = [i for i in range(obuf_words, max_burst) if words[i] != words[i - obuf_words]]
+    assert not wrap_bad, (
+        f"{len(wrap_bad)} of the {max_burst - obuf_words} beats past the output "
+        f"window did not wrap to word (beat - {obuf_words}); first bad beat {wrap_bad[0]}")
+
+"""Does every read beat get an avs_readdatavalid pulse - including the first?
+
+Paste these into tb/test_accel_top.py. They need rdv_counter, start_clock,
+reset_dut, and the address constants already in that file.
+
+History: avalon_read and avalon_burst_read used to sample avs_readdata on
+the acceptance edge, matching an RTL that returned the first beat (and its
+readdatavalid) in the acceptance cycle itself - a zero-latency response,
+which Avalon forbids for a slave with readdatavalid. accel_top now registers
+readdatavalid/readdata one cycle after acceptance, and both helpers wait for
+readdatavalid like a pipelined master. read_count_rdv below also fails a
+pulse that lands in the acceptance cycle.
+
+dma_1.read_master is exactly such a master. On hardware it reads CTRL fine
+and hangs on OBUF with busy=1 and zero beats moved, which is what waiting
+forever for a missing valid looks like from the outside.
+
+The Avalon-MM rule: if a slave has a readdatavalid port, it is a pipelined
+slave, and EVERY beat it returns must be flagged by readdatavalid. There is
+no "first beat comes back with acceptance" variant. Mixing the two is the
+defect these tests look for.
+"""
+
+async def read_count_rdv(dut, addr, count, window=32):
+    """Issue one read of `count` beats at `addr`, then count how many
+    avs_readdatavalid pulses arrive after the acceptance cycle.
+
+    Returns (pulses, stall_cycles, valid_at_accept). valid_at_accept is
+    avs_readdatavalid during the acceptance cycle itself, which Avalon
+    requires to be 0 (at least one cycle of read latency). Pulses are
+    sampled on the falling edge, the same convention as rdv_counter, so the
+    values are settled mid-cycle - what a master latching on the rising
+    edge actually sees.
+    """
+    dut.avs_address.value = addr
+    dut.avs_burstcount.value = count
+    dut.avs_read.value = 1
+    dut.avs_write.value = 0
+
+    await RisingEdge(dut.clk)
+    stalls = 0
+    while int(dut.avs_waitrequest.value):
+        stalls += 1
+        await RisingEdge(dut.clk)
+        if stalls > 200:
+            raise TimeoutError(
+                f"avs_waitrequest never dropped for a read at 0x{addr:04x} - "
+                f"the slave never accepted the command at all")
+
+    # command accepted on this edge. Values read here are still those of
+    # the acceptance cycle (the edge's register updates have not landed),
+    # so this is readdatavalid *during* acceptance - it must be 0.
+    valid_at_accept = int(dut.avs_readdatavalid.value)
+    # drop read as a real master would
+    dut.avs_read.value = 0
+    dut.avs_burstcount.value = 1
+
+    pulses = [0]
+    counter = cocotb.start_soon(rdv_counter(dut, pulses))
+    await ClockCycles(dut.clk, window)
+    counter.kill()
+    return pulses[0], stalls, valid_at_accept
+
+
+@cocotb.test()
+async def test_every_read_beat_has_readdatavalid(dut):
+    """One readdatavalid pulse per beat, for CTRL and for OBUF alike.
+
+    CTRL is the control: dma_1 reads it correctly on hardware. OBUF is the
+    one that hangs. If CTRL comes back with a pulse and OBUF does not, the
+    bug is reproduced here and the board can be left alone.
+    """
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=4000))
+    await reset_dut(dut)
+
+    # Put something in OBUF first so the read is of real data rather than X.
+    # A full matmul is not needed - any committed result will do.
+    await program_dims(dut, ARRAY_ROWS, ARRAY_COLS, ARRAY_ROWS, 32768)
+    import numpy as np
+    W = 2 * np.eye(ARRAY_ROWS, ARRAY_COLS, dtype=np.int64)
+    X = np.array([[(p * ARRAY_ROWS + m) % 127 for m in range(ARRAY_ROWS)]
+                  for p in range(ARRAY_COLS)], dtype=np.int64)
+    await write_weights(dut, W)
+    await write_inputs(dut, X)
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    await wait_matmul_done(dut)
+    await ClockCycles(dut.clk, 2)
+
+    ctrl_pulses, ctrl_stalls, ctrl_early = await read_count_rdv(dut, STATUS_ADDR, 1)
+    dut._log.info(f"CTRL  single beat: {ctrl_pulses} readdatavalid pulse(s), "
+                  f"{ctrl_stalls} stall cycle(s)")
+
+    obuf_pulses, obuf_stalls, obuf_early = await read_count_rdv(dut, OBUF_BASE, 1)
+    dut._log.info(f"OBUF  single beat: {obuf_pulses} readdatavalid pulse(s), "
+                  f"{obuf_stalls} stall cycle(s)")
+
+    problems = []
+    for region, early in (("CTRL", ctrl_early), ("OBUF", obuf_early)):
+        if early:
+            problems.append(
+                f"{region} asserted readdatavalid in the acceptance cycle - "
+                f"Avalon requires at least one cycle of read latency")
+    if ctrl_pulses != 1:
+        problems.append(
+            f"CTRL single-beat read produced {ctrl_pulses} readdatavalid "
+            f"pulses, expected exactly 1")
+    if obuf_pulses != 1:
+        problems.append(
+            f"OBUF single-beat read produced {obuf_pulses} readdatavalid "
+            f"pulses, expected exactly 1. A pipelined master waits for that "
+            f"pulse and will hang without it - which is what dma_1 does on "
+            f"hardware (busy=1, 0 beats moved).")
+    if problems:
+        raise AssertionError(" | ".join(problems))
+
+
+@cocotb.test()
+async def test_burst_read_beat_count(dut):
+    """An N-beat burst must produce exactly N readdatavalid pulses.
+
+    Separate from the single-beat test because an off-by-one in the burst
+    FSM shows up here and nowhere else: avalon_burst_read stops collecting
+    once it has `count` samples, so a slave that emits N-1 or N+1 pulses
+    still satisfies it.
+    """
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=8000))
+    await reset_dut(dut)
+
+    await program_dims(dut, ARRAY_ROWS, ARRAY_COLS, ARRAY_ROWS, 32768)
+    import numpy as np
+    W = 2 * np.eye(ARRAY_ROWS, ARRAY_COLS, dtype=np.int64)
+    X = np.array([[(p * ARRAY_ROWS + m) % 127 for m in range(ARRAY_ROWS)]
+                  for p in range(ARRAY_COLS)], dtype=np.int64)
+    await write_weights(dut, W)
+    await write_inputs(dut, X)
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    await wait_matmul_done(dut)
+    await ClockCycles(dut.clk, 2)
+
+    bad = []
+    for n in (1, 2, 4, 8):
+        pulses, _, early = await read_count_rdv(dut, OBUF_BASE, n, window=16 + 4 * n)
+        dut._log.info(f"OBUF burst of {n}: {pulses} readdatavalid pulse(s)")
+        if pulses != n:
+            bad.append(f"burst {n} -> {pulses} pulses")
+        if early:
+            bad.append(f"burst {n} -> readdatavalid in the acceptance cycle")
+        await ClockCycles(dut.clk, 4)
+
+    if bad:
+        raise AssertionError(
+            "readdatavalid pulse count does not match burstcount: "
+            + ", ".join(bad))
