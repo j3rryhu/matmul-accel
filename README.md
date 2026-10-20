@@ -98,18 +98,23 @@ Access conventions:
 - **Write whole contiguous images.** Write `W` and `X` each as one
   row-major image with every row zero-padded to a multiple of 16 bytes (see
   [Buffer layouts](#buffer-layouts)); hardware scatters the rows to banks.
-- **Reads may need covering-word arithmetic.** Output segments start at
-  `k_blk*M`, which is only word-aligned when `M` is a multiple of 16. To
-  read an unaligned run, burst the words that cover it and unpack.
+- **Results read back as a contiguous padded image.** Output rows are
+  word-aligned, so a whole row is a run of whole words. When `M` is not a
+  multiple of 16, a row's last word ends in pad bytes, which are never
+  written; ignore them.
 - **Each register is its own 128-bit bus word** at the 16-byte-aligned
   offsets below; its value sits in the low bytes (lanes 0..3), so a write
   needs `avs_byteenable` bits 0..3 set.
-- `output_buffer` reads have one cycle of latency and assert
-  `avs_waitrequest`; `avs_readdatavalid` marks valid beats.
+- **Reads are pipelined with variable latency.** Every beat is marked by
+  `avs_readdatavalid`, never in the cycle the read is accepted: `CTRL`
+  beats arrive 1 cycle after acceptance, `OBUF` beats 3 cycles after,
+  because the read address goes through the same remap as the writes.
+  The slave holds one read in flight at a time, using `avs_waitrequest`
+  to stall the next command until the previous read has returned its last
+  beat. Declare `maximumPendingReadTransactions = 1`.
 - **Burst reads are supported** for `CTRL` and `OBUF`: drive
-  `avs_burstcount`, hold `avs_read` until `avs_waitrequest` drops (that
-  accepting cycle already carries the first beat), then take one beat per
-  `avs_readdatavalid` pulse, address auto-incrementing.
+  `avs_burstcount`, hold `avs_read` until `avs_waitrequest` drops, then
+  take one beat per `avs_readdatavalid` pulse, address auto-incrementing.
 - At 16x16 every buffer is 16 banks x 1 KB, which fills its 16 KB window
   exactly. Growing a bank depth or the array means growing the matching
   window in `rtl/accel_top.sv`; elaboration fails if a window is too small
@@ -129,7 +134,7 @@ Defined in [`rdl/ctrl_reg.rdl`](rdl/ctrl_reg.rdl), compiled to
 | `0x10` | `WEIGHT_ROWS` | `value` | `[15:0]` | W | `K` - **output rows**. May be any value; a non-multiple of `ARRAY_ROWS` is handled by masking. |
 | `0x20` | `WEIGHT_COLS` | `value` | `[15:0]` | W | `N` - **contraction size**. **Must be a multiple of `ARRAY_COLS`** (see [Known issues](#known-issues)). |
 | `0x30` | `INPUT_MAX_ADDR` | `value` | `[9:0]` | W | `M` - number of reads issued per input band. Set equal to `INPUT_COLS`. |
-| `0x40` | `INPUT_COLS` | `value` | `[15:0]` | W | `M` - output/activation column count. Becomes `output_loader.total_rows`, the per-bank segment stride. |
+| `0x40` | `INPUT_COLS` | `value` | `[15:0]` | W | `M` - output/activation column count. Sets the output row length, and its padded pitch for both `output_loader` and the `OBUF` read remap. Keep it at `M` until the result is read. |
 | `0x50` | `STATUS` | `busy` | `[0]` | R | Live level. Compute in progress: `weight_ctrl` sequencing **or** `output_loader` still draining. |
 | `0x50` | `STATUS` | `done` | `[1]` | R, **read-to-clear** | Sticky. Set once per matmul, when every block is committed **and** the last one has drained. Cleared by the read that observes it. |
 | `0x60` | `OUTPUT_SCALE` | `value` | `[15:0]` | W | Q0.16 unsigned rescale factor; actual scale = `value/65536`, range `[0,1)`. |
@@ -199,6 +204,7 @@ which must land in `[0, 65536)` - i.e. the combined scale must be `< 1.0`.
  5. poll STATUS until bit[1] (done) reads 1
     # NB: that read consumes done - keep the value, don't re-read
  6. read result bytes from OBUF   (layout below)
+    # INPUT_COLS must still be M here - the OBUF read remap uses it
 ```
 
 Step 4 is the **only** software trigger. From there `weight_ctrl` sequences
@@ -218,44 +224,28 @@ step 4, because `matmul_start` latches the dimension registers.
 
 ## Buffer layouts
 
-`ARRAY_ROWS`/`ARRAY_COLS` below are the array dimensions (16), and
-`OBUF_BANK_DEPTH` = 1024 is the per-bank output RAM depth. All three
+`ARRAY_ROWS`/`ARRAY_COLS` below are the array dimensions (16). All three
 buffers have 1024-byte banks. `pitch(c) = roundup(c, 16)` is a row padded
 to whole 128-bit words.
 
-### `weight_buffer` and `input_buffer` - contiguous padded images
-
-Software writes each matrix as one row-major image, rows padded to whole
-words. `W` is stored exactly as written on paper, with no transpose:
+All three matrices are contiguous row-major images with padded rows. `W`
+is stored exactly as written on paper, with no transpose:
 
 ```
-addr(k, n) = WBUF_BASE + k*pitch(N) + n     k in [0,K), n in [0,N)
-addr(p, m) = IBUF_BASE + p*pitch(M) + m     p in [0,N), m in [0,M)
+addr(k, n) = WBUF_BASE + k*pitch(N) + n     W: k in [0,K), n in [0,N)   write
+addr(p, m) = IBUF_BASE + p*pitch(M) + m     X: p in [0,N), m in [0,M)   write
+addr(k, m) = OBUF_BASE + k*pitch(M) + m     Y: k in [0,K), m in [0,M)   read
 ```
 
-[`rtl/buf_addr_remap.v`](rtl/buf_addr_remap.v) scatters row `r` to bank
-`r % 16`, at offset `(r / 16) * pitch` within the bank. It uses the live
-`WEIGHT_COLS` and `INPUT_MAX_ADDR` values, so program those registers
-**before** writing either buffer.
+Inside each buffer, [`rtl/buf_addr_remap.v`](rtl/buf_addr_remap.v) maps row
+`r` to bank `r % 16`, at offset `(r / 16) * pitch` within the bank. It uses
+the live register values: `WEIGHT_COLS` for `W`, `INPUT_MAX_ADDR` for `X`,
+and `INPUT_COLS` for `Y`. Program them **before** writing the inputs, and
+leave `INPUT_COLS` alone until the result has been read. `output_loader`
+writes each output row at that same padded pitch.
 
-### `output_buffer` - banked by output row
-
-One bank per PE row. Output row `k` goes to bank `k % ARRAY_ROWS`, with
-output-block `k / ARRAY_ROWS` occupying an `M`-sized segment appended within
-that bank:
-
-```
-addr(k, m) = OBUF_BASE
-           + (k % ARRAY_ROWS) * OBUF_BANK_DEPTH     # bank select
-           + (k / ARRAY_ROWS) * M                   # output-block segment
-           + m
-```
-
-Results are **int8**; sign-extend the byte you read back.
-
-Note this means an output row is *not* one contiguous run in the buffer - it
-is split one-`ARRAY_ROWS`-th per bank, so reading a full row means striding
-across banks.
+Results are **int8**; sign-extend the byte you read back. Pad bytes at the
+end of each output row are never written.
 
 ---
 
@@ -268,7 +258,7 @@ programming a matmul:
 |---|---|
 | `ceil(K / ARRAY_ROWS) * pitch(N) <= 1024` | weight_buffer per-bank depth |
 | `ceil(N / ARRAY_COLS) * pitch(M) <= 1024` | input_buffer per-bank depth |
-| `ceil(K / ARRAY_ROWS) * M <= 1024` | output_buffer per-bank depth |
+| `ceil(K / ARRAY_ROWS) * pitch(M) <= 1024` | output_buffer per-bank depth |
 | `M <= 1023` | `INPUT_MAX_ADDR` is a 10-bit field |
 
 `K = N = M = 128` fills all three buffers exactly

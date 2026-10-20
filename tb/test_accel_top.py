@@ -34,10 +34,10 @@ Everything is addressed per the RTL's own documented conventions:
     (rtl/buf_addr_remap.v) scatters row r to bank r % ARRAY_ROWS using the
     WEIGHT_COLS / INPUT_MAX_ADDR registers, so those are programmed first
     (program_dims, write_weights, write_inputs below).
-  - output_buffer: banked one row per array column; bank c, offset m holds
-    y[row=n_blk_idx*ARRAY_COLS+c, col=m] (see output_loader.v). With a
-    single 32x32 output block, n_blk_idx=0, so bank c holds row c directly,
-    laid out at OBUF_BASE + c*(1<<OBUF_BANK_ADDR_WIDTH) + m.
+  - output_buffer: read back the same way, as one contiguous row-major
+    image with every row padded to a whole word: y[k, m] at
+    OBUF_BASE + k*pitch(M) + m (obuf_row_addr). Hardware reads it through
+    the same remap, using INPUT_COLS (= M) for the pitch.
 
 Golden model (both tests): raw = W_int8 @ X_int8 at full precision (the
 32-bit ACC_DATA_WIDTH accumulator - see pe.v/pe_array.v - can't overflow
@@ -165,13 +165,21 @@ async def collect_read_beats(dut, count, decode_data=True):
     """Call right after a read is accepted. Collects `count` beats, one per
     cycle with avs_readdatavalid high, the way a pipelined Avalon master
     does. Never samples the acceptance cycle itself: Avalon requires at
-    least one cycle of latency between acceptance and readdatavalid."""
+    least one cycle of latency between acceptance and readdatavalid.
+
+    A decoded beat is an int, or - if any bit is X/Z, e.g. a word holding
+    never-written output-row pad bytes - the beat's bit string, MSB first,
+    so word_bytes can still unpack the bytes that are defined."""
     data = []
     idle = 0
     while len(data) < count:
         await RisingEdge(dut.clk)
         if int(dut.avs_readdatavalid.value):
-            data.append(int(dut.avs_readdata.value) if decode_data else None)
+            if decode_data:
+                v = dut.avs_readdata.value
+                data.append(int(v) if v.is_resolvable else str(v))
+            else:
+                data.append(None)
             idle = 0
         else:
             idle += 1
@@ -226,6 +234,13 @@ async def write_bytes(dut, byte_addr, values):
 def row_pitch(ncols):
     """Host row pitch in bytes: every row is padded to a whole word."""
     return -(-ncols // BYTES_PER_WORD) * BYTES_PER_WORD
+
+
+def obuf_row_addr(k, M):
+    """Byte address of output row k. Y is read back as one contiguous
+    row-major image, rows padded to row_pitch(M) - accel_top reads it through
+    buf_addr_remap with INPUT_COLS (= M) as the row length."""
+    return OBUF_BASE + k * row_pitch(M)
 
 
 def padded_image(A):
@@ -294,20 +309,22 @@ async def avalon_burst_read(dut, addr, count, decode_data=True):
 
 
 async def read_bytes(dut, byte_addr, count):
-    """Read `count` bytes starting at an arbitrary (possibly unaligned)
-    byte address, by bursting the words that cover them and unpacking.
+    """Read `count` bytes starting at an arbitrary byte address, by
+    bursting the words that cover them and unpacking.
 
     output_buffer's host-facing read port is AVS_DATA_WIDTH wide, so a read
     returns BYTES_PER_WORD packed bytes, least significant lane = lowest
-    byte address. Output segments start at k_blk*M, which need not be word
-    aligned, hence the covering-word arithmetic here.
+    byte address. Output rows start on a word boundary, but a single byte or
+    a run ending mid-word still needs the covering-word arithmetic here. A
+    byte that is X in simulation - an output-row pad byte, or anything never
+    written - comes back as None.
     """
     first = (byte_addr // BYTES_PER_WORD) * BYTES_PER_WORD
     last  = ((byte_addr + count + BYTES_PER_WORD - 1) // BYTES_PER_WORD) * BYTES_PER_WORD
     words = await avalon_burst_read(dut, first, (last - first) // BYTES_PER_WORD)
     buf = []
     for w in words:
-        buf += [(w >> (8 * j)) & 0xFF for j in range(BYTES_PER_WORD)]
+        buf += word_bytes(w)
     off = byte_addr - first
     return buf[off:off + count]
 
@@ -358,7 +375,23 @@ async def wait_matmul_idle(dut, timeout_reads=STATUS_POLL_LIMIT):
 
 
 def to_int8(byte_val):
+    if byte_val is None:        # X byte (see word_bytes) - never equals a golden value
+        return None
     return byte_val - 256 if byte_val >= 128 else byte_val
+
+
+def word_bytes(w):
+    """Unpack one AVS_DATA_WIDTH read word, least significant byte first.
+    `w` is an int, or (see collect_read_beats) the MSB-first bit string of a
+    word with X/Z bits, in which case each byte containing one is None."""
+    if isinstance(w, int):
+        return [(w >> (8 * j)) & 0xFF for j in range(BYTES_PER_WORD)]
+    bits = w[-8 * BYTES_PER_WORD:]
+    out = []
+    for j in range(BYTES_PER_WORD):
+        b = bits[len(bits) - 8 * (j + 1):len(bits) - 8 * j]
+        out.append(int(b, 2) if set(b) <= {"0", "1"} else None)
+    return out
 
 
 def to_uint8(int_val):
@@ -454,13 +487,13 @@ async def test_single_block_matmul(dut):
     scaled = (raw * output_scale_q16) >> 16
     golden = np.clip(scaled, -128, 127)
 
-    # ---- read back output_buffer: bank c (=row n, since n_blk_idx=0),
-    # offset m ----
+    # ---- read back output_buffer byte by byte: y[n, m] sits at
+    # obuf_row_addr(n, M) + m in the contiguous output image ----
     mismatches = []
     for n in range(N):
-        bank_base = OBUF_BASE + (n << OBUF_BANK_ADDR_WIDTH)
+        row_base = obuf_row_addr(n, M)
         for m in range(M):
-            got = to_int8(await read_byte(dut, bank_base + m))
+            got = to_int8(await read_byte(dut, row_base + m))
             exp = int(golden[n, m])
             if got != exp:
                 mismatches.append((n, m, exp, got))
@@ -496,7 +529,7 @@ async def test_multiblock_matmul(dut):
     weight_scale*input_scale/output_scale) - see that test's docstring.
 
     Buffer capacity check: output_buffer's per-bank depth
-    (1<<OBUF_BANK_ADDR_WIDTH entries) must hold num_k_blocks*M entries, and
+    (1<<OBUF_BANK_ADDR_WIDTH entries) must hold num_k_blocks*pitch(M) entries, and
     input_buffer's per-bank depth (1<<IBUF_BANK_ADDR_WIDTH) must hold
     num_n_blocks*M. Both are asserted below.
     """
@@ -504,7 +537,7 @@ async def test_multiblock_matmul(dut):
     N = 2 * ARRAY_COLS
     M = 2 * ARRAY_ROWS
 
-    assert ((K + ARRAY_ROWS - 1) // ARRAY_ROWS) * M <= (1 << OBUF_BANK_ADDR_WIDTH),         "output_buffer per-bank depth too small for num_k_blocks*M"
+    assert ((K + ARRAY_ROWS - 1) // ARRAY_ROWS) * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH),         "output_buffer per-bank depth too small for num_k_blocks*pitch(M)"
     assert ((N + ARRAY_COLS - 1) // ARRAY_COLS) * M <= (1 << IBUF_BANK_ADDR_WIDTH),         "input_buffer per-bank depth too small for num_n_blocks*M"
 
     rng = np.random.default_rng(1)
@@ -580,15 +613,11 @@ async def test_multiblock_matmul(dut):
         scaled_block = np.clip((raw_block * output_scale_q16) >> 16, -128, 127)
         golden = scaled_block if golden is None else np.clip(golden + scaled_block, -128, 127)
 
-    # ---- read back output_buffer: row n lives in bank c = n % ARRAY_COLS,
-    # at that bank's n_blk_idx*M + m offset, where n_blk_idx = n //
-    # ARRAY_COLS (see output_loader.v's header note on bank layout) ----
+    # ---- read back output_buffer one row per burst: row n starts at
+    # obuf_row_addr(n, M); the read remap finds its bank and segment ----
     mismatches = []
     for n in range(N):
-        n_blk = n // ARRAY_COLS
-        c = n % ARRAY_COLS
-        bank_base = OBUF_BASE + (c << OBUF_BANK_ADDR_WIDTH) + n_blk * M
-        row_bytes = await read_bytes(dut, bank_base, M)
+        row_bytes = await read_bytes(dut, obuf_row_addr(n, M), M)
         for m in range(M):
             got = to_int8(row_bytes[m])
             exp = int(golden[n, m])
@@ -661,7 +690,7 @@ async def test_partial_row_block_matmul(dut):
     symmetric int8 -> OUTPUT_SCALE combines weight_scale*input_scale/output_scale.
 
     Buffer capacity check: output_buffer's per-bank depth
-    (1<<OBUF_BANK_ADDR_WIDTH entries) must hold num_k_blocks*M entries -
+    (1<<OBUF_BANK_ADDR_WIDTH entries) must hold num_k_blocks*pitch(M) entries -
     asserted below.
     """
     # K: output rows, deliberately NOT a multiple of ARRAY_ROWS so the last
@@ -672,7 +701,7 @@ async def test_partial_row_block_matmul(dut):
     M = 2 * ARRAY_ROWS
 
     assert K % ARRAY_ROWS != 0, "last k-block must be partial for this test to mean anything"
-    assert ((K + ARRAY_ROWS - 1) // ARRAY_ROWS) * M <= (1 << OBUF_BANK_ADDR_WIDTH),         "output_buffer per-bank depth too small for num_k_blocks*M"
+    assert ((K + ARRAY_ROWS - 1) // ARRAY_ROWS) * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH),         "output_buffer per-bank depth too small for num_k_blocks*pitch(M)"
 
     rng = np.random.default_rng(2)
     await start_clock(dut)
@@ -734,16 +763,14 @@ async def test_partial_row_block_matmul(dut):
     await wait_matmul_done(dut)
     await ClockCycles(dut.clk, 2)
 
-    # ---- read back output_buffer: output row k lives in bank r = k % ARRAY_ROWS,
-    # at that bank's k_blk_idx*M + m offset, k_blk_idx = k // ARRAY_ROWS
-    # (see output_loader.v's obuf address: held_k_blk_idx*total_rows + m) ----
+    # ---- read back output_buffer: output row k starts at obuf_row_addr(k, M)
+    # in the contiguous image (inside output_buffer it is bank k % ARRAY_ROWS,
+    # segment k // ARRAY_ROWS - the read remap hides that) ----
     mismatches = []
     for k in range(K):
-        k_blk = k // ARRAY_ROWS
-        r = k % ARRAY_ROWS
-        bank_base = OBUF_BASE + (r << OBUF_BANK_ADDR_WIDTH) + k_blk * M
+        row_base = obuf_row_addr(k, M)
         for m in range(M):
-            got = to_int8(await read_byte(dut, bank_base + m))
+            got = to_int8(await read_byte(dut, row_base + m))
             exp = int(golden[k, m])
             if got != exp:
                 mismatches.append((k, m, exp, got))
@@ -813,8 +840,7 @@ async def test_back_to_back_matmul_no_reset(dut):
         golden = np.clip(((W_int8 @ X_int8) * q16) >> 16, -128, 127)
         bad = []
         for k in range(K):
-            k_blk = k // ARRAY_ROWS
-            base = OBUF_BASE + ((k % ARRAY_ROWS) << OBUF_BANK_ADDR_WIDTH) + k_blk * M
+            base = obuf_row_addr(k, M)
             for m in range(M):
                 got = to_int8(await read_byte(dut, base + m))
                 if got != int(golden[k, m]):
@@ -835,17 +861,20 @@ async def test_back_to_back_matmul_no_reset(dut):
 @cocotb.test()
 async def test_unaligned_m_matmul(dut):
     """M deliberately NOT a multiple of BYTES_PER_WORD, with more than one
-    output-row block, so output_buffer segments start at byte offsets that
-    are not word aligned (segment kb begins at kb*M).
+    output-row block, so every output row ends in pad bytes.
 
-    This is the case the 32-bit host data path is most likely to get wrong.
-    The core side is unaffected - output_loader still writes single bytes at
-    byte addresses, and input_dispatch still reads single bytes - but every
-    host access now moves a whole word, so:
-      - a result read has to fetch the covering words and unpack, since the
-        segment it wants starts mid-word;
-      - a bank's input image must be written as one contiguous run, because
-        a partial tail word would otherwise clobber the next band.
+    Output rows are stored at a padded pitch, roundup(M, BYTES_PER_WORD),
+    in two places that must agree: output_loader's segment stride inside
+    each bank, and the host read remap's row pitch in the contiguous image
+    software reads. With M a multiple of the word size there is no padding
+    and the test passes whether or not they agree; this one does not. Rows
+    k and k + ARRAY_ROWS share a bank, so a pitch mismatch shifts the second
+    output-row block's data onto the wrong rows.
+
+    The pad bytes are never written. The covering-word reads therefore see
+    X in those lanes; read_bytes returns them as None, outside the M bytes
+    compared here. (test_padded_input_multiband_matmul checks the same
+    agreement on the input side.)
     """
     K = ARRAY_ROWS + 4          # 2 output-row blocks, second one partial
     N = ARRAY_COLS              # contraction must be a multiple of ARRAY_COLS
@@ -853,8 +882,8 @@ async def test_unaligned_m_matmul(dut):
 
     assert M % BYTES_PER_WORD != 0, "test is pointless unless M is unaligned"
     num_k_blocks = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
-    assert num_k_blocks > 1, "need >1 output block for an unaligned segment start"
-    assert num_k_blocks * M <= (1 << OBUF_BANK_ADDR_WIDTH)
+    assert num_k_blocks > 1, "need >1 output-row block so padded rows share a bank"
+    assert num_k_blocks * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH)
 
     rng = np.random.default_rng(11)
     await start_clock(dut)
@@ -878,20 +907,15 @@ async def test_unaligned_m_matmul(dut):
 
     golden = np.clip(((W_int8 @ X_int8) * q16) >> 16, -128, 127)
 
+    assert row_pitch(M) != M, "output rows are not padded - test not doing its job"
     mismatches = []
-    unaligned_seen = False
     for k in range(K):
-        k_blk = k // ARRAY_ROWS
-        bank_base = OBUF_BASE + ((k % ARRAY_ROWS) << OBUF_BANK_ADDR_WIDTH) + k_blk * M
-        if bank_base % BYTES_PER_WORD:
-            unaligned_seen = True
-        row = await read_bytes(dut, bank_base, M)
+        row = await read_bytes(dut, obuf_row_addr(k, M), M)
         for m in range(M):
             got = to_int8(row[m])
             if got != int(golden[k, m]):
                 mismatches.append((k, m, int(golden[k, m]), got))
 
-    assert unaligned_seen, "no unaligned segment was actually read - test not doing its job"
     if mismatches:
         preview = ", ".join(f"y[{k},{m}]: exp {e}, got {g}" for k, m, e, g in mismatches[:8])
         raise AssertionError(
@@ -926,10 +950,10 @@ async def test_hw_min_identity_sequence(dut):
         does), not the burst reads read_bytes uses.
 
     Addressing must match matmul_min.c one for one: the WBUF/IBUF/OBUF
-    bases and the output bank stride (1 << OBUF_BANK_ADDR_WIDTH = 1024
-    bytes) are the same numbers on both sides. NB: the buffer expansion
-    moved OBUF_BASE from 0x7000 to 0x9000 and the output bank stride from
-    128 to 1024 bytes, so matmul_min.c needs the same update.
+    bases and the output layout are the same numbers on both sides. Output
+    row k is now at OBUF_BASE + k*pitch(M) (here k*16), a contiguous image
+    read through the remap, so matmul_min.c needs OBUF_BASE = 0x9000 and
+    that row stride instead of the old per-bank stride.
     """
     K = N = M = ARRAY_ROWS
     assert ARRAY_ROWS == 16 and ARRAY_COLS == 16, (
@@ -981,12 +1005,12 @@ async def test_hw_min_identity_sequence(dut):
     await wait_matmul_done(dut)
     await ClockCycles(dut.clk, 2)
 
-    # ---- phase: read output buffer as single 32-bit words, 4 per bank ----
+    # ---- phase: read output buffer as single words, one per output row ----
     Y = np.zeros((K, M), dtype=np.int64)
     for k in range(K):
-        bank_base = OBUF_BASE + (k << OBUF_BANK_ADDR_WIDTH)
+        row_base = obuf_row_addr(k, M)
         for m in range(0, M, BYTES_PER_WORD):
-            word = await avalon_read(dut, bank_base + m)
+            word = await avalon_read(dut, row_base + m)
             for j in range(BYTES_PER_WORD):
                 Y[k, m + j] = to_int8((word >> (8 * j)) & 0xFF)
 
@@ -995,7 +1019,7 @@ async def test_hw_min_identity_sequence(dut):
     # here and a failure on hardware name the same location. ----
     mismatches = [
         (k, m, int(golden[k, m]), int(Y[k, m]),
-         OBUF_BASE + (k << OBUF_BANK_ADDR_WIDTH) + m)
+         obuf_row_addr(k, M) + m)
         for k in range(K) for m in range(M)
         if int(Y[k, m]) != int(golden[k, m])
     ]
@@ -1187,7 +1211,7 @@ async def test_padded_input_multiband_matmul(dut):
 
     assert M % BYTES_PER_WORD != 0 and N // ARRAY_COLS > 1
     num_k_blocks = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
-    assert num_k_blocks * M <= (1 << OBUF_BANK_ADDR_WIDTH)
+    assert num_k_blocks * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH)
 
     rng = np.random.default_rng(23)
     await start_clock(dut)
@@ -1219,8 +1243,7 @@ async def test_padded_input_multiband_matmul(dut):
 
     mismatches = []
     for k in range(K):
-        base = OBUF_BASE + ((k % ARRAY_ROWS) << OBUF_BANK_ADDR_WIDTH) + (k // ARRAY_ROWS) * M
-        row = await read_bytes(dut, base, M)
+        row = await read_bytes(dut, obuf_row_addr(k, M), M)
         for m in range(M):
             got = to_int8(row[m])
             if got != int(golden[k, m]):
@@ -1278,7 +1301,7 @@ async def test_128x128x128_matmul(dut):
     num_n_blocks = (N + ARRAY_COLS - 1) // ARRAY_COLS
     assert num_k_blocks * row_pitch(N) <= (1 << WBUF_BANK_ADDR_WIDTH), "weight bank too small"
     assert num_n_blocks * row_pitch(M) <= (1 << IBUF_BANK_ADDR_WIDTH), "input bank too small"
-    assert num_k_blocks * M <= (1 << OBUF_BANK_ADDR_WIDTH), "output bank too small"
+    assert num_k_blocks * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH), "output bank too small"
 
     rng = np.random.default_rng(31)
     await start_clock(dut)
@@ -1326,9 +1349,9 @@ async def test_128x128x128_matmul(dut):
     # at 2**(n-1) = 1024 beats, so a Platform Designer master would not
     # issue this - it tests this slave's counters, not the interconnect.)
     #
-    # The output window is only obuf_words = 1024 words (16 banks x 64),
-    # so beats 0..1023 read every bank in order and beats 1024..2046 run
-    # past the end of the window. accel_top truncates the burst address to
+    # The output image is K rows x row_pitch(M) = 1024 words, exactly the
+    # output window (obuf_words), so beats 0..1023 read every row in order
+    # and beats 1024..2046 run past the end of the window. accel_top truncates the burst address to
     # the window's word-address width, so those beats wrap back to word 0.
     # The wrap is checked too: it shows the address counter stayed in step
     # with the beat counter all the way to the last beat.
@@ -1347,22 +1370,17 @@ async def test_128x128x128_matmul(dut):
     # the bus must still accept a new transaction after a max-length burst
     await read_status(dut)
 
-    # beats 0..obuf_words-1 are the whole output buffer, byte for byte:
-    # bank r at byte offset r << OBUF_BANK_ADDR_WIDTH holds output rows
-    # r, r+16, ..., output-row block kb at offset kb*M within the bank
+    # beats 0..obuf_words-1 are the whole contiguous output image: row k
+    # at byte k*row_pitch(M)
     image = []
     for w in words[:obuf_words]:
-        image += [(w >> (8 * j)) & 0xFF for j in range(BYTES_PER_WORD)]
-    bank_bytes = 1 << OBUF_BANK_ADDR_WIDTH
-    Y = np.zeros((K, M), dtype=np.int64)
-    for r in range(ARRAY_ROWS):
-        bank = image[r * bank_bytes:(r + 1) * bank_bytes]
-        for kb in range(num_k_blocks):
-            k = kb * ARRAY_ROWS + r
-            if k < K:
-                Y[k, :] = [to_int8(b) for b in bank[kb * M:(kb + 1) * M]]
+        image += word_bytes(w)
+    pitch = row_pitch(M)
+    Y = np.zeros((K, M), dtype=object)     # object: an X byte stays None
+    for k in range(K):
+        Y[k, :] = [to_int8(b) for b in image[k * pitch:k * pitch + M]]
 
-    mismatches = [(k, m, int(golden[k, m]), int(Y[k, m]))
+    mismatches = [(k, m, int(golden[k, m]), Y[k, m])
                   for k in range(K) for m in range(M) if Y[k, m] != golden[k, m]]
     if mismatches:
         preview = ", ".join(f"y[{k},{m}]: exp {e}, got {g}" for k, m, e, g in mismatches[:8])

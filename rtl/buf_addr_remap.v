@@ -21,6 +21,10 @@
 // row_words and is registered - row_words is a control register that
 // software programs before writing the buffer.
 //
+// accel_top also uses it on output_buffer's READ address path (host_wren =
+// read fetch enable, data unused), so software reads results back as a
+// contiguous row-major image too; the read FSM absorbs the extra latency.
+//
 // Two register stages: write address/data/enable come out two cycles after
 // they go in. That is safe against matmul_start - the start write is
 // accepted at least one cycle after the last buffer write and takes several

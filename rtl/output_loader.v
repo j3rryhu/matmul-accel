@@ -16,12 +16,13 @@
 // holds output row n". Bank r always holds output row
 // (n_blk_idx*ARRAY_COLS+r) for whichever n_blk_idx is currently committed
 // - i.e. each bank is reused across every n_blk_idx pass, and within a
-// bank the per-n_blk_idx segments (each total_rows elements, one per
-// output column m) are simply appended head-to-tail: bank r's internal
-// address = n_blk_idx*total_rows + m. That makes the layout row-major
-// *within* a bank, but NOT globally row-major across the whole
-// output_buffer (output row n's data isn't one contiguous run - it's
-// split one-ARRAY_COLS-th-per-bank).
+// bank the per-block segments (each total_rows elements, one per output
+// column m) are appended at a padded stride: bank r's internal address =
+// blk*row_pitch + m, with row_pitch = total_rows rounded up to ROW_ALIGN
+// (the host word). The pad bytes are never written. Inside output_buffer
+// the layout is row-major per bank only, but the host never sees that:
+// accel_top reads it through buf_addr_remap, which presents Y as one
+// contiguous row-major image with rows row_pitch apart.
 //
 // Since the contraction dimension may need more than one ARRAY_ROWS-block pass
 // (k_blk_idx = 0..num_k_blocks-1) to fully sum, every block's psums must
@@ -127,7 +128,8 @@ module output_loader #(
     parameter SCALE_WIDTH    = 16,   // output_scale width - Q0.16 fixed point (unsigned, range [0,1))
     parameter ARRAY_COLS     = 16,
     parameter ARRAY_ROWS     = 16,
-    parameter ROW_ADDR_WIDTH = 16,   // per-bank WRITE (byte) address width - must span num_n_blocks*total_rows
+    parameter ROW_ADDR_WIDTH = 16,   // per-bank WRITE (byte) address width - must span num_blocks*row_pitch
+    parameter ROW_ALIGN      = 16,   // output row pitch = roundup(total_rows, ROW_ALIGN) - the host word, a power of 2
     parameter RD_DATA_WIDTH  = 32,   // output_buffer read port width (wide, shared with Avalon)
     // The output_buffer read port is wide (one word per access) because the
     // Avalon host reads through it; this module only ever wants one byte of
@@ -250,6 +252,10 @@ module output_loader #(
     // held high for the whole compute+drain window - never gated per row
     assign b_en = {ARRAY_COLS{running}};
 
+    // segment stride within a bank: total_rows padded to a whole host word,
+    // the same pitch accel_top's host read remap assumes (see header)
+    wire [ROW_ADDR_WIDTH:0] row_pitch = (({1'b0, total_rows} + ROW_ALIGN - 1) / ROW_ALIGN) * ROW_ALIGN;
+
     genvar r;
     generate
         for (r = 0; r < ARRAY_ROWS; r = r + 1) begin : ROW
@@ -275,10 +281,10 @@ module output_loader #(
             assign row_done[r] = (row_count[r] == total_rows);
 
             // this bank's address for the position row_count[r] currently
-            // points at: held_k_blk_idx's segment, appended after every
-            // earlier n_blk_idx's total_rows-sized segment in this bank
+            // points at: held_k_blk_idx's segment, after every earlier
+            // output-row block's row_pitch-sized segment in this bank
             (* multstyle = "logic" *)
-            wire [ROW_ADDR_WIDTH-1:0] cur_addr = held_k_blk_idx*total_rows + row_count[r];
+            wire [ROW_ADDR_WIDTH-1:0] cur_addr = held_k_blk_idx*row_pitch + row_count[r];
 
             assign obuf_rden[r] = row_active;
             assign obuf_rdaddress[r*ROW_RADDR_WIDTH +: ROW_RADDR_WIDTH] = cur_addr[ROW_ADDR_WIDTH-1:LANE_SEL_W];
