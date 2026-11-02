@@ -125,22 +125,22 @@ module input_buffer (
     );
 endmodule
 
-// output_buffer: one bank of output_buffer_32_bank, 1024 bytes.
-// output_loader writes bytes (1024 x 8, 10-bit); Avalon reads 128-bit words
-// (64 x 128, 6-bit word address).
+// output_buffer: one bank of output_buffer_32_bank, 4096 bytes (16 rows of
+// the 256x256 output canvas). output_loader writes bytes (4096 x 8, 12-bit);
+// Avalon reads 128-bit words (256 x 128, 8-bit word address).
 module output_buffer (
     input         clock,
     input  [ 7:0] data,
-    input  [ 5:0] rdaddress,
+    input  [ 7:0] rdaddress,
     input         rden,
-    input  [ 9:0] wraddress,
+    input  [11:0] wraddress,
     input         wren,
     output [127:0] q
 );
     mixed_ram_rd_wide #(
         .NARROW_WIDTH (8),
         .WIDE_WIDTH   (128),
-        .NARROW_DEPTH (1024)
+        .NARROW_DEPTH (4096)
     ) u_ram (
         .clock (clock), .data (data),
         .rdaddress (rdaddress), .rden (rden),

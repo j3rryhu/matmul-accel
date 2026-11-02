@@ -76,6 +76,9 @@ module ctrl_rf_tb #(
     logic                     [29:15] TILE_CFG_tile_c_q;
     logic                     [30:30] TILE_CFG_use_prev_out_q;
 
+    // Register TILED_MAT_DIM
+    logic                     [15: 0] TILED_MAT_DIM_tiled_c_dim_q;
+
     // Register Bus
     logic                             valid;    // active high
     logic                             read;     // indicates request is a read
@@ -298,6 +301,23 @@ module ctrl_rf_tb #(
 
             `SW_WRITE( 112, 0 )
             #1 `CHECK_EQUAL(TILE_CFG_use_prev_out_q, value[30:30])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (TILED_MAT_DIM_tiled_c_dim ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 0; IDX <= 15; ++IDX) begin
+
+            temp = '0;
+            temp[15: 0] = TILED_MAT_DIM_tiled_c_dim_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 128, (1 << IDX) )
+            #1 `CHECK_EQUAL(TILED_MAT_DIM_tiled_c_dim_q, temp[15: 0])
+
+            `SW_WRITE( 128, 0 )
+            #1 `CHECK_EQUAL(TILED_MAT_DIM_tiled_c_dim_q, value[15: 0])
 
         end
 

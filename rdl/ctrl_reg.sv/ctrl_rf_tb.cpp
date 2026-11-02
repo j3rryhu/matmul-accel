@@ -277,6 +277,24 @@ int main(int argc, char** argv) {
         CHECK_EQUAL(top->TILE_CFG_use_prev_out_q, RANGE(value, 1, 30))
 
     }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (TILED_MAT_DIM_tiled_c_dim ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 0; IDX <= 15; ++IDX) {
+        int temp, value;
+
+        temp = top->TILED_MAT_DIM_tiled_c_dim_q << 0;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 128, (1 << IDX) )
+        CHECK_EQUAL(top->TILED_MAT_DIM_tiled_c_dim_q, RANGE(temp, 16, 0))
+
+        SW_WRITE( 128, 0 )
+        CHECK_EQUAL(top->TILED_MAT_DIM_tiled_c_dim_q, RANGE(value, 16, 0))
+
+    }
 
     cycle(top);
     cycle(top);

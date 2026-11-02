@@ -102,8 +102,8 @@ addrmap ctrl_rf {
         } value [15:0];
     } OUTPUT_SCALE @ 0x60;
 
-    // Output tile placement (0x70). The output buffer is one 128x128 int8
-    // canvas; this matmul's K x M result lands with its top-left corner at
+    // Output tile placement (0x70). The output buffer holds one int8 canvas
+    // (width: TILED_MAT_DIM); this matmul's K x M result lands with its top-left corner at
     // canvas row tile_r*WEIGHT_ROWS, column tile_c*INPUT_COLS. Every tile
     // of one result must use the same K and M, and with tile_r > 0, K must
     // be a multiple of 16 (bank boundary). use_prev_out: the first
@@ -129,4 +129,17 @@ addrmap ctrl_rf {
             reset = 0;
         } use_prev_out;
     } TILE_CFG @ 0x70;
+
+    // Output canvas width (0x80): the whole result's column count when it
+    // is built from tiles, so the canvas reads back as one dense row-major
+    // matrix (rows padded to a 16-byte word). 0 = use INPUT_COLS, for one
+    // untiled matmul. Must stay the same from the first tile until the
+    // canvas has been read.
+    reg {
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } tiled_c_dim[15:0];
+    } TILED_MAT_DIM @ 0x80;
 };

@@ -17,6 +17,7 @@ at `CTRL_BASE = 0x0000_0000`, size `0x100` (see `rtl/accel_top.sv`).
 | 0x70   | TILE_CFG        | `tile_r`              | [14:0] | sw=w   | Output tile row index: the result starts at canvas row `tile_r * WEIGHT_ROWS`. |
 |        |                 | `tile_c`              | [29:15]| sw=w   | Output tile column index: the result starts at canvas column `tile_c * INPUT_COLS`. |
 |        |                 | `use_prev_out`        | [30]   | sw=w   | 1 = the first contraction block accumulates onto the output canvas instead of overwriting it. See the top-level README, "Output canvas and tiling". |
+| 0x80   | TILED_MAT_DIM   | `tiled_c_dim`         | [15:0] | sw=w   | Output canvas width: the whole (tiled) result's column count; 0 = use `INPUT_COLS`. Sets the canvas row pitch for both the writes and the read remap. |
 
 Bit positions above 0 for multi-bit/later fields are assigned automatically
 by PeakRDL in declaration order; re-check `ctrl_rf_rf.sv` after regenerating

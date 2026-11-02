@@ -36,6 +36,9 @@ module ctrl_rf_rf #(
     output logic                     [14: 0] TILE_CFG_tile_c_q,              //! Current field value
     output logic                     [ 0: 0] TILE_CFG_use_prev_out_q,              //! Current field value
 
+    // Register TILED_MAT_DIM
+    output logic                     [15: 0] TILED_MAT_DIM_tiled_c_dim_q,              //! Current field value
+
     // Register Bus
     input  logic                             valid,    //! Active high valid
     input  logic                             read,     //! Indicates request is a read
@@ -96,6 +99,10 @@ module ctrl_rf_rf #(
     logic                             TILE_CFG_use_prev_out_anded;
     logic                             TILE_CFG_use_prev_out_ored;
     logic                             TILE_CFG_use_prev_out_xored;
+    logic                           [15: 0] TILED_MAT_DIM_tiled_c_dim_next;
+    logic                             TILED_MAT_DIM_tiled_c_dim_anded;
+    logic                             TILED_MAT_DIM_tiled_c_dim_ored;
+    logic                             TILED_MAT_DIM_tiled_c_dim_xored;
 /* verilator lint_on UNUSED */
 
     // ============================================================
@@ -134,6 +141,7 @@ module ctrl_rf_rf #(
     logic                     [DATA_WIDTH-1:0] STATUS_rdata;
     logic                     [DATA_WIDTH-1:0] OUTPUT_SCALE_rdata;
     logic                     [DATA_WIDTH-1:0] TILE_CFG_rdata;
+    logic                     [DATA_WIDTH-1:0] TILED_MAT_DIM_rdata;
 
     assign sw_rdata = // or of each register return (masked)
                    CONTROL_rdata | 
@@ -143,7 +151,8 @@ module ctrl_rf_rf #(
                    INPUT_COLS_rdata | 
                    STATUS_rdata | 
                    OUTPUT_SCALE_rdata | 
-                   TILE_CFG_rdata;
+                   TILE_CFG_rdata | 
+                   TILED_MAT_DIM_rdata;
             
         
     // ============================================================
@@ -545,6 +554,48 @@ module ctrl_rf_rf #(
         // Software write
         if (TILE_CFG_sw_wr) begin
             TILE_CFG_use_prev_out_q <=  sw_masked_data[30:30] | (TILE_CFG_use_prev_out_q & ~sw_mask[30:30]);
+        end
+    end
+            
+        
+    // ============================================================
+    // Register: TILED_MAT_DIM
+    //    [15: 0]          tiled_c_dim: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  TILED_MAT_DIM_decode;
+    logic                  TILED_MAT_DIM_sw_wr;
+    logic                  TILED_MAT_DIM_sw_rd;
+    logic [DATA_WIDTH-1:0] TILED_MAT_DIM_q;
+
+    assign TILED_MAT_DIM_decode = (addr == (ADDR_OFFSET+'h0+'h80));
+    assign TILED_MAT_DIM_sw_wr = sw_wr && TILED_MAT_DIM_decode;
+    assign TILED_MAT_DIM_sw_rd = sw_rd && TILED_MAT_DIM_decode;
+
+    always_comb begin
+        TILED_MAT_DIM_q = '0;
+        TILED_MAT_DIM_q[15: 0] = TILED_MAT_DIM_tiled_c_dim_q;
+    end
+
+    // masked version of return data
+    assign TILED_MAT_DIM_rdata = TILED_MAT_DIM_sw_rd ? TILED_MAT_DIM_q : 'b0;
+
+    // ------------------------------------------------------------
+    // Field: tiled_c_dim
+    // ------------------------------------------------------------
+    assign TILED_MAT_DIM_tiled_c_dim_anded = & TILED_MAT_DIM_tiled_c_dim_q;
+    assign TILED_MAT_DIM_tiled_c_dim_ored  = | TILED_MAT_DIM_tiled_c_dim_q;
+    assign TILED_MAT_DIM_tiled_c_dim_xored = ^ TILED_MAT_DIM_tiled_c_dim_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        TILED_MAT_DIM_tiled_c_dim_q <= 0;
+    end else begin
+        // Software write
+        if (TILED_MAT_DIM_sw_wr) begin
+            TILED_MAT_DIM_tiled_c_dim_q <=  sw_masked_data[15: 0] | (TILED_MAT_DIM_tiled_c_dim_q & ~sw_mask[15: 0]);
         end
     end
 
