@@ -223,6 +223,60 @@ int main(int argc, char** argv) {
         CHECK_EQUAL(top->OUTPUT_SCALE_value_q, RANGE(value, 16, 0))
 
     }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (TILE_CFG_tile_r ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 0; IDX <= 14; ++IDX) {
+        int temp, value;
+
+        temp = top->TILE_CFG_tile_r_q << 0;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 112, (1 << IDX) )
+        CHECK_EQUAL(top->TILE_CFG_tile_r_q, RANGE(temp, 15, 0))
+
+        SW_WRITE( 112, 0 )
+        CHECK_EQUAL(top->TILE_CFG_tile_r_q, RANGE(value, 15, 0))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (TILE_CFG_tile_c ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 15; IDX <= 29; ++IDX) {
+        int temp, value;
+
+        temp = top->TILE_CFG_tile_c_q << 15;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 112, (1 << IDX) )
+        CHECK_EQUAL(top->TILE_CFG_tile_c_q, RANGE(temp, 15, 15))
+
+        SW_WRITE( 112, 0 )
+        CHECK_EQUAL(top->TILE_CFG_tile_c_q, RANGE(value, 15, 15))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (TILE_CFG_use_prev_out ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 30; IDX <= 30; ++IDX) {
+        int temp, value;
+
+        temp = top->TILE_CFG_use_prev_out_q << 30;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 112, (1 << IDX) )
+        CHECK_EQUAL(top->TILE_CFG_use_prev_out_q, RANGE(temp, 1, 30))
+
+        SW_WRITE( 112, 0 )
+        CHECK_EQUAL(top->TILE_CFG_use_prev_out_q, RANGE(value, 1, 30))
+
+    }
 
     cycle(top);
     cycle(top);

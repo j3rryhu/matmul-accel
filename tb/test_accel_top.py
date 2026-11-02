@@ -34,10 +34,11 @@ Everything is addressed per the RTL's own documented conventions:
     (rtl/buf_addr_remap.v) scatters row r to bank r % ARRAY_ROWS using the
     WEIGHT_COLS / INPUT_MAX_ADDR registers, so those are programmed first
     (program_dims, write_weights, write_inputs below).
-  - output_buffer: read back the same way, as one contiguous row-major
-    image with every row padded to a whole word: y[k, m] at
-    OBUF_BASE + k*pitch(M) + m (obuf_row_addr). Hardware reads it through
-    the same remap, using INPUT_COLS (= M) for the pitch.
+  - output_buffer: a fixed OBUF_CANVAS_W x OBUF_CANVAS_H output canvas,
+    read back as one row-major image: canvas (row, col) at
+    OBUF_BASE + row*OBUF_CANVAS_W + col (obuf_addr). A matmul's K x M
+    result is the canvas tile TILE_CFG selects; tests that never write
+    TILE_CFG get tile (0, 0), so y[k, m] is canvas (k, m).
 
 Golden model (both tests): raw = W_int8 @ X_int8 at full precision (the
 32-bit ACC_DATA_WIDTH accumulator - see pe.v/pe_array.v - can't overflow
@@ -68,6 +69,7 @@ INPUT_MAX_ADDR_ADDR = CTRL_BASE + 0x30
 INPUT_COLS_ADDR     = CTRL_BASE + 0x40
 STATUS_ADDR         = CTRL_BASE + 0x50
 OUTPUT_SCALE_ADDR   = CTRL_BASE + 0x60
+TILE_CFG_ADDR       = CTRL_BASE + 0x70
 
 MATMUL_START_BIT = 0
 
@@ -75,6 +77,11 @@ MATMUL_START_BIT = 0
 # re-check ctrl_rf_rf.sv if ctrl_reg.rdl's field order changes
 STATUS_BUSY_BIT = 0
 STATUS_DONE_BIT = 1
+
+# TILE_CFG fields - see rdl/ctrl_reg.rdl
+TILE_R_SHIFT     = 0    # tile_r [14:0]
+TILE_C_SHIFT     = 15   # tile_c [29:15]
+USE_PREV_OUT_BIT = 30
 
 # ---- test-fixed dimensions ----
 ARRAY_ROWS = 16  # must match accel_top.sv's ARRAY_ROWS / input_buffer_32_bank's bank count
@@ -90,6 +97,11 @@ M = ARRAY_ROWS   # input/output column count (INPUT_COLS == INPUT_MAX_ADDR here)
 REAL_VAL_STD = 1.0
 
 OBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's OBUF_BANK_ADDR_WIDTH (1024 B/bank)
+
+# output canvas: OBUF_CANVAS_W must match accel_top.sv; the height follows
+# from the output_buffer size (16 banks x 1024 B / 128 B = 128 rows)
+OBUF_CANVAS_W = 128
+OBUF_CANVAS_H = (ARRAY_ROWS << OBUF_BANK_ADDR_WIDTH) // OBUF_CANVAS_W
 IBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's IBUF_BANK_ADDR_WIDTH (1024 B/bank)
 WBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's WBUF_BANK_ADDR_WIDTH (1024 B/bank)
 
@@ -168,7 +180,7 @@ async def collect_read_beats(dut, count, decode_data=True):
     least one cycle of latency between acceptance and readdatavalid.
 
     A decoded beat is an int, or - if any bit is X/Z, e.g. a word holding
-    never-written output-row pad bytes - the beat's bit string, MSB first,
+    canvas bytes no matmul has written - the beat's bit string, MSB first,
     so word_bytes can still unpack the bytes that are defined."""
     data = []
     idle = 0
@@ -236,11 +248,23 @@ def row_pitch(ncols):
     return -(-ncols // BYTES_PER_WORD) * BYTES_PER_WORD
 
 
-def obuf_row_addr(k, M):
-    """Byte address of output row k. Y is read back as one contiguous
-    row-major image, rows padded to row_pitch(M) - accel_top reads it through
-    buf_addr_remap with INPUT_COLS (= M) as the row length."""
-    return OBUF_BASE + k * row_pitch(M)
+def obuf_addr(row, col=0):
+    """Byte address of output canvas element (row, col). The canvas is read
+    back as one row-major image with a fixed OBUF_CANVAS_W-byte pitch,
+    whatever M is. A matmul's result is the tile TILE_CFG placed it in -
+    tile (0, 0) by default, so output row k is canvas row k."""
+    return OBUF_BASE + row * OBUF_CANVAS_W + col
+
+
+def assert_fits_canvas(K, M, tile_r=0, tile_c=0):
+    """A K x M result placed as tile (tile_r, tile_c) has to lie inside the
+    output canvas, and a nonzero tile row offset has to be a multiple of
+    ARRAY_ROWS - see the TILE_CFG latch in rtl/accel_top.sv."""
+    assert (tile_r + 1) * K <= OBUF_CANVAS_H and (tile_c + 1) * M <= OBUF_CANVAS_W, (
+        f"tile ({tile_r},{tile_c}) of {K}x{M} runs off the "
+        f"{OBUF_CANVAS_H}x{OBUF_CANVAS_W} output canvas")
+    assert tile_r == 0 or K % ARRAY_ROWS == 0, (
+        f"tile row offset {tile_r}*{K} is not a multiple of {ARRAY_ROWS}")
 
 
 def padded_image(A):
@@ -314,10 +338,10 @@ async def read_bytes(dut, byte_addr, count):
 
     output_buffer's host-facing read port is AVS_DATA_WIDTH wide, so a read
     returns BYTES_PER_WORD packed bytes, least significant lane = lowest
-    byte address. Output rows start on a word boundary, but a single byte or
-    a run ending mid-word still needs the covering-word arithmetic here. A
-    byte that is X in simulation - an output-row pad byte, or anything never
-    written - comes back as None.
+    byte address. Canvas rows start on a word boundary, but a single byte, a
+    tile starting mid-word, or a run ending mid-word still needs the
+    covering-word arithmetic here. A byte that is X in simulation - any
+    canvas byte no matmul has written - comes back as None.
     """
     first = (byte_addr // BYTES_PER_WORD) * BYTES_PER_WORD
     last  = ((byte_addr + count + BYTES_PER_WORD - 1) // BYTES_PER_WORD) * BYTES_PER_WORD
@@ -488,10 +512,10 @@ async def test_single_block_matmul(dut):
     golden = np.clip(scaled, -128, 127)
 
     # ---- read back output_buffer byte by byte: y[n, m] sits at
-    # obuf_row_addr(n, M) + m in the contiguous output image ----
+    # obuf_addr(n) + m in the output canvas ----
     mismatches = []
     for n in range(N):
-        row_base = obuf_row_addr(n, M)
+        row_base = obuf_addr(n)
         for m in range(M):
             got = to_int8(await read_byte(dut, row_base + m))
             exp = int(golden[n, m])
@@ -528,8 +552,7 @@ async def test_multiblock_matmul(dut):
     W/X -> per-tensor symmetric int8 -> OUTPUT_SCALE combines
     weight_scale*input_scale/output_scale) - see that test's docstring.
 
-    Buffer capacity check: output_buffer's per-bank depth
-    (1<<OBUF_BANK_ADDR_WIDTH entries) must hold num_k_blocks*pitch(M) entries, and
+    Buffer capacity check: the K x M result must fit the output canvas, and
     input_buffer's per-bank depth (1<<IBUF_BANK_ADDR_WIDTH) must hold
     num_n_blocks*M. Both are asserted below.
     """
@@ -537,7 +560,7 @@ async def test_multiblock_matmul(dut):
     N = 2 * ARRAY_COLS
     M = 2 * ARRAY_ROWS
 
-    assert ((K + ARRAY_ROWS - 1) // ARRAY_ROWS) * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH),         "output_buffer per-bank depth too small for num_k_blocks*pitch(M)"
+    assert_fits_canvas(K, M)
     assert ((N + ARRAY_COLS - 1) // ARRAY_COLS) * M <= (1 << IBUF_BANK_ADDR_WIDTH),         "input_buffer per-bank depth too small for num_n_blocks*M"
 
     rng = np.random.default_rng(1)
@@ -614,10 +637,10 @@ async def test_multiblock_matmul(dut):
         golden = scaled_block if golden is None else np.clip(golden + scaled_block, -128, 127)
 
     # ---- read back output_buffer one row per burst: row n starts at
-    # obuf_row_addr(n, M); the read remap finds its bank and segment ----
+    # obuf_addr(n); the canvas read wiring finds its bank and segment ----
     mismatches = []
     for n in range(N):
-        row_bytes = await read_bytes(dut, obuf_row_addr(n, M), M)
+        row_bytes = await read_bytes(dut, obuf_addr(n), M)
         for m in range(M):
             got = to_int8(row_bytes[m])
             exp = int(golden[n, m])
@@ -689,8 +712,7 @@ async def test_partial_row_block_matmul(dut):
     test_64x64_multiblock_matmul's docstring): real float W/X -> per-tensor
     symmetric int8 -> OUTPUT_SCALE combines weight_scale*input_scale/output_scale.
 
-    Buffer capacity check: output_buffer's per-bank depth
-    (1<<OBUF_BANK_ADDR_WIDTH entries) must hold num_k_blocks*pitch(M) entries -
+    Buffer capacity check: the K x M result must fit the output canvas -
     asserted below.
     """
     # K: output rows, deliberately NOT a multiple of ARRAY_ROWS so the last
@@ -701,7 +723,7 @@ async def test_partial_row_block_matmul(dut):
     M = 2 * ARRAY_ROWS
 
     assert K % ARRAY_ROWS != 0, "last k-block must be partial for this test to mean anything"
-    assert ((K + ARRAY_ROWS - 1) // ARRAY_ROWS) * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH),         "output_buffer per-bank depth too small for num_k_blocks*pitch(M)"
+    assert_fits_canvas(K, M)
 
     rng = np.random.default_rng(2)
     await start_clock(dut)
@@ -763,12 +785,12 @@ async def test_partial_row_block_matmul(dut):
     await wait_matmul_done(dut)
     await ClockCycles(dut.clk, 2)
 
-    # ---- read back output_buffer: output row k starts at obuf_row_addr(k, M)
+    # ---- read back output_buffer: output row k starts at obuf_addr(k)
     # in the contiguous image (inside output_buffer it is bank k % ARRAY_ROWS,
-    # segment k // ARRAY_ROWS - the read remap hides that) ----
+    # segment k // ARRAY_ROWS - the canvas read wiring hides that) ----
     mismatches = []
     for k in range(K):
-        row_base = obuf_row_addr(k, M)
+        row_base = obuf_addr(k)
         for m in range(M):
             got = to_int8(await read_byte(dut, row_base + m))
             exp = int(golden[k, m])
@@ -840,7 +862,7 @@ async def test_back_to_back_matmul_no_reset(dut):
         golden = np.clip(((W_int8 @ X_int8) * q16) >> 16, -128, 127)
         bad = []
         for k in range(K):
-            base = obuf_row_addr(k, M)
+            base = obuf_addr(k)
             for m in range(M):
                 got = to_int8(await read_byte(dut, base + m))
                 if got != int(golden[k, m]):
@@ -861,20 +883,14 @@ async def test_back_to_back_matmul_no_reset(dut):
 @cocotb.test()
 async def test_unaligned_m_matmul(dut):
     """M deliberately NOT a multiple of BYTES_PER_WORD, with more than one
-    output-row block, so every output row ends in pad bytes.
+    output-row block, so every output row ends mid-word.
 
-    Output rows are stored at a padded pitch, roundup(M, BYTES_PER_WORD),
-    in two places that must agree: output_loader's segment stride inside
-    each bank, and the host read remap's row pitch in the contiguous image
-    software reads. With M a multiple of the word size there is no padding
-    and the test passes whether or not they agree; this one does not. Rows
-    k and k + ARRAY_ROWS share a bank, so a pitch mismatch shifts the second
-    output-row block's data onto the wrong rows.
-
-    The pad bytes are never written. The covering-word reads therefore see
-    X in those lanes; read_bytes returns them as None, outside the M bytes
-    compared here. (test_padded_input_multiband_matmul checks the same
-    agreement on the input side.)
+    Each output row fills the first M bytes of its canvas row; the rest of
+    that canvas row is not written, so the covering-word reads see X there
+    (or an earlier test's data). read_bytes returns X bytes as None,
+    outside the M bytes compared here. Rows k and k + ARRAY_ROWS share a
+    bank, so this also checks that the second output-row block lands one
+    canvas row block further down rather than on top of the first.
     """
     K = ARRAY_ROWS + 4          # 2 output-row blocks, second one partial
     N = ARRAY_COLS              # contraction must be a multiple of ARRAY_COLS
@@ -883,7 +899,7 @@ async def test_unaligned_m_matmul(dut):
     assert M % BYTES_PER_WORD != 0, "test is pointless unless M is unaligned"
     num_k_blocks = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
     assert num_k_blocks > 1, "need >1 output-row block so padded rows share a bank"
-    assert num_k_blocks * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH)
+    assert_fits_canvas(K, M)
 
     rng = np.random.default_rng(11)
     await start_clock(dut)
@@ -907,10 +923,9 @@ async def test_unaligned_m_matmul(dut):
 
     golden = np.clip(((W_int8 @ X_int8) * q16) >> 16, -128, 127)
 
-    assert row_pitch(M) != M, "output rows are not padded - test not doing its job"
     mismatches = []
     for k in range(K):
-        row = await read_bytes(dut, obuf_row_addr(k, M), M)
+        row = await read_bytes(dut, obuf_addr(k), M)
         for m in range(M):
             got = to_int8(row[m])
             if got != int(golden[k, m]):
@@ -951,9 +966,9 @@ async def test_hw_min_identity_sequence(dut):
 
     Addressing must match matmul_min.c one for one: the WBUF/IBUF/OBUF
     bases and the output layout are the same numbers on both sides. Output
-    row k is now at OBUF_BASE + k*pitch(M) (here k*16), a contiguous image
-    read through the remap, so matmul_min.c needs OBUF_BASE = 0x9000 and
-    that row stride instead of the old per-bank stride.
+    row k is at OBUF_BASE + k*OBUF_CANVAS_W (128 bytes per canvas row,
+    whatever M is), so matmul_min.c needs OBUF_BASE = 0x9000 and that row
+    stride.
     """
     K = N = M = ARRAY_ROWS
     assert ARRAY_ROWS == 16 and ARRAY_COLS == 16, (
@@ -1008,7 +1023,7 @@ async def test_hw_min_identity_sequence(dut):
     # ---- phase: read output buffer as single words, one per output row ----
     Y = np.zeros((K, M), dtype=np.int64)
     for k in range(K):
-        row_base = obuf_row_addr(k, M)
+        row_base = obuf_addr(k)
         for m in range(0, M, BYTES_PER_WORD):
             word = await avalon_read(dut, row_base + m)
             for j in range(BYTES_PER_WORD):
@@ -1019,7 +1034,7 @@ async def test_hw_min_identity_sequence(dut):
     # here and a failure on hardware name the same location. ----
     mismatches = [
         (k, m, int(golden[k, m]), int(Y[k, m]),
-         obuf_row_addr(k, M) + m)
+         obuf_addr(k) + m)
         for k in range(K) for m in range(M)
         if int(Y[k, m]) != int(golden[k, m])
     ]
@@ -1211,7 +1226,7 @@ async def test_padded_input_multiband_matmul(dut):
 
     assert M % BYTES_PER_WORD != 0 and N // ARRAY_COLS > 1
     num_k_blocks = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
-    assert num_k_blocks * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH)
+    assert_fits_canvas(K, M)
 
     rng = np.random.default_rng(23)
     await start_clock(dut)
@@ -1243,7 +1258,7 @@ async def test_padded_input_multiband_matmul(dut):
 
     mismatches = []
     for k in range(K):
-        row = await read_bytes(dut, obuf_row_addr(k, M), M)
+        row = await read_bytes(dut, obuf_addr(k), M)
         for m in range(M):
             got = to_int8(row[m])
             if got != int(golden[k, m]):
@@ -1301,7 +1316,7 @@ async def test_128x128x128_matmul(dut):
     num_n_blocks = (N + ARRAY_COLS - 1) // ARRAY_COLS
     assert num_k_blocks * row_pitch(N) <= (1 << WBUF_BANK_ADDR_WIDTH), "weight bank too small"
     assert num_n_blocks * row_pitch(M) <= (1 << IBUF_BANK_ADDR_WIDTH), "input bank too small"
-    assert num_k_blocks * row_pitch(M) <= (1 << OBUF_BANK_ADDR_WIDTH), "output bank too small"
+    assert_fits_canvas(K, M)
 
     rng = np.random.default_rng(31)
     await start_clock(dut)
@@ -1349,8 +1364,8 @@ async def test_128x128x128_matmul(dut):
     # at 2**(n-1) = 1024 beats, so a Platform Designer master would not
     # issue this - it tests this slave's counters, not the interconnect.)
     #
-    # The output image is K rows x row_pitch(M) = 1024 words, exactly the
-    # output window (obuf_words), so beats 0..1023 read every row in order
+    # The canvas is 128 rows x 128 bytes = 1024 words, exactly the output
+    # window (obuf_words), so beats 0..1023 read every canvas row in order
     # and beats 1024..2046 run past the end of the window. accel_top truncates the burst address to
     # the window's word-address width, so those beats wrap back to word 0.
     # The wrap is checked too: it shows the address counter stayed in step
@@ -1370,12 +1385,12 @@ async def test_128x128x128_matmul(dut):
     # the bus must still accept a new transaction after a max-length burst
     await read_status(dut)
 
-    # beats 0..obuf_words-1 are the whole contiguous output image: row k
-    # at byte k*row_pitch(M)
+    # beats 0..obuf_words-1 are the whole canvas: output row k is canvas
+    # row k, at byte k*OBUF_CANVAS_W
     image = []
     for w in words[:obuf_words]:
         image += word_bytes(w)
-    pitch = row_pitch(M)
+    pitch = OBUF_CANVAS_W
     Y = np.zeros((K, M), dtype=object)     # object: an X byte stays None
     for k in range(K):
         Y[k, :] = [to_int8(b) for b in image[k * pitch:k * pitch + M]]
@@ -1547,3 +1562,201 @@ async def test_burst_read_beat_count(dut):
         raise AssertionError(
             "readdatavalid pulse count does not match burstcount: "
             + ", ".join(bad))
+
+
+# ---------------------------------------------------------------------------
+# Output canvas tiling (TILE_CFG)
+# ---------------------------------------------------------------------------
+
+async def program_tile(dut, tile_r, tile_c, use_prev_out=False):
+    """TILE_CFG: put this matmul's K x M result at canvas row tile_r*K,
+    column tile_c*M; use_prev_out accumulates onto what the canvas already
+    holds. Latched by matmul_start, like the dimension registers."""
+    await avalon_write(dut, TILE_CFG_ADDR,
+                       (tile_r << TILE_R_SHIFT) | (tile_c << TILE_C_SHIFT)
+                       | (int(use_prev_out) << USE_PREV_OUT_BIT))
+
+
+async def run_tile(dut, W_tile, X_tile, q16, tile_r, tile_c, use_prev_out=False):
+    """One complete matmul that writes one tile of the output canvas."""
+    K, N = W_tile.shape
+    M = X_tile.shape[1]
+    assert_fits_canvas(K, M, tile_r, tile_c)
+    await program_dims(dut, K, N, M, q16)
+    await program_tile(dut, tile_r, tile_c, use_prev_out)
+    await write_weights(dut, W_tile)
+    await write_inputs(dut, X_tile)
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    await wait_matmul_done(dut)
+
+
+async def read_canvas(dut, rows, cols):
+    """Top-left rows x cols of the output canvas as int8, one burst per
+    canvas row; a byte that is X in simulation comes back as None."""
+    Y = np.zeros((rows, cols), dtype=object)
+    for R in range(rows):
+        Y[R, :] = [to_int8(b) for b in await read_bytes(dut, obuf_addr(R), cols)]
+    return Y
+
+
+def check_canvas(Y, golden, what):
+    bad = [(r, c, int(golden[r, c]), Y[r, c])
+           for r in range(golden.shape[0]) for c in range(golden.shape[1])
+           if Y[r, c] != golden[r, c]]
+    if bad:
+        preview = ", ".join(f"y[{r},{c}]: exp {e}, got {g}" for r, c, e, g in bad[:8])
+        raise AssertionError(
+            f"{what}: {len(bad)}/{golden.size} mismatches. First few: {preview}")
+
+
+def quantized_problem(rng, K, N, M):
+    """Float W (K x N) and X (N x M), quantized per tensor as in the other
+    tests; returns (W_int8, X_int8, q16) with one OUTPUT_SCALE for the whole
+    product, so every tile of a tiled run shares it."""
+    W_real = rng.normal(0.0, REAL_VAL_STD, size=(K, N))
+    X_real = rng.normal(0.0, REAL_VAL_STD, size=(N, M))
+    W_int8, ws = quantize_symmetric_int8(W_real)
+    X_int8, xs = quantize_symmetric_int8(X_real)
+    _, os_ = quantize_symmetric_int8(W_real @ X_real)
+    assert 0.0 <= ws * xs / os_ < 1.0
+    return W_int8, X_int8, round(ws * xs / os_ * 65536)
+
+
+@cocotb.test()
+async def test_tiled_canvas_use_prev_out(dut):
+    """Y (128x128) = W (128x128) @ X (128x128) as eight matmuls: 2x2 output
+    tiles of 64x64, each tile's contraction split into two halves of 64.
+
+    The order is half-outer, tile-inner: all four tiles' first halves with
+    use_prev_out = 0, then all four second halves with use_prev_out = 1.
+    That checks three things at once:
+      - tile (tr, tc) lands at canvas rows 64*tr.., columns 64*tc.. - all
+        four quadrants, read back as one 128x128 image;
+      - a second-half matmul accumulates onto ITS OWN tile's first half,
+        with three other tiles written in between;
+      - a first-half matmul overwrites whatever the canvas held before
+        (earlier tests leave data in it).
+    use_prev_out continues the same saturating int8 accumulate the hardware
+    does between contraction blocks of one matmul, so the expected result
+    is exactly golden_blocked over the full N = 128: the second half's
+    blocks simply carry on the first half's chain.
+    """
+    T = 64                     # tile edge: K = M = T per matmul
+    H = 64                     # contraction half: N = H per matmul
+    K = M = 2 * T
+    N = 2 * H
+    assert_fits_canvas(K, M)
+
+    rng = np.random.default_rng(41)
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=BIG_MATMUL_WATCHDOG_CYCLES))
+    await reset_dut(dut)
+
+    W_int8, X_int8, q16 = quantized_problem(rng, K, N, M)
+    golden = golden_blocked(W_int8, X_int8, q16)
+
+    for half in range(2):
+        for tr in range(2):
+            for tc in range(2):
+                await run_tile(dut,
+                               W_int8[tr * T:(tr + 1) * T, half * H:(half + 1) * H],
+                               X_int8[half * H:(half + 1) * H, tc * T:(tc + 1) * T],
+                               q16, tr, tc, use_prev_out=(half == 1))
+
+    check_canvas(await read_canvas(dut, K, M), golden,
+                 "2x2 tiles x 2 contraction halves on the 128x128 canvas")
+
+
+@cocotb.test()
+async def test_tiled_unaligned_col_offset(dut):
+    """2x2 tiles of 16 x 24 (K = 16, N = 16, M = 24), each a complete
+    matmul. The right-hand tiles start at canvas column 24, which is not a
+    multiple of the 16-byte bus word, so tile (r, 1) shares the bus word
+    holding columns 16..31 with tile (r, 0): its byte writes must not
+    disturb the left tile's columns 16..23. The bottom tiles start at
+    canvas row 16, one bank row block down. Together the four tiles must
+    hold exactly W @ X.
+    """
+    T_K, T_M = ARRAY_ROWS, 24
+    K, N, M = 2 * T_K, ARRAY_COLS, 2 * T_M
+    assert T_M % BYTES_PER_WORD != 0, "test is pointless unless column tiles start mid-word"
+    assert_fits_canvas(K, M)
+
+    rng = np.random.default_rng(43)
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=MULTIBLOCK_WATCHDOG_CYCLES))
+    await reset_dut(dut)
+
+    W_int8, X_int8, q16 = quantized_problem(rng, K, N, M)
+    golden = golden_blocked(W_int8, X_int8, q16)
+
+    for tr in range(2):
+        for tc in range(2):
+            await run_tile(dut,
+                           W_int8[tr * T_K:(tr + 1) * T_K, :],
+                           X_int8[:, tc * T_M:(tc + 1) * T_M],
+                           q16, tr, tc)
+
+    check_canvas(await read_canvas(dut, K, M), golden,
+                 "2x2 tiles of 16x24 on the canvas")
+
+
+@cocotb.test()
+async def test_done_set_wins_over_status_read(dut):
+    """A STATUS read whose read-to-clear lands in the same cycle as the
+    matmul's done pulse must not lose the done event.
+
+    rdl/ctrl_reg.sv/ctrl_rf_rf.sv is generated, and PeakRDL-verilog lets the
+    read-to-clear win that collision; rdl/python_gen.py patches the output
+    so the hardware set wins. Without the patch, a poll that lands on the
+    pulse clears it, and every later poll reads done = 0: wait_matmul_done
+    hangs. Normal polling hits that only by chance, so this test sets the
+    collision up on purpose: run a matmul once to measure when its done
+    pulse fires, then run the identical matmul again and time one STATUS
+    read to be accepted in exactly that cycle.
+    """
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=MULTIBLOCK_WATCHDOG_CYCLES))
+    await reset_dut(dut)
+
+    K = N = M = ARRAY_ROWS
+    await program_dims(dut, K, N, M, 32768)
+    await write_weights(dut, 2 * np.eye(K, N, dtype=np.int64))
+    await write_inputs(dut, np.arange(N * M, dtype=np.int64).reshape(N, M) % 100)
+
+    # run 1: no bus traffic while it computes; count rising edges from the
+    # start write to the edge that ends the done-pulse cycle (a value read
+    # at a rising edge is the one from the cycle that edge ends)
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    n_pulse = 0
+    while True:
+        await RisingEdge(dut.clk)
+        n_pulse += 1
+        if int(dut.matmul_done_pulse.value):
+            break
+    assert (await read_status(dut)) & (1 << STATUS_DONE_BIT), "run 1: done not set"
+
+    # run 2: identical matmul. A read presented right after edge j stalls
+    # one cycle and is accepted (its read-to-clear cycle) in the cycle that
+    # edge j+2 ends, so present it after edge n_pulse-2.
+    collided = [False]
+
+    async def watch_collision():
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.matmul_done_pulse.value) and int(dut.rf_data_valid.value):
+                collided[0] = True
+
+    watcher = cocotb.start_soon(watch_collision())
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    await ClockCycles(dut.clk, n_pulse - 2)
+    timed = await read_status(dut)
+    watcher.cancel()
+    assert collided[0], (
+        "test setup failed: the timed STATUS read did not land on the done "
+        "pulse, so it proves nothing - did run 2's timing differ from run 1?")
+    assert not timed & (1 << STATUS_DONE_BIT), (
+        "the timed read already saw done - it was not in the collision cycle")
+
+    # the set must have won: done is still pending for the next poll
+    await wait_matmul_done(dut, timeout_reads=20)

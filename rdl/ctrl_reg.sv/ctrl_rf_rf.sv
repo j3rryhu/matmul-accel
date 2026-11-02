@@ -31,6 +31,11 @@ module ctrl_rf_rf #(
     // Register OUTPUT_SCALE
     output logic                     [15: 0] OUTPUT_SCALE_value_q,              //! Current field value
 
+    // Register TILE_CFG
+    output logic                     [14: 0] TILE_CFG_tile_r_q,              //! Current field value
+    output logic                     [14: 0] TILE_CFG_tile_c_q,              //! Current field value
+    output logic                     [ 0: 0] TILE_CFG_use_prev_out_q,              //! Current field value
+
     // Register Bus
     input  logic                             valid,    //! Active high valid
     input  logic                             read,     //! Indicates request is a read
@@ -79,6 +84,18 @@ module ctrl_rf_rf #(
     logic                             OUTPUT_SCALE_value_anded;
     logic                             OUTPUT_SCALE_value_ored;
     logic                             OUTPUT_SCALE_value_xored;
+    logic                           [14: 0] TILE_CFG_tile_r_next;
+    logic                             TILE_CFG_tile_r_anded;
+    logic                             TILE_CFG_tile_r_ored;
+    logic                             TILE_CFG_tile_r_xored;
+    logic                           [14: 0] TILE_CFG_tile_c_next;
+    logic                             TILE_CFG_tile_c_anded;
+    logic                             TILE_CFG_tile_c_ored;
+    logic                             TILE_CFG_tile_c_xored;
+    logic                           [ 0: 0] TILE_CFG_use_prev_out_next;
+    logic                             TILE_CFG_use_prev_out_anded;
+    logic                             TILE_CFG_use_prev_out_ored;
+    logic                             TILE_CFG_use_prev_out_xored;
 /* verilator lint_on UNUSED */
 
     // ============================================================
@@ -116,6 +133,7 @@ module ctrl_rf_rf #(
     logic                     [DATA_WIDTH-1:0] INPUT_COLS_rdata;
     logic                     [DATA_WIDTH-1:0] STATUS_rdata;
     logic                     [DATA_WIDTH-1:0] OUTPUT_SCALE_rdata;
+    logic                     [DATA_WIDTH-1:0] TILE_CFG_rdata;
 
     assign sw_rdata = // or of each register return (masked)
                    CONTROL_rdata | 
@@ -124,7 +142,8 @@ module ctrl_rf_rf #(
                    INPUT_MAX_ADDR_rdata | 
                    INPUT_COLS_rdata | 
                    STATUS_rdata | 
-                   OUTPUT_SCALE_rdata;
+                   OUTPUT_SCALE_rdata | 
+                   TILE_CFG_rdata;
             
         
     // ============================================================
@@ -393,9 +412,9 @@ module ctrl_rf_rf #(
             STATUS_done_q <= STATUS_done_next;
         end
         // Software read
-        // NB hand edit, re-apply after regenerating: `else` so a hardware
-        // set on the same cycle as a read-to-clear wins and the done event
-        // isn't lost (PeakRDL emits a plain `if`, letting the clear win)
+        // NB patched by rdl/python_gen.py: `else` so a hardware set in the
+        // same cycle as a read-to-clear wins and the done event isn't lost
+        // (PeakRDL emits a plain `if`, letting the clear win)
         else if (STATUS_sw_rd) begin
             STATUS_done_q <= '0;
         end
@@ -440,6 +459,92 @@ module ctrl_rf_rf #(
         // Software write
         if (OUTPUT_SCALE_sw_wr) begin
             OUTPUT_SCALE_value_q <=  sw_masked_data[15: 0] | (OUTPUT_SCALE_value_q & ~sw_mask[15: 0]);
+        end
+    end
+            
+        
+    // ============================================================
+    // Register: TILE_CFG
+    //    [14: 0]               tile_r: hw=r     sw=w     reset=0x0
+    //    [29:15]               tile_c: hw=r     sw=w     reset=0x0
+    //    [30:30]         use_prev_out: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  TILE_CFG_decode;
+    logic                  TILE_CFG_sw_wr;
+    logic                  TILE_CFG_sw_rd;
+    logic [DATA_WIDTH-1:0] TILE_CFG_q;
+
+    assign TILE_CFG_decode = (addr == (ADDR_OFFSET+'h0+'h70));
+    assign TILE_CFG_sw_wr = sw_wr && TILE_CFG_decode;
+    assign TILE_CFG_sw_rd = sw_rd && TILE_CFG_decode;
+
+    always_comb begin
+        TILE_CFG_q = '0;
+        TILE_CFG_q[14: 0] = TILE_CFG_tile_r_q;
+        TILE_CFG_q[29:15] = TILE_CFG_tile_c_q;
+        TILE_CFG_q[30:30] = TILE_CFG_use_prev_out_q;
+    end
+
+    // masked version of return data
+    assign TILE_CFG_rdata = TILE_CFG_sw_rd ? TILE_CFG_q : 'b0;
+
+    // ------------------------------------------------------------
+    // Field: tile_r
+    // ------------------------------------------------------------
+    assign TILE_CFG_tile_r_anded = & TILE_CFG_tile_r_q;
+    assign TILE_CFG_tile_r_ored  = | TILE_CFG_tile_r_q;
+    assign TILE_CFG_tile_r_xored = ^ TILE_CFG_tile_r_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        TILE_CFG_tile_r_q <= 0;
+    end else begin
+        // Software write
+        if (TILE_CFG_sw_wr) begin
+            TILE_CFG_tile_r_q <=  sw_masked_data[14: 0] | (TILE_CFG_tile_r_q & ~sw_mask[14: 0]);
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Field: tile_c
+    // ------------------------------------------------------------
+    assign TILE_CFG_tile_c_anded = & TILE_CFG_tile_c_q;
+    assign TILE_CFG_tile_c_ored  = | TILE_CFG_tile_c_q;
+    assign TILE_CFG_tile_c_xored = ^ TILE_CFG_tile_c_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        TILE_CFG_tile_c_q <= 0;
+    end else begin
+        // Software write
+        if (TILE_CFG_sw_wr) begin
+            TILE_CFG_tile_c_q <=  sw_masked_data[29:15] | (TILE_CFG_tile_c_q & ~sw_mask[29:15]);
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Field: use_prev_out
+    // ------------------------------------------------------------
+    assign TILE_CFG_use_prev_out_anded = & TILE_CFG_use_prev_out_q;
+    assign TILE_CFG_use_prev_out_ored  = | TILE_CFG_use_prev_out_q;
+    assign TILE_CFG_use_prev_out_xored = ^ TILE_CFG_use_prev_out_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        TILE_CFG_use_prev_out_q <= 0;
+    end else begin
+        // Software write
+        if (TILE_CFG_sw_wr) begin
+            TILE_CFG_use_prev_out_q <=  sw_masked_data[30:30] | (TILE_CFG_use_prev_out_q & ~sw_mask[30:30]);
         end
     end
 

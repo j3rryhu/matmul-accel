@@ -71,6 +71,11 @@ module ctrl_rf_tb #(
     // Register OUTPUT_SCALE
     logic                     [15: 0] OUTPUT_SCALE_value_q;
 
+    // Register TILE_CFG
+    logic                     [14: 0] TILE_CFG_tile_r_q;
+    logic                     [29:15] TILE_CFG_tile_c_q;
+    logic                     [30:30] TILE_CFG_use_prev_out_q;
+
     // Register Bus
     logic                             valid;    // active high
     logic                             read;     // indicates request is a read
@@ -242,6 +247,57 @@ module ctrl_rf_tb #(
 
             `SW_WRITE( 96, 0 )
             #1 `CHECK_EQUAL(OUTPUT_SCALE_value_q, value[15: 0])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (TILE_CFG_tile_r ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 0; IDX <= 14; ++IDX) begin
+
+            temp = '0;
+            temp[14: 0] = TILE_CFG_tile_r_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 112, (1 << IDX) )
+            #1 `CHECK_EQUAL(TILE_CFG_tile_r_q, temp[14: 0])
+
+            `SW_WRITE( 112, 0 )
+            #1 `CHECK_EQUAL(TILE_CFG_tile_r_q, value[14: 0])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (TILE_CFG_tile_c ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 15; IDX <= 29; ++IDX) begin
+
+            temp = '0;
+            temp[29:15] = TILE_CFG_tile_c_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 112, (1 << IDX) )
+            #1 `CHECK_EQUAL(TILE_CFG_tile_c_q, temp[29:15])
+
+            `SW_WRITE( 112, 0 )
+            #1 `CHECK_EQUAL(TILE_CFG_tile_c_q, value[29:15])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (TILE_CFG_use_prev_out ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 30; IDX <= 30; ++IDX) begin
+
+            temp = '0;
+            temp[30:30] = TILE_CFG_use_prev_out_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 112, (1 << IDX) )
+            #1 `CHECK_EQUAL(TILE_CFG_use_prev_out_q, temp[30:30])
+
+            `SW_WRITE( 112, 0 )
+            #1 `CHECK_EQUAL(TILE_CFG_use_prev_out_q, value[30:30])
 
         end
 

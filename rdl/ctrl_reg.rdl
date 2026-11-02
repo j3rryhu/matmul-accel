@@ -101,4 +101,32 @@ addrmap ctrl_rf {
             reset = 0;
         } value [15:0];
     } OUTPUT_SCALE @ 0x60;
+
+    // Output tile placement (0x70). The output buffer is one 128x128 int8
+    // canvas; this matmul's K x M result lands with its top-left corner at
+    // canvas row tile_r*WEIGHT_ROWS, column tile_c*INPUT_COLS. Every tile
+    // of one result must use the same K and M, and with tile_r > 0, K must
+    // be a multiple of 16 (bank boundary). use_prev_out: the first
+    // contraction block accumulates onto the canvas instead of overwriting
+    // it, to split a long contraction across matmuls. Latched at
+    // matmul_start. See rtl/accel_top.sv's TILE_CFG latch.
+    reg {
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } tile_r [14:0];
+
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } tile_c [29:15];
+
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } use_prev_out;
+    } TILE_CFG @ 0x70;
 };

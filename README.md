@@ -80,7 +80,7 @@ address drives that region's RAM or register file directly.
 | `CTRL_BASE` | `0x0000_0000` | `0x100` | R/W, 32-bit words | Control/status register file (`ctrl_rf`) |
 | `WBUF_BASE` | `0x0000_1000` | `0x4000` (16 KB) | **write-only**, byte | `weight_buffer` (banked) |
 | `IBUF_BASE` | `0x0000_5000` | `0x4000` (16 KB) | **write-only**, byte | `input_buffer` (banked) |
-| `OBUF_BASE` | `0x0000_9000` | `0x4000` (16 KB) | **read-only**, byte | `output_buffer` (banked) |
+| `OBUF_BASE` | `0x0000_9000` | `0x4000` (16 KB) | **read-only**, byte | `output_buffer`: the 128x128 output canvas |
 
 The whole map spans `0x0000_0000`-`0x0000_CFFF`, so the slave needs at
 least a 16-bit byte address. `OBUF_BASE` moved from `0x7000` to `0x9000`
@@ -98,18 +98,16 @@ Access conventions:
 - **Write whole contiguous images.** Write `W` and `X` each as one
   row-major image with every row zero-padded to a multiple of 16 bytes (see
   [Buffer layouts](#buffer-layouts)); hardware scatters the rows to banks.
-- **Results read back as a contiguous padded image.** Output rows are
-  word-aligned, so a whole row is a run of whole words. When `M` is not a
-  multiple of 16, a row's last word ends in pad bytes, which are never
-  written; ignore them.
+- **Results read back as a 128x128 canvas.** Canvas row `R` starts at
+  `OBUF_BASE + 128*R`, whatever `M` is. A matmul writes only its own tile
+  of the canvas; every other byte keeps what it held. See
+  [Output canvas and tiling](#output-canvas-and-tiling).
 - **Each register is its own 128-bit bus word** at the 16-byte-aligned
   offsets below; its value sits in the low bytes (lanes 0..3), so a write
   needs `avs_byteenable` bits 0..3 set.
 - **Reads are pipelined with variable latency.** Every beat is marked by
   `avs_readdatavalid`, never in the cycle the read is accepted: `CTRL`
-  beats arrive 1 cycle after acceptance, `OBUF` beats 3 cycles after,
-  because the read address goes through the same remap as the writes.
-  The slave holds one read in flight at a time, using `avs_waitrequest`
+  and `OBUF` beats both arrive 1 cycle after acceptance. The slave holds one read in flight at a time, using `avs_waitrequest`
   to stall the next command until the previous read has returned its last
   beat. Declare `maximumPendingReadTransactions = 1`.
 - **Burst reads are supported** for `CTRL` and `OBUF`: drive
@@ -134,10 +132,13 @@ Defined in [`rdl/ctrl_reg.rdl`](rdl/ctrl_reg.rdl), compiled to
 | `0x10` | `WEIGHT_ROWS` | `value` | `[15:0]` | W | `K` - **output rows**. May be any value; a non-multiple of `ARRAY_ROWS` is handled by masking. |
 | `0x20` | `WEIGHT_COLS` | `value` | `[15:0]` | W | `N` - **contraction size**. **Must be a multiple of `ARRAY_COLS`** (see [Known issues](#known-issues)). |
 | `0x30` | `INPUT_MAX_ADDR` | `value` | `[9:0]` | W | `M` - number of reads issued per input band. Set equal to `INPUT_COLS`. |
-| `0x40` | `INPUT_COLS` | `value` | `[15:0]` | W | `M` - output/activation column count. Sets the output row length, and its padded pitch for both `output_loader` and the `OBUF` read remap. Keep it at `M` until the result is read. |
+| `0x40` | `INPUT_COLS` | `value` | `[15:0]` | W | `M` - output/activation column count: the width of this matmul's output tile. |
 | `0x50` | `STATUS` | `busy` | `[0]` | R | Live level. Compute in progress: `weight_ctrl` sequencing **or** `output_loader` still draining. |
 | `0x50` | `STATUS` | `done` | `[1]` | R, **read-to-clear** | Sticky. Set once per matmul, when every block is committed **and** the last one has drained. Cleared by the read that observes it. |
 | `0x60` | `OUTPUT_SCALE` | `value` | `[15:0]` | W | Q0.16 unsigned rescale factor; actual scale = `value/65536`, range `[0,1)`. |
+| `0x70` | `TILE_CFG` | `tile_r` | `[14:0]` | W | Output tile row index: this matmul's result starts at canvas row `tile_r * WEIGHT_ROWS`. |
+| `0x70` | `TILE_CFG` | `tile_c` | `[29:15]` | W | Output tile column index: the result starts at canvas column `tile_c * INPUT_COLS`. |
+| `0x70` | `TILE_CFG` | `use_prev_out` | `[30]` | W | 1 = the first contraction block accumulates onto the canvas instead of overwriting it. See [Output canvas and tiling](#output-canvas-and-tiling). |
 
 The two bits behave differently, and the difference matters:
 
@@ -158,7 +159,10 @@ The two bits behave differently, and the difference matters:
 
 If a completion pulse arrives on the same cycle as a software read, the
 hardware write wins and the bit stays set for the next read, so an event
-cannot be lost to that collision.
+cannot be lost to that collision. PeakRDL does not generate that priority:
+[`rdl/python_gen.py`](rdl/python_gen.py) patches it into the generated
+register file after export, and `test_done_set_wins_over_status_read`
+checks it.
 
 ### `OUTPUT_SCALE` and the quantization scheme
 
@@ -198,13 +202,15 @@ which must land in `[0, 65536)` - i.e. the combined scale must be `< 1.0`.
     write INPUT_MAX_ADDR = M
     write INPUT_COLS     = M
     write OUTPUT_SCALE   = round(w_scale * x_scale / y_scale * 65536)
+    write TILE_CFG       = tile_r | tile_c << 15 | use_prev_out << 30
+                                     # 0 for a single, untiled matmul
  3. write weight bytes into WBUF  (layout below)
     write input  bytes into IBUF  (layout below)
  4. write CONTROL.matmul_start = 1  # single pulse, self-clearing
  5. poll STATUS until bit[1] (done) reads 1
     # NB: that read consumes done - keep the value, don't re-read
  6. read result bytes from OBUF   (layout below)
-    # INPUT_COLS must still be M here - the OBUF read remap uses it
+    # canvas row R at OBUF_BASE + 128*R; with tiling, after the last tile
 ```
 
 Step 4 is the **only** software trigger. From there `weight_ctrl` sequences
@@ -228,24 +234,60 @@ step 4, because `matmul_start` latches the dimension registers.
 buffers have 1024-byte banks. `pitch(c) = roundup(c, 16)` is a row padded
 to whole 128-bit words.
 
-All three matrices are contiguous row-major images with padded rows. `W`
-is stored exactly as written on paper, with no transpose:
+`W` and `X` are contiguous row-major images with padded rows, and the
+result is read from a fixed 128x128 canvas. `W` is stored exactly as written
+on paper, with no transpose:
 
 ```
-addr(k, n) = WBUF_BASE + k*pitch(N) + n     W: k in [0,K), n in [0,N)   write
-addr(p, m) = IBUF_BASE + p*pitch(M) + m     X: p in [0,N), m in [0,M)   write
-addr(k, m) = OBUF_BASE + k*pitch(M) + m     Y: k in [0,K), m in [0,M)   read
+addr(k, n) = WBUF_BASE + k*pitch(N) + n     W: k in [0,K), n in [0,N)    write
+addr(p, m) = IBUF_BASE + p*pitch(M) + m     X: p in [0,N), m in [0,M)    write
+addr(R, C) = OBUF_BASE + R*128 + C          canvas: R, C in [0,128)      read
 ```
 
-Inside each buffer, [`rtl/buf_addr_remap.v`](rtl/buf_addr_remap.v) maps row
-`r` to bank `r % 16`, at offset `(r / 16) * pitch` within the bank. It uses
-the live register values: `WEIGHT_COLS` for `W`, `INPUT_MAX_ADDR` for `X`,
-and `INPUT_COLS` for `Y`. Program them **before** writing the inputs, and
-leave `INPUT_COLS` alone until the result has been read. `output_loader`
-writes each output row at that same padded pitch.
+Inside the weight and input buffers,
+[`rtl/buf_addr_remap.v`](rtl/buf_addr_remap.v) maps row `r` to bank
+`r % 16`, at offset `(r / 16) * pitch` within the bank. It uses the live
+`WEIGHT_COLS` and `INPUT_MAX_ADDR` values, so program them **before**
+writing either buffer. The canvas needs no remap: its pitch is a fixed
+power of two, so the bank and offset are bit fields of the address.
 
-Results are **int8**; sign-extend the byte you read back. Pad bytes at the
-end of each output row are never written.
+Results are **int8**; sign-extend the byte you read back.
+
+### Output canvas and tiling
+
+The output buffer is one 128x128 int8 canvas. Each matmul writes its
+`K x M` result as one tile of it, placed by `TILE_CFG`:
+
+```
+result[k][m]  ->  canvas[tile_r*K + k][tile_c*M + m]
+```
+
+With `TILE_CFG = 0` that is `canvas[k][m]`, the untiled case. To build a
+larger result, run one matmul per tile and read the canvas once at the end.
+For example, `Y` (128x128) as 2x2 tiles of 64x64 is four matmuls with
+`(tile_r, tile_c)` = (0,0), (0,1), (1,0), (1,1).
+
+`use_prev_out` splits a contraction too long for one matmul. With it set,
+the matmul's first contraction block adds onto the canvas instead of
+overwriting it, so the second part of `N` carries on the first part's
+accumulation. It is the same saturating int8 add the hardware uses between
+contraction blocks, so the result is identical to one long matmul.
+
+Rules - nothing in hardware checks them:
+
+- Every tile of one result uses the same `K` and `M`. The offsets scale
+  with the current matmul's `K` and `M`, so pad an edge tile with zeros
+  rather than shrinking it.
+- With `tile_r > 0`, `K` must be a multiple of 16, so the tile's rows start
+  on a bank boundary. Column offsets can be anything.
+- The tile must lie inside the canvas: `(tile_r+1)*K <= 128` and
+  `(tile_c+1)*M <= 128`.
+- `TILE_CFG` is latched at `matmul_start`, like the dimension registers.
+
+A bigger canvas is a parameter change - `OBUF_CANVAS_W` in
+[`rtl/accel_top.sv`](rtl/accel_top.sv), a deeper `output_buffer` IP and a
+bigger `OBUF` window. 256x256 needs a 64 KB window, which no longer fits
+below the current 64 KB span.
 
 ---
 
@@ -258,12 +300,14 @@ programming a matmul:
 |---|---|
 | `ceil(K / ARRAY_ROWS) * pitch(N) <= 1024` | weight_buffer per-bank depth |
 | `ceil(N / ARRAY_COLS) * pitch(M) <= 1024` | input_buffer per-bank depth |
-| `ceil(K / ARRAY_ROWS) * pitch(M) <= 1024` | output_buffer per-bank depth |
+| `(tile_r+1)*K <= 128` and `(tile_c+1)*M <= 128` | output canvas |
+| `K % 16 == 0` when `tile_r > 0` | tile rows start on a bank boundary |
 | `M <= 1023` | `INPUT_MAX_ADDR` is a 10-bit field |
 
 `K = N = M = 128` fills all three buffers exactly
-(`test_128x128x128_matmul`). Beyond that the bounds trade off against each
-other: larger `K` or `N` needs a smaller `M`, and vice versa.
+(`test_128x128x128_matmul`). Beyond that the input bounds trade off against
+each other: larger `K` or `N` needs a smaller `M`, and vice versa. Splitting
+the contraction across matmuls with `use_prev_out` removes the limit on `N`.
 
 ---
 
@@ -386,6 +430,9 @@ make clean
 | `test_partial_row_block_matmul` | Partial last **output-row** block (`K` not a multiple of `ARRAY_ROWS`): `valid_row` masking, `weight_loader` zero-padding, `output_loader` row gating |
 | `test_back_to_back_matmul_no_reset` | Two matmuls with no reset between - regression test for stale `STATUS.done`/`busy` |
 | `test_128x128x128_matmul` | `W` (128x128) @ `X` (128x128): 64 blocks, fills every buffer bank to its full 1 KB, and is the only test with `M` larger than the 32-entry input FIFOs. Reads the result back in one 2047-beat burst, the 11-bit `avs_burstcount` maximum, which runs past the 1024-word output window and wraps to its start. Logs cycles from `matmul_start` to `STATUS.done`. Takes about a minute in Icarus. |
+| `test_tiled_canvas_use_prev_out` | `Y` (128x128) as 2x2 tiles of 64x64, each tile's contraction split into two `use_prev_out` matmuls: eight matmuls into one canvas, read back once. Takes about a minute. |
+| `test_tiled_unaligned_col_offset` | 2x2 tiles of 16x24, so column tiles start mid-word and share bus words with their left neighbour |
+| `test_done_set_wins_over_status_read` | Times a `STATUS` read to land exactly on the done pulse; the done event must survive. Guards the patch `rdl/python_gen.py` applies to the generated register file. |
 
 Test dimensions derive from `ARRAY_ROWS`/`ARRAY_COLS` (top of
 `tb/test_accel_top.py`, which must match `accel_top.sv`), so the suite
