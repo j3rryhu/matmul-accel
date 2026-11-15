@@ -250,7 +250,8 @@ module output_loader #(
     reg                     running;
     reg                     running_d;
     reg                     running_2d;
-    reg                     running_3d;   // covers the GELU stage-4 write (see busy below)
+    reg                     running_3d;
+    reg                     running_4d;   // covers the GELU stage-4 write (see busy below)
     reg  [ELAPSED_W:0]      elapsed;
 
     reg  [ROW_ADDR_WIDTH-1:0] row_count [0:ARRAY_COLS-1];
@@ -302,6 +303,7 @@ module output_loader #(
             running_d        <= 0;
             running_2d       <= 0;
             running_3d       <= 0;
+            running_4d       <= 0;
         end
         else begin
             if (running) begin
@@ -329,6 +331,7 @@ module output_loader #(
             running_d  <= running;
             running_2d <= running_d;
             running_3d <= running_2d;
+            running_4d <= running_3d;
         end
     end
 
@@ -385,13 +388,20 @@ module output_loader #(
             assign bbuf_rden[r] = final_blk && bias_en ? row_active : 0;
             assign bbuf_rdaddress[r*BIAS_ADDR_WIDTH +: BIAS_ADDR_WIDTH] = tile_row_blk + held_k_blk_idx;
 
-            // three-cycle pipeline: the first stage lines psum_q[r] / obuf_q[r]
-            // (each RAM's own one-cycle synchronous read latency) up with the
-            // psum it should be added to, the next two carry that alongside
-            // the split rescale multiply. addr_d is the psum_buffer slot (the
-            // stage-1 raw write-back); addr8_d and addr_2d..addr_4d are the
-            // output_buffer byte (the final int8 write).
+            // pipeline: the first stage lines psum_q[r] / obuf_q[r] (each
+            // RAM's own one-cycle synchronous read latency) up with the psum
+            // it should be added to, the rest carry that alongside the split
+            // rescale multiply. On the final pass, stage 1b registers acc_last
+            // between the accumulate/bias adds and the multiply (timing: RAM
+            // out -> two adds -> soft multiply was one cycle), so stages 2..4
+            // run one cycle later than their names. addr_d is the psum_buffer
+            // slot (the stage-1 raw write-back); addr8_d, addr_1b and
+            // addr_2d..addr_4d are the output_buffer byte (the final int8 write).
             reg                      active_d;
+            reg                      active_1b;
+            reg [ROW_ADDR_WIDTH-1:0] addr_1b;
+            reg signed [ACC_WIDTH:0] acc_last_1b;   // acc_last, registered: the multiply's input
+            reg [ACC_WIDTH-1:0]      old_val_1b;
             reg                      active_2d;
             reg                      active_3d;
             reg                      active_4d;
@@ -452,6 +462,10 @@ module output_loader #(
                     final_blk_d   <= 0;
                     active_4d     <= 1'b0;
                     addr_4d       <= {ROW_ADDR_WIDTH{1'b0}};
+                    active_1b     <= 1'b0;
+                    addr_1b       <= {ROW_ADDR_WIDTH{1'b0}};
+                    acc_last_1b   <= 0;
+                    old_val_1b    <= 0;
                 end
                 else begin
                     // stage 0 -> 1
@@ -463,15 +477,21 @@ module output_loader #(
 
                     // only rescale at final output
                     if(final_blk_d)begin
-                        // stage 1 -> 2 : the two narrow partial products
+                        // stage 1 -> 1b : register the accumulated, biased sum
+                        acc_last_1b <= acc_last;
+                        addr_1b     <= addr8_d;
+                        active_1b   <= active_d;
+                        old_val_1b  <= old_val;
+
+                        // stage 1b -> 2 : the two narrow partial products
                         // (* multstyle = "logic" *)
-                        prod_hi   <= $signed(acc_last[ACC_WIDTH-1 -: HI_W]) *
+                        prod_hi   <= $signed(acc_last_1b[ACC_WIDTH-1 -: HI_W]) *
                                     $signed({1'b0, output_scale});
                         // (* multstyle = "logic" *)
-                        prod_lo   <= acc_last[LO_W-1:0] * output_scale;
-                        addr_2d   <= addr8_d;
-                        active_2d <= active_d;
-                        old_val_d <= old_val;
+                        prod_lo   <= acc_last_1b[LO_W-1:0] * output_scale;
+                        addr_2d   <= addr_1b;
+                        active_2d <= active_1b;
+                        old_val_d <= old_val_1b;
 
                         // stage 2 -> 3 : shift-and-add into the full product
                         scale_product <= prod_sum;
@@ -512,7 +532,7 @@ module output_loader #(
             assign old_val = {{(ACC_WIDTH-DATA_WIDTH){old_byte[DATA_WIDTH-1]}}, old_byte};
 
             // (first_pass / acc_sum / acc_last are declared above the always
-            // block - acc_last feeds the stage-1 multiply)
+            // block - acc_last is registered in stage 1b, ahead of the multiply)
             
             
             // registered LUT: out_data is valid one cycle after in_valid, i.e.
@@ -558,13 +578,14 @@ module output_loader #(
     // file's header), so it must already be high on the pass's very first
     // read cycle (a prev_int8 read), i.e. rise with `running`; and accel_top gates
     // matmul_complete on !busy, so it must not drop until the last write has
-    // left the pipeline, i.e. fall with `running_3d` - one past stage 3,
-    // for the GELU stage-4 write (also keeps weight_ctrl from committing the
+    // left the pipeline, i.e. fall with `running_4d` - the GELU stage-4
+    // write, which stage 1b puts five cycles after the pass's last read
+    // (also keeps weight_ctrl from committing the
     // next block while that write is still pending). Using the
     // delayed copies alone throws away the first read of every pass (obuf_q
     // then still holds the previous pass's word, and m=0 accumulates onto
     // garbage).
-    assign busy = running || running_d || running_2d || running_3d;
+    assign busy = running || running_d || running_2d || running_3d || running_4d;
     assign done = running && &(row_done | ~((1 << weight_rows) - 1));
 
 endmodule
