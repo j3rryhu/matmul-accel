@@ -261,6 +261,7 @@ module output_loader #(
     reg [DIM_WIDTH-1:0] held_k_blk_idx;
     reg [DIM_WIDTH-1:0] held_n_blk_idx;
     reg                 held_first_k_blk;
+    reg                 held_final_blk;   // last contraction block and not out_raw: write the int8 result
 
     // where this pass's output-row block starts in every bank: canvas row
     // block (tile_row_blk + k_blk), column tile_col_off. Computed from the
@@ -298,6 +299,7 @@ module output_loader #(
             held_k_blk_idx   <= 0;
             held_n_blk_idx   <= 0;
             held_first_k_blk <= 1'b0;
+            held_final_blk   <= 1'b0;
             held_seg_base    <= 0;
             held_seg_base8   <= 0;
             running_d        <= 0;
@@ -324,6 +326,7 @@ module output_loader #(
                     held_k_blk_idx   <= committed_k_blk_idx;
                     held_n_blk_idx   <= committed_n_blk_idx;
                     held_first_k_blk <= committed_first_k_blk;
+                    held_final_blk   <= (committed_n_blk_idx == max_n_blk_idx) && !out_raw;
                     held_seg_base    <= committed_seg_base;
                     held_seg_base8   <= committed_seg_base8;
                 end
@@ -344,7 +347,9 @@ module output_loader #(
             wire row_live   = running && elapsed >= r && r < weight_rows;
             wire row_active = row_live && (row_count[r] < total_rows);
             wire [ROW_ADDR_WIDTH-1:0] per_row_cnt = row_count[r];
-            wire final_blk = (committed_n_blk_idx == max_n_blk_idx) && !out_raw;
+            // latched at pass start with the other held_* values (timing:
+            // the 16-bit compare was the head of the int8 write-data path)
+            wire final_blk = held_final_blk;
             reg  final_blk_d;
 
             // cleared at the start of every pass, not only on &row_done: a
