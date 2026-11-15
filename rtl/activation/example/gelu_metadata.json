@@ -1,0 +1,13 @@
+{
+  "function": "0.5*x*(1+erf(x/sqrt(2)))",
+  "input_scale": 0.03125,
+  "output_scale": 0.03125,
+  "input_zero_point": 0,
+  "output_zero_point": 0,
+  "rounding": "nearest_ties_to_even",
+  "entries": 256,
+  "addressing": "input_int8 & 0xff; output byte is two's complement",
+  "max_absolute_error": 0.015524163314440398,
+  "mean_absolute_error": 0.006481730960956105,
+  "saturated_reference_count": 0
+}

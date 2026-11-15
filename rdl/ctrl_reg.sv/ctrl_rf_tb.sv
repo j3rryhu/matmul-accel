@@ -76,8 +76,20 @@ module ctrl_rf_tb #(
     logic                     [29:15] TILE_CFG_tile_c_q;
     logic                     [30:30] TILE_CFG_use_prev_out_q;
 
-    // Register TILED_MAT_DIM
-    logic                     [15: 0] TILED_MAT_DIM_tiled_c_dim_q;
+    // Register CANVAS_WIDTH
+    logic                     [15: 0] CANVAS_WIDTH_value_q;
+
+    // Register ACT_CFG
+    logic                     [ 0: 0] ACT_CFG_bias_en_q;
+    logic                     [ 1: 1] ACT_CFG_gelu_en_q;
+    logic                     [ 2: 2] ACT_CFG_prev_int8_q;
+    logic                     [ 3: 3] ACT_CFG_out_raw_q;
+
+    // Register TILE_ROWS
+    logic                     [15: 0] TILE_ROWS_value_q;
+
+    // Register TILE_COLS
+    logic                     [15: 0] TILE_COLS_value_q;
 
     // Register Bus
     logic                             valid;    // active high
@@ -304,20 +316,122 @@ module ctrl_rf_tb #(
 
         end
         repeat(5) @(posedge clk);
-        $display("%t: Testcase (TILED_MAT_DIM_tiled_c_dim ):", $time());
+        $display("%t: Testcase (CANVAS_WIDTH_value ):", $time());
         $display("%t:\tSoftware write (hardware read) test", $time());
         for (int IDX = 0; IDX <= 15; ++IDX) begin
 
             temp = '0;
-            temp[15: 0] = TILED_MAT_DIM_tiled_c_dim_q;
+            temp[15: 0] = CANVAS_WIDTH_value_q;
             temp = (1 << IDX);
             value = '0;
 
             `SW_WRITE( 128, (1 << IDX) )
-            #1 `CHECK_EQUAL(TILED_MAT_DIM_tiled_c_dim_q, temp[15: 0])
+            #1 `CHECK_EQUAL(CANVAS_WIDTH_value_q, temp[15: 0])
 
             `SW_WRITE( 128, 0 )
-            #1 `CHECK_EQUAL(TILED_MAT_DIM_tiled_c_dim_q, value[15: 0])
+            #1 `CHECK_EQUAL(CANVAS_WIDTH_value_q, value[15: 0])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (ACT_CFG_bias_en ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 0; IDX <= 0; ++IDX) begin
+
+            temp = '0;
+            temp[ 0: 0] = ACT_CFG_bias_en_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 144, (1 << IDX) )
+            #1 `CHECK_EQUAL(ACT_CFG_bias_en_q, temp[ 0: 0])
+
+            `SW_WRITE( 144, 0 )
+            #1 `CHECK_EQUAL(ACT_CFG_bias_en_q, value[ 0: 0])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (ACT_CFG_gelu_en ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 1; IDX <= 1; ++IDX) begin
+
+            temp = '0;
+            temp[ 1: 1] = ACT_CFG_gelu_en_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 144, (1 << IDX) )
+            #1 `CHECK_EQUAL(ACT_CFG_gelu_en_q, temp[ 1: 1])
+
+            `SW_WRITE( 144, 0 )
+            #1 `CHECK_EQUAL(ACT_CFG_gelu_en_q, value[ 1: 1])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (ACT_CFG_prev_int8 ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 2; IDX <= 2; ++IDX) begin
+
+            temp = '0;
+            temp[ 2: 2] = ACT_CFG_prev_int8_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 144, (1 << IDX) )
+            #1 `CHECK_EQUAL(ACT_CFG_prev_int8_q, temp[ 2: 2])
+
+            `SW_WRITE( 144, 0 )
+            #1 `CHECK_EQUAL(ACT_CFG_prev_int8_q, value[ 2: 2])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (ACT_CFG_out_raw ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 3; IDX <= 3; ++IDX) begin
+
+            temp = '0;
+            temp[ 3: 3] = ACT_CFG_out_raw_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 144, (1 << IDX) )
+            #1 `CHECK_EQUAL(ACT_CFG_out_raw_q, temp[ 3: 3])
+
+            `SW_WRITE( 144, 0 )
+            #1 `CHECK_EQUAL(ACT_CFG_out_raw_q, value[ 3: 3])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (TILE_ROWS_value ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 0; IDX <= 15; ++IDX) begin
+
+            temp = '0;
+            temp[15: 0] = TILE_ROWS_value_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 160, (1 << IDX) )
+            #1 `CHECK_EQUAL(TILE_ROWS_value_q, temp[15: 0])
+
+            `SW_WRITE( 160, 0 )
+            #1 `CHECK_EQUAL(TILE_ROWS_value_q, value[15: 0])
+
+        end
+        repeat(5) @(posedge clk);
+        $display("%t: Testcase (TILE_COLS_value ):", $time());
+        $display("%t:\tSoftware write (hardware read) test", $time());
+        for (int IDX = 0; IDX <= 15; ++IDX) begin
+
+            temp = '0;
+            temp[15: 0] = TILE_COLS_value_q;
+            temp = (1 << IDX);
+            value = '0;
+
+            `SW_WRITE( 176, (1 << IDX) )
+            #1 `CHECK_EQUAL(TILE_COLS_value_q, temp[15: 0])
+
+            `SW_WRITE( 176, 0 )
+            #1 `CHECK_EQUAL(TILE_COLS_value_q, value[15: 0])
 
         end
 

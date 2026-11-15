@@ -1,11 +1,11 @@
 # cocotb + icarus verilog testbench for accel_top.
 #
-# Buffer-RAM IP (weight_buffer/input_buffer/output_buffer) and FIFO IP
-# (sync_fifo_w8_d32) aren't in this repo - models/ provides simulation-only
-# behavioral stand-ins with matching module names/ports (see
-# models/buffer_ram_models.v, models/sync_fifo_w8_d32.v). Swap those two
-# files out of VERILOG_SOURCES for the real generated IP once it exists;
-# nothing else needs to change.
+# Buffer-RAM IP (weight_buffer/input_buffer/output_buffer/bias_buffer) and
+# FIFO IP (sync_fifo_w8_d32) aren't in this repo - models/ provides
+# simulation-only behavioral stand-ins with matching module names/ports (see
+# models/buffer_ram_models.v, models/sync_fifo_w8_d32.v).
+# Swap those files out of VERILOG_SOURCES for the real generated IP once it
+# exists; nothing else needs to change.
 #
 # Usage:
 #   make        # run the test
@@ -20,6 +20,8 @@ RDL_SV_DIR := $(PWD)/../rdl/ctrl_reg.sv
 MODEL_DIR  := $(PWD)/models
 
 COMPILE_ARGS += -g2012   # accel_top.sv/ctrl_rf_rf.sv use logic/always_ff/always_comb
+# output_loader's GELU table ($readmemh): absolute, since vvp runs from tb/
+COMPILE_ARGS += -Paccel_top.GELU_LUT_FILE=\"$(RTL_DIR)/activation/example/gelu_int8.hex\"
 
 VERILOG_SOURCES += $(RDL_SV_DIR)/ctrl_rf_rf.sv
 
@@ -30,10 +32,13 @@ VERILOG_SOURCES += $(RTL_DIR)/weight_loader.v
 VERILOG_SOURCES += $(RTL_DIR)/weight_ctrl.v
 VERILOG_SOURCES += $(RTL_DIR)/weight_buffer_32_bank.v
 VERILOG_SOURCES += $(RTL_DIR)/buf_addr_remap.v
+VERILOG_SOURCES += $(RTL_DIR)/psum_buffer_32_bank.v
 VERILOG_SOURCES += $(RTL_DIR)/input_dispatch.v
 VERILOG_SOURCES += $(RTL_DIR)/input_buffer_32_bank.v
 VERILOG_SOURCES += $(RTL_DIR)/output_loader.v
+VERILOG_SOURCES += $(RTL_DIR)/activation/rtl/gelu_int8.sv
 VERILOG_SOURCES += $(RTL_DIR)/output_buffer_32_bank.v
+VERILOG_SOURCES += $(RTL_DIR)/bias_buffer_32_bank.v
 VERILOG_SOURCES += $(RTL_DIR)/accel_top.sv
 
 # simulation-only models - see header note above

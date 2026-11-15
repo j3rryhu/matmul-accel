@@ -4,8 +4,11 @@
 // (read-modify-write accumulation) rather than input_buffer_32_bank's
 // single shared read address, so each bank gets its own full port here.
 //
-// output_loader drives every bank's read+write directly (bank_r*/bank_w*
-// buses below, one ARRAY_COLS-wide slice per bank). Avalon only ever
+// It holds the int8 output canvas - the finished results the host reads;
+// raw 32-bit partial sums live in psum_buffer_32_bank instead.
+// output_loader drives every bank's write, and reads it (for
+// ACT_CFG.prev_int8) through the bank_r* buses below, one ARRAY_COLS-wide
+// slice per bank. Avalon only ever
 // reads (software reads results out after a matmul), never writes, and
 // only does so once output_loader is idle - per the programming sequence,
 // software polls STATUS.busy/done before reading, so there's no window
@@ -14,14 +17,15 @@
 // `busy` (output_loader's own busy, not the whole matmul's): output_loader
 // wins while busy, the Avalon-derived address wins once idle.
 //
-// The Avalon-facing read port is WIDE (AVS_DATA_WIDTH, 32) so a host read
-// moves a full word and its byte address advances by 4; output_loader's own
-// per-bank write side stays DATA_WIDTH (byte) wide because it writes one
-// rescaled result per bank per cycle. ext_rdaddress is therefore a linear
-// *word* address, split the same way input_buffer_32_bank's write address
-// is: upper bits pick the bank, low bits are the word offset within it.
-// Per-bank byte regions are a power-of-two multiple of 4 bytes, so bank
-// boundaries stay word aligned and a wide read never straddles two banks.
+// The Avalon-facing read port is WIDE (RD_DATA_WIDTH = AVS_DATA_WIDTH) so a
+// host read moves a full bus word; output_loader's own per-bank write side
+// is DATA_WIDTH (byte) wide - one int8 result per bank per cycle, at its
+// exact canvas position. Write addresses count bytes; ext_rdaddress is a
+// linear *word* address, split the same
+// way input_buffer_32_bank's write address is: upper bits pick the bank,
+// low bits are the word offset within it. Per-bank regions are a
+// power-of-two number of words, so bank boundaries stay word aligned and a
+// wide read never straddles two banks.
 //
 // NB: the "32" in the module name is historical - the bank count is
 // NUM_BANKS and is fully parameterized (kept as-is so the Qsys/Platform
@@ -29,12 +33,12 @@
 `timescale 1ps/1ps
 
 module output_buffer_32_bank #(
-    parameter DATA_WIDTH      = 8,   // int8 - output_loader rescales pe_array's ACC_WIDTH accumulator down to this before writing (see output_loader.v)
+    parameter DATA_WIDTH      = 8,   // int8 - output_loader's write width (see output_loader.v)
     parameter NUM_BANKS       = 16,
     parameter BANK_ADDR_WIDTH = 12,   // per-bank WRITE (byte) address width - match the generated output_buffer IP's depth (4096)
-    parameter RD_DATA_WIDTH   = 32,   // Avalon-side read width
+    parameter RD_DATA_WIDTH   = 128,  // Avalon-side read width
     // per-bank READ (word) address width: the same region addressed in
-    // RD_DATA_WIDTH/DATA_WIDTH-sized words instead of bytes
+    // RD_DATA_WIDTH-sized words instead of bytes
     parameter BANK_RADDR_WIDTH = BANK_ADDR_WIDTH - $clog2(RD_DATA_WIDTH/DATA_WIDTH)
 )(
     input clock,

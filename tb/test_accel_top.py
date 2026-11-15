@@ -34,20 +34,25 @@ Everything is addressed per the RTL's own documented conventions:
     (rtl/buf_addr_remap.v) scatters row r to bank r % ARRAY_ROWS using the
     WEIGHT_COLS / INPUT_MAX_ADDR registers, so those are programmed first
     (program_dims, write_weights, write_inputs below).
-  - output_buffer: an output canvas W bytes wide, W = TILED_MAT_DIM (or M
-    when it is 0, as in every untiled test), read back as one row-major
-    image with rows padded to a whole word: canvas (row, col) at
-    OBUF_BASE + row*pitch(W) + col (obuf_addr). A matmul's K x M result is
-    the canvas tile TILE_CFG selects; tests that never write TILE_CFG get
-    tile (0, 0), so y[k, m] is canvas (k, m).
+  - output_buffer: an int8 output canvas W bytes wide, W = CANVAS_WIDTH (or
+    M when it is 0, as in every untiled test), read back as one row-major
+    image with rows padded to a whole word: int8 (row, col) at
+    OBUF_BASE + row*pitch(W) + col (obuf_addr). Raw 32-bit partial sums
+    live in the internal psum_buffer and are not host-readable. A matmul's
+    K x M result is the canvas tile TILE_CFG selects; tests that never write
+    TILE_CFG get tile (0, 0), so y[k, m] is canvas (k, m).
 
 Golden model (both tests): raw = W_int8 @ X_int8 at full precision (the
 32-bit ACC_DATA_WIDTH accumulator - see pe.v/pe_array.v - can't overflow
 for int8 operands at any K used here: worst case is K*127*127, well under
-2^31), then rescaled by the *actual* OUTPUT_SCALE value written to the
-device (raw*OUTPUT_SCALE >> 16, arithmetic shift) and saturated to signed
-int8 [-128,127] - matching output_loader's requantize stage bit-for-bit.
+2^31; output_loader carries that full sum across contraction blocks in the
+32-bit canvas), then rescaled once by the *actual* OUTPUT_SCALE value
+written to the device (raw*OUTPUT_SCALE >> 16, arithmetic shift) and
+saturated to signed int8 [-128,127] - matching output_loader's requantize
+stage bit-for-bit.
 """
+
+import os
 
 import numpy as np
 
@@ -60,6 +65,7 @@ CTRL_BASE = 0x0000
 WBUF_BASE = 0x1000
 IBUF_BASE = 0x5000
 OBUF_BASE = 0x9000
+BBUF_BASE = 0x0800   # bias_buffer: int32 bias of canvas row R at byte 4*R (write-only)
 
 # one register per 128-bit bus word (16-byte stride, value in byte lanes
 # 0..3) - see rdl/ctrl_reg.rdl
@@ -71,7 +77,10 @@ INPUT_COLS_ADDR     = CTRL_BASE + 0x40
 STATUS_ADDR         = CTRL_BASE + 0x50
 OUTPUT_SCALE_ADDR   = CTRL_BASE + 0x60
 TILE_CFG_ADDR       = CTRL_BASE + 0x70
-TILED_MAT_DIM_ADDR  = CTRL_BASE + 0x80
+CANVAS_WIDTH_ADDR   = CTRL_BASE + 0x80
+ACT_CFG_ADDR        = CTRL_BASE + 0x90
+TILE_ROWS_ADDR      = CTRL_BASE + 0xA0
+TILE_COLS_ADDR      = CTRL_BASE + 0xB0
 
 MATMUL_START_BIT = 0
 
@@ -84,6 +93,12 @@ STATUS_DONE_BIT = 1
 TILE_R_SHIFT     = 0    # tile_r [14:0]
 TILE_C_SHIFT     = 15   # tile_c [29:15]
 USE_PREV_OUT_BIT = 30
+
+# ACT_CFG fields - see rdl/ctrl_reg.rdl
+BIAS_EN_BIT   = 0
+GELU_EN_BIT   = 1
+PREV_INT8_BIT = 2
+OUT_RAW_BIT   = 3
 
 # ---- test-fixed dimensions ----
 ARRAY_ROWS = 16  # must match accel_top.sv's ARRAY_ROWS / input_buffer_32_bank's bank count
@@ -99,11 +114,14 @@ M = ARRAY_ROWS   # input/output column count (INPUT_COLS == INPUT_MAX_ADDR here)
 REAL_VAL_STD = 1.0
 
 OBUF_BANK_ADDR_WIDTH = 12  # must match accel_top.sv's OBUF_BANK_ADDR_WIDTH (4096 B/bank)
+PSUM_BANK_ADDR_WIDTH = 12  # must match accel_top.sv's PSUM_BANK_ADDR_WIDTH (4096 32-bit slots/bank)
 
-# output canvas: W = TILED_MAT_DIM bytes wide (0 = M), rows padded to
+# output canvas: W = CANVAS_WIDTH int8 wide (0 = M), rows padded to
 # row_pitch(W); canvas row R sits in bank R % ARRAY_ROWS, and each bank holds
-# OBUF_BANK_BYTES of rows
+# OBUF_BANK_BYTES of rows. psum_buffer keeps the same canvas as raw 32-bit
+# sums, W slots per row, PSUM_BANK_SLOTS per bank (internal only).
 OBUF_BANK_BYTES = 1 << OBUF_BANK_ADDR_WIDTH
+PSUM_BANK_SLOTS = 1 << PSUM_BANK_ADDR_WIDTH
 IBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's IBUF_BANK_ADDR_WIDTH (1024 B/bank)
 WBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's WBUF_BANK_ADDR_WIDTH (1024 B/bank)
 
@@ -111,6 +129,13 @@ WBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's WBUF_BANK_ADDR_WIDTH (102
 # wide, so every host access moves a whole word and byte addresses advance
 # by this much (accel_top.sv's BYTES_PER_WORD).
 BYTES_PER_WORD = 16
+
+BIAS_ROWS = 256   # must match accel_top.sv's BIAS_ROWS (bias_buffer depth)
+
+# output_loader's GELU table - tb/Makefile points accel_top's GELU_LUT_FILE
+# at this same file
+GELU_LUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "rtl", "activation", "example", "gelu_int8.hex")
 
 CLK_PERIOD_NS = 10
 WATCHDOG_CYCLES = 8000
@@ -251,28 +276,37 @@ def row_pitch(ncols):
 
 
 def obuf_addr(row, width, col=0):
-    """Byte address of output canvas element (row, col). The canvas is read
-    back as one row-major image, rows padded to row_pitch(width), where
-    width is TILED_MAT_DIM - or M, when TILED_MAT_DIM is left at 0 as in
-    every untiled test. A matmul's result is the tile TILE_CFG placed it
-    in - tile (0, 0) by default, so output row k is canvas row k."""
+    """Byte address of int8 result (row, col) in the output canvas. The
+    canvas is read back as one dense row-major int8 image, rows padded to
+    row_pitch(width), where width is CANVAS_WIDTH - or M, when CANVAS_WIDTH
+    is left at 0 as in every untiled test. A matmul's result is the tile
+    TILE_CFG placed it in - tile (0, 0) by default, so output row k is
+    canvas row k."""
     return OBUF_BASE + row * row_pitch(width) + col
 
 
-def assert_fits_canvas(K, M, tile_r=0, tile_c=0, width=None):
+def assert_fits_canvas(K, M, tile_r=0, tile_c=0, width=None, tile_rows=0, tile_cols=0):
     """A K x M result placed as tile (tile_r, tile_c) of a canvas `width`
-    bytes wide (default M: untiled) has to lie inside the canvas width and
-    inside the output buffer, and a nonzero tile row offset has to be a
-    multiple of ARRAY_ROWS - see the TILE_CFG latch in rtl/accel_top.sv."""
+    elements wide (default M: untiled), on a grid of tile_rows x tile_cols
+    (TILE_ROWS / TILE_COLS; 0 = K / M), has to lie inside the canvas width
+    and inside the output and psum buffers, and its first canvas row,
+    tile_r*TILE_ROWS, has to be a multiple of ARRAY_ROWS - see the TILE_CFG
+    latch in rtl/accel_top.sv."""
     width = M if width is None else width
-    rows = (tile_r + 1) * K
-    assert (tile_c + 1) * M <= width, (
+    row0 = tile_r * (tile_rows or K)
+    col0 = tile_c * (tile_cols or M)
+    rows = row0 + K
+    bank_rows = -(-rows // ARRAY_ROWS)
+    assert col0 + M <= width, (
         f"tile ({tile_r},{tile_c}) of {K}x{M} runs past the {width}-wide canvas")
-    assert -(-rows // ARRAY_ROWS) * row_pitch(width) <= OBUF_BANK_BYTES, (
+    assert bank_rows * row_pitch(width) <= OBUF_BANK_BYTES, (
         f"{rows} canvas rows at pitch {row_pitch(width)} overflow the "
         f"{OBUF_BANK_BYTES} B output banks")
-    assert tile_r == 0 or K % ARRAY_ROWS == 0, (
-        f"tile row offset {tile_r}*{K} is not a multiple of {ARRAY_ROWS}")
+    assert bank_rows * width <= PSUM_BANK_SLOTS, (
+        f"{rows} canvas rows of {width} slots overflow the "
+        f"{PSUM_BANK_SLOTS}-slot psum banks")
+    assert row0 % ARRAY_ROWS == 0, (
+        f"tile's first canvas row {row0} is not a multiple of {ARRAY_ROWS}")
 
 
 def padded_image(A):
@@ -620,29 +654,12 @@ async def test_multiblock_matmul(dut):
     await wait_matmul_done(dut)
     await ClockCycles(dut.clk, 2)
 
-    # ---- golden model: output_loader rescales/saturates EACH k-block's
-    # raw partial psum separately, then accumulates the already-saturated
-    # int8 results (see output_loader.v: scaled_psum = saturate(psum_d *
-    # output_scale >>> 16); acc_sat = saturate(old_val + scaled_psum)). It
-    # does NOT sum the full-precision raw accumulator across k-blocks and
-    # rescale once - that would require carrying the 32-bit psum across
-    # block boundaries instead of just the int8 result already sitting in
-    # output_buffer, defeating the point of rescaling to int8 between
-    # passes. Reproduce that ordering exactly.
-    #
-    # Block kb covers contraction index p in [kb*ARRAY_ROWS,
-    # (kb+1)*ARRAY_ROWS) - X_int8 is blocked by ROWS (confirmed above by
-    # this test's own input-writing code: k_blk = k // ARRAY_ROWS), and
-    # since the full contraction is sum_p W_int8[n,p]*X_int8[p,m], p *is*
-    # X_int8's row index by definition of matmul - so W_int8 must be
-    # sliced by the *matching columns* (not rows) for the same p range. ----
-    num_k_blocks = (K + ARRAY_ROWS - 1) // ARRAY_ROWS
-    golden = None
-    for kb in range(num_k_blocks):
-        lo, hi = kb * ARRAY_ROWS, min((kb + 1) * ARRAY_ROWS, K)
-        raw_block = W_int8[:, lo:hi] @ X_int8[lo:hi, :]
-        scaled_block = np.clip((raw_block * output_scale_q16) >> 16, -128, 127)
-        golden = scaled_block if golden is None else np.clip(golden + scaled_block, -128, 127)
+    # ---- golden model: output_loader keeps each element's full-precision
+    # 32-bit running sum in the canvas between contraction blocks and
+    # rescales/saturates only on the last one, so blocking the contraction
+    # does not change the result - it is the full product, requantized once
+    # (see golden_blocked). ----
+    golden = np.clip(((W_int8 @ X_int8) * output_scale_q16) >> 16, -128, 127)
 
     # ---- read back output_buffer one row per burst: row n starts at
     # obuf_addr(n, M); the read remap finds its bank and segment ----
@@ -895,8 +912,8 @@ async def test_unaligned_m_matmul(dut):
 
     Each output row fills the first M bytes of its canvas row, which is
     padded to row_pitch(M) = 32 bytes; the pad is never written, so the
-    covering-word reads see X there (or an earlier test's data). read_bytes returns X bytes as None,
-    outside the M bytes compared here. Rows k and k + ARRAY_ROWS share a
+    covering-word reads see X there (or an earlier test's data). read_bytes
+    returns X bytes as None, outside the M bytes compared here. Rows k and k + ARRAY_ROWS share a
     bank, so this also checks that the second output-row block lands one
     canvas row block further down rather than on top of the first.
     """
@@ -974,9 +991,9 @@ async def test_hw_min_identity_sequence(dut):
 
     Addressing must match matmul_min.c one for one: the WBUF/IBUF/OBUF
     bases and the output layout are the same numbers on both sides. Output
-    row k is at OBUF_BASE + k*row_pitch(M) - here k*16, since TILED_MAT_DIM
-    stays 0 and the canvas is M wide - so matmul_min.c needs
-    OBUF_BASE = 0x9000 and that row stride.
+    row k is at OBUF_BASE + k*pitch(M) - here k*16, since CANVAS_WIDTH stays
+    0 and the int8 canvas is M bytes wide, one 16-byte word per row - so
+    matmul_min.c needs OBUF_BASE = 0x9000 and that row stride.
     """
     K = N = M = ARRAY_ROWS
     assert ARRAY_ROWS == 16 and ARRAY_COLS == 16, (
@@ -1028,23 +1045,24 @@ async def test_hw_min_identity_sequence(dut):
     await wait_matmul_done(dut)
     await ClockCycles(dut.clk, 2)
 
-    # ---- phase: read output buffer as single words, one per output row ----
-    Y = np.zeros((K, M), dtype=np.int64)
+    # ---- phase: read output buffer as single words, one per output row
+    # (its M = 16 int8s) ----
+    Y = np.zeros((K, M), dtype=object)     # object: an X byte stays None
     for k in range(K):
         row_base = obuf_addr(k, M)
         for m in range(0, M, BYTES_PER_WORD):
-            word = await avalon_read(dut, row_base + m)
+            wb = word_bytes(await avalon_read(dut, row_base + m))
             for j in range(BYTES_PER_WORD):
-                Y[k, m + j] = to_int8((word >> (8 * j)) & 0xFF)
+                Y[k, m + j] = to_int8(wb[j])
 
     # ---- phase: verify. Mismatches are reported with the avs address the
     # byte came from, the same way matmul_min.c prints them, so a failure
     # here and a failure on hardware name the same location. ----
     mismatches = [
-        (k, m, int(golden[k, m]), int(Y[k, m]),
+        (k, m, int(golden[k, m]), Y[k, m],
          obuf_addr(k, M) + m)
         for k in range(K) for m in range(M)
-        if int(Y[k, m]) != int(golden[k, m])
+        if Y[k, m] != int(golden[k, m])
     ]
     if mismatches:
         preview = ", ".join(
@@ -1256,13 +1274,9 @@ async def test_padded_input_multiband_matmul(dut):
     await wait_matmul_done(dut)
     await ClockCycles(dut.clk, 2)
 
-    # per-contraction-block rescale + saturating accumulate, as in
+    # full 32-bit sum across contraction blocks, rescaled once, as in
     # test_multiblock_matmul
-    golden = None
-    for nb in range(N // ARRAY_COLS):
-        lo, hi = nb * ARRAY_COLS, (nb + 1) * ARRAY_COLS
-        blk = np.clip(((W_int8[:, lo:hi] @ X_int8[lo:hi, :]) * q16) >> 16, -128, 127)
-        golden = blk if golden is None else np.clip(golden + blk, -128, 127)
+    golden = np.clip(((W_int8 @ X_int8) * q16) >> 16, -128, 127)
 
     mismatches = []
     for k in range(K):
@@ -1285,16 +1299,12 @@ BIG_MATMUL_WATCHDOG_CYCLES = 150000
 
 
 def golden_blocked(W_int8, X_int8, q16):
-    """Golden model for any N: output_loader rescales and saturates each
-    contraction block's psum separately, then saturating-accumulates the
-    int8 results in contraction-block order (see test_multiblock_matmul)."""
-    N = W_int8.shape[1]
-    golden = None
-    for lo in range(0, N, ARRAY_COLS):
-        hi = min(lo + ARRAY_COLS, N)
-        blk = np.clip(((W_int8[:, lo:hi] @ X_int8[lo:hi, :]) * q16) >> 16, -128, 127)
-        golden = blk if golden is None else np.clip(golden + blk, -128, 127)
-    return golden
+    """Golden model for any N: output_loader carries each element's
+    full-precision sum across contraction blocks in the 32-bit canvas and
+    rescales/saturates once, on the last block - so blocking the
+    contraction does not change the result (see test_multiblock_matmul).
+    The name is kept from the per-block int8 model this replaced."""
+    return np.clip(((W_int8 @ X_int8) * q16) >> 16, -128, 127)
 
 
 @cocotb.test()
@@ -1368,11 +1378,11 @@ async def test_128x128x128_matmul(dut):
     # at 2**(n-1) = 1024 beats, so a Platform Designer master would not
     # issue this - it tests this slave's counters, not the interconnect.)
     #
-    # TILED_MAT_DIM is 0, so the canvas is M = 128 bytes wide: the first
-    # 1024 beats are this whole result, row by row, and the other 1023 run on
-    # through canvas rows no matmul here wrote. Every result byte is checked,
-    # so a beat counter and address counter that drifted apart anywhere in
-    # the first half of the burst would show up as mismatches.
+    # CANVAS_WIDTH is 0, so the int8 canvas is M = 128 bytes wide: the
+    # first 1024 beats are this whole result, row by row, and the other 1023
+    # run on through canvas rows no matmul here wrote. Every result byte is
+    # checked, so a beat counter and address counter that drifted apart
+    # anywhere in the first half of the burst would show up as mismatches.
     max_burst = (1 << len(dut.avs_burstcount)) - 1          # 2047
     row_words = row_pitch(M) // BYTES_PER_WORD
     assert (K - 1) * row_words + M // BYTES_PER_WORD <= max_burst, \
@@ -1389,7 +1399,7 @@ async def test_128x128x128_matmul(dut):
     # the bus must still accept a new transaction after a max-length burst
     await read_status(dut)
 
-    # output row k is canvas row k, at byte k*row_pitch(M)
+    # output row k is canvas row k, at byte k*pitch(M)
     image = []
     for w in words:
         image += word_bytes(w)
@@ -1567,24 +1577,31 @@ async def test_burst_read_beat_count(dut):
 # Output canvas tiling (TILE_CFG)
 # ---------------------------------------------------------------------------
 
-async def program_tile(dut, tile_r, tile_c, use_prev_out=False):
-    """TILE_CFG: put this matmul's K x M result at canvas row tile_r*K,
-    column tile_c*M; use_prev_out accumulates onto what the canvas already
-    holds. Latched by matmul_start, like the dimension registers."""
+async def program_tile(dut, tile_r, tile_c, use_prev_out=False, tile_rows=0, tile_cols=0):
+    """TILE_CFG + TILE_ROWS/TILE_COLS: put this matmul's K x M result at
+    canvas row tile_r*TILE_ROWS, column tile_c*TILE_COLS (0 = K / M, equal
+    tiles); use_prev_out accumulates onto what the canvas already holds (in
+    the format ACT_CFG.prev_int8 names). Latched by matmul_start, like the
+    dimension registers."""
     await avalon_write(dut, TILE_CFG_ADDR,
                        (tile_r << TILE_R_SHIFT) | (tile_c << TILE_C_SHIFT)
                        | (int(use_prev_out) << USE_PREV_OUT_BIT))
+    await avalon_write(dut, TILE_ROWS_ADDR, tile_rows)
+    await avalon_write(dut, TILE_COLS_ADDR, tile_cols)
 
 
-async def run_tile(dut, W_tile, X_tile, q16, tile_r, tile_c, width, use_prev_out=False):
+async def run_tile(dut, W_tile, X_tile, q16, tile_r, tile_c, width, use_prev_out=False,
+                   tile_rows=0, tile_cols=0):
     """One complete matmul that writes one tile of an output canvas `width`
-    bytes wide (TILED_MAT_DIM - the whole result's column count)."""
+    elements wide (CANVAS_WIDTH - the whole result's column count), on a
+    tile grid of tile_rows x tile_cols (0 = this tile's own size).
+    ACT_CFG is left as the caller programmed it."""
     K, N = W_tile.shape
     M = X_tile.shape[1]
-    assert_fits_canvas(K, M, tile_r, tile_c, width)
+    assert_fits_canvas(K, M, tile_r, tile_c, width, tile_rows, tile_cols)
     await program_dims(dut, K, N, M, q16)
-    await avalon_write(dut, TILED_MAT_DIM_ADDR, width)
-    await program_tile(dut, tile_r, tile_c, use_prev_out)
+    await avalon_write(dut, CANVAS_WIDTH_ADDR, width)
+    await program_tile(dut, tile_r, tile_c, use_prev_out, tile_rows, tile_cols)
     await write_weights(dut, W_tile)
     await write_inputs(dut, X_tile)
     await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
@@ -1592,9 +1609,9 @@ async def run_tile(dut, W_tile, X_tile, q16, tile_r, tile_c, width, use_prev_out
 
 
 async def read_canvas(dut, rows, cols):
-    """The first rows x cols of an output canvas `cols` bytes wide, as int8,
-    one burst per canvas row; a byte that is X in simulation comes back as
-    None."""
+    """The first rows x cols of an int8 output canvas `cols` bytes wide, one
+    burst per canvas row - every tile's columns of that row in one go. A
+    byte that is X in simulation comes back as None."""
     Y = np.zeros((rows, cols), dtype=object)
     for R in range(rows):
         Y[R, :] = [to_int8(b) for b in await read_bytes(dut, obuf_addr(R, cols), cols)]
@@ -1627,7 +1644,7 @@ def quantized_problem(rng, K, N, M):
 @cocotb.test()
 async def test_tiled_canvas_use_prev_out(dut):
     """Y (256x256) = W (256x32) @ X (32x256) as eight matmuls filling the
-    whole output buffer: a 256-wide canvas (TILED_MAT_DIM = 256) of 2x2
+    whole output buffer: a 256-wide canvas (CANVAS_WIDTH = 256) of 2x2
     output tiles of 128x128, each tile's contraction split into two halves
     of 16.
 
@@ -1641,12 +1658,13 @@ async def test_tiled_canvas_use_prev_out(dut):
         with three other tiles written in between;
       - a first-half matmul overwrites whatever the canvas held before
         (earlier tests leave data in it).
-    use_prev_out continues the same saturating int8 accumulate the hardware
-    does between contraction blocks of one matmul, so the expected result
-    is exactly golden_blocked over the full N = 32: the second half's
-    block simply carries on the first half's chain. (Each half is a single
-    contraction block to keep the run short; multi-block accumulation
-    inside one matmul is covered by the other tests.)
+    The first halves set ACT_CFG.out_raw, so they leave raw 32-bit sums;
+    the second halves (use_prev_out, prev_int8 = 0) add onto those and
+    rescale once, exactly as the hardware does between contraction blocks
+    of one matmul - so the expected result is golden_blocked over the full
+    N = 32, read back as one 256x256 int8 image. (Each half is
+    a single contraction block to keep the run short; multi-block
+    accumulation inside one matmul is covered by the other tests.)
     """
     T = 128                    # tile edge: K = M = T per matmul
     H = ARRAY_COLS             # contraction half: N = H per matmul
@@ -1663,6 +1681,7 @@ async def test_tiled_canvas_use_prev_out(dut):
     golden = golden_blocked(W_int8, X_int8, q16)
 
     for half in range(2):
+        await program_act(dut, out_raw=(half == 0))
         for tr in range(2):
             for tc in range(2):
                 await run_tile(dut,
@@ -1676,21 +1695,26 @@ async def test_tiled_canvas_use_prev_out(dut):
 
 @cocotb.test()
 async def test_tiled_unaligned_col_offset(dut):
-    """2x2 tiles of 16 x 20 (K = 16, N = 16, M = 20), each a complete
-    matmul, on a canvas TILED_MAT_DIM = 40 wide:
-      - canvas rows are padded to 48 bytes, three words - not a power of
-        two, so the write side's segment multiply and the read remap's
-        divide both have to agree on a real pitch;
-      - the right-hand tiles start at canvas column 20, mid-word, so tile
-        (r, 1) shares the bus word holding columns 16..31 with tile (r, 0):
-        its byte writes must not disturb the left tile's columns 16..19;
+    """2x2 tiles of 16 x 37 (K = 16, N = 32, M = 37), each a complete
+    matmul, on a canvas CANVAS_WIDTH = 74 wide:
+      - int8 canvas rows are 74 bytes, padded to 80 - five words, not a
+        power of two, so the write side's segment multiply and the read
+        remap's divide both have to agree on a real pitch;
+      - the right-hand tiles start at canvas column 37, mid-word, so tile
+        (r, 1) shares the bus word holding columns 32..47 with tile (r, 0):
+        its int8 byte writes must not disturb the left tile's columns
+        32..36;
+      - N = 32 is two contraction blocks, so the right-hand tiles' raw sums
+        go through psum_buffer from column 37 on too;
       - the bottom tiles start at canvas row 16, one bank row block down.
-    Together the four tiles must hold exactly W @ X.
+    Together the four tiles must hold exactly W @ X, read back one burst per
+    canvas row.
     """
-    T_K, T_M = ARRAY_ROWS, 20
-    K, N, M = 2 * T_K, ARRAY_COLS, 2 * T_M
+    T_K, T_M = ARRAY_ROWS, 37
+    K, N, M = 2 * T_K, 2 * ARRAY_COLS, 2 * T_M
     assert T_M % BYTES_PER_WORD != 0, "test is pointless unless column tiles start mid-word"
-    assert row_pitch(M) != M and (row_pitch(M) // BYTES_PER_WORD) & (row_pitch(M) // BYTES_PER_WORD - 1), \
+    pitch_words = row_pitch(M) // BYTES_PER_WORD
+    assert row_pitch(M) != M and pitch_words & (pitch_words - 1), \
         "test is pointless unless the canvas pitch is padded and not a power of two"
     assert_fits_canvas(K, M)
 
@@ -1710,7 +1734,207 @@ async def test_tiled_unaligned_col_offset(dut):
                            q16, tr, tc, M)
 
     check_canvas(await read_canvas(dut, K, M), golden,
-                 "2x2 tiles of 16x20 on a 40-wide canvas")
+                 "2x2 tiles of 16x37 on a 74-wide canvas")
+
+
+@cocotb.test()
+async def test_tiled_edge_tiles(dut):
+    """A 40 x 37 result on a TILE_ROWS = 32 x TILE_COLS = 22 tile grid, so
+    the bottom and right tiles are smaller than the grid:
+
+        tile (0,0): 32 x 22    tile (0,1): 32 x 15
+        tile (1,0):  8 x 22    tile (1,1):  8 x 15
+
+    Every tile's position comes from the grid (first row tile_r*32, first
+    column tile_c*22), not from its own size: with the old tile_r*WEIGHT_ROWS
+    rule the 8-row bottom tiles would start at canvas row 8 instead of 32,
+    and the 15-wide right tiles at column 15 instead of 22. Also checks:
+      - the bottom tiles are a single partial row block (8 of 16 rows);
+      - the right tiles start mid-word (column 22 of the int8 canvas) and
+        write 15 int8s next to the left tiles' 22 in the same bus words;
+      - N = 32 is two contraction blocks, so the edge tiles accumulate too.
+    """
+    TR, TC = 32, 22                       # TILE_ROWS, TILE_COLS
+    K, N, M = 40, 2 * ARRAY_COLS, 37      # whole result
+    rng = np.random.default_rng(59)
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=MULTIBLOCK_WATCHDOG_CYCLES))
+    await reset_dut(dut)
+
+    W_int8, X_int8, q16 = quantized_problem(rng, K, N, M)
+    golden = golden_blocked(W_int8, X_int8, q16)
+
+    for tr in range(2):
+        for tc in range(2):
+            await run_tile(dut,
+                           W_int8[tr * TR:(tr + 1) * TR, :],
+                           X_int8[:, tc * TC:(tc + 1) * TC],
+                           q16, tr, tc, M, tile_rows=TR, tile_cols=TC)
+
+    check_canvas(await read_canvas(dut, K, M), golden,
+                 "40x37 result on a 32x22 tile grid (smaller edge tiles)")
+
+
+# ---------------------------------------------------------------------------
+# Final-pass bias + GELU (ACT_CFG, bias_buffer)
+# ---------------------------------------------------------------------------
+
+def load_gelu_lut():
+    """The 256-entry GELU table output_loader's GELU stage uses: entry i is
+    GELU of the int8 whose two's-complement byte is i, as int8."""
+    with open(GELU_LUT_FILE) as f:
+        lut = [int(tok, 16) for tok in f.read().split()]
+    assert len(lut) == 256, f"{GELU_LUT_FILE}: expected 256 entries, got {len(lut)}"
+    return np.array([to_int8(v) for v in lut], dtype=np.int64)
+
+
+def golden_act(W_int8, X_int8, q16, bias_rows=None, lut=None, prev=None):
+    """golden_blocked plus the final-pass activation: bias_rows[k] (int32,
+    in accumulator units) added to output row k's full sum before the rescale;
+    prev (a previous int8 result, ACT_CFG.prev_int8) added after it, with
+    one saturation over the sum; then the int8 mapped through the GELU
+    table."""
+    raw = W_int8 @ X_int8
+    if bias_rows is not None:
+        raw = raw + np.asarray(bias_rows, dtype=np.int64)[:, None]
+    y = (raw * q16) >> 16
+    if prev is not None:
+        y = y + np.asarray(prev, dtype=np.int64)
+    y = np.clip(y, -128, 127)
+    return lut[y & 0xFF] if lut is not None else y
+
+
+def bias_image(bias):
+    """Host image of a bias vector for BBUF_BASE: little-endian int32s,
+    bias[R] at byte 4*R."""
+    return [(int(b) >> (8 * i)) & 0xFF for b in bias for i in range(4)]
+
+
+async def program_act(dut, bias_en=False, gelu_en=False, prev_int8=False, out_raw=False):
+    """ACT_CFG - latched by matmul_start."""
+    await avalon_write(dut, ACT_CFG_ADDR,
+                       (int(bias_en) << BIAS_EN_BIT) | (int(gelu_en) << GELU_EN_BIT)
+                       | (int(prev_int8) << PREV_INT8_BIT) | (int(out_raw) << OUT_RAW_BIT))
+
+
+@cocotb.test()
+async def test_bias_gelu(dut):
+    """ACT_CFG bias + GELU, applied on each output element's last
+    contraction pass.
+
+    Run 1: K = 36 (three output-row blocks, the last partial), N = 48 (three
+    contraction blocks), bias + GELU. weight_ctrl runs the output-row blocks
+    inside each contraction block, so every output-row block has its own
+    last pass (n_blk = 2) and must get the bias and GELU there exactly once,
+    while the earlier passes keep raw 32-bit sums for the next block to add
+    to.
+
+    Run 2: the first 32 rows of the same W as tile row 1 (canvas rows
+    32..63), bias only: checks the non-GELU final write path, and that the
+    bias is indexed by *canvas* row (bias[32..63]), not the matmul's own
+    output row.
+
+    Values are kept small (|w|, |x| <= 7, OUTPUT_SCALE = 1/4) so the
+    rescaled values land in the GELU table's nonlinear range. The int32
+    biases (accumulator units) span +-600, past int8, so their upper bytes
+    and sign matter; they move a result by up to 150 LSBs.
+    """
+    K, N, M = 2 * ARRAY_ROWS + 4, 3 * ARRAY_COLS, 20
+    q16 = 1 << 14              # 0.25
+    assert_fits_canvas(K, M)
+
+    rng = np.random.default_rng(47)
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=MULTIBLOCK_WATCHDOG_CYCLES))
+    await reset_dut(dut)
+
+    W_int8 = rng.integers(-7, 8, size=(K, N)).astype(np.int64)
+    X_int8 = rng.integers(-7, 8, size=(N, M)).astype(np.int64)
+    bias = rng.integers(-600, 601, size=BIAS_ROWS).astype(np.int64)
+    lut = load_gelu_lut()
+
+    await write_bytes(dut, BBUF_BASE, bias_image(bias))
+
+    # ---- run 1: bias + GELU, tile (0, 0) ----
+    golden = golden_act(W_int8, X_int8, q16, bias[:K], lut)
+    assert not np.array_equal(golden, golden_act(W_int8, X_int8, q16, None, lut)), \
+        "test setup: the bias changes nothing"
+    assert not np.array_equal(golden, golden_act(W_int8, X_int8, q16, bias[:K])), \
+        "test setup: GELU changes nothing"
+
+    await program_dims(dut, K, N, M, q16)
+    await program_act(dut, bias_en=True, gelu_en=True)
+    await write_weights(dut, W_int8)
+    await write_inputs(dut, X_int8)
+    await avalon_write(dut, CONTROL_ADDR, 1 << MATMUL_START_BIT)
+    await wait_matmul_done(dut)
+    check_canvas(await read_canvas(dut, K, M), golden,
+                 f"bias + GELU, {K}x{N} @ {N}x{M} (3 output-row x 3 contraction blocks)")
+
+    # ---- run 2: bias only, tile row 1 ----
+    K2 = 2 * ARRAY_ROWS
+    W2 = W_int8[:K2]
+    await program_act(dut, bias_en=True, gelu_en=False)
+    await run_tile(dut, W2, X_int8, q16, 1, 0, M)
+    golden2 = golden_act(W2, X_int8, q16, bias[K2:2 * K2])
+    Y = await read_canvas(dut, 2 * K2, M)
+    check_canvas(Y[K2:], golden2, "bias only, tile row 1 (canvas rows 32..63)")
+
+
+@cocotb.test()
+async def test_prev_int8_out_raw(dut):
+    """ACT_CFG.out_raw and ACT_CFG.prev_int8 on one tile: K = 32, M = 21.
+
+    Run 1 (out_raw, bias_en also set; N = 16): leaves raw 32-bit sums in
+    psum_buffer - no bias, rescale or int8 result. They are not
+    host-readable, so run 2 checks them.
+    Run 2 (use_prev_out, plain; N = 16): adds onto run 1's raw sums and
+    produces the int8 result of the whole 32-long contraction - which only
+    matches if run 1 really left the unbiased raw sums.
+    Run 3 (use_prev_out + prev_int8, bias + GELU; N = 32, two contraction
+    blocks): starts its raw sums fresh, and on its last block reads run 2's
+    int8 result back from output_buffer and adds it to its own rescaled
+    (biased) result with one saturation, applies GELU, and writes the
+    result over it. The previous int8 lives in a different buffer from the
+    raw sums, so the multi-block contraction can't overwrite it first.
+
+    Small values (|w|, |x| <= 7, OUTPUT_SCALE = 1/4) as in test_bias_gelu.
+    """
+    K, N, M = 2 * ARRAY_ROWS, ARRAY_COLS, 21
+    q16 = 1 << 14              # 0.25
+
+    rng = np.random.default_rng(53)
+    await start_clock(dut)
+    cocotb.start_soon(watchdog(dut, max_cycles=MULTIBLOCK_WATCHDOG_CYCLES))
+    await reset_dut(dut)
+
+    W1, W2 = (rng.integers(-7, 8, size=(K, N)).astype(np.int64) for _ in range(2))
+    X1, X2 = (rng.integers(-7, 8, size=(N, M)).astype(np.int64) for _ in range(2))
+    W3 = rng.integers(-7, 8, size=(K, 2 * N)).astype(np.int64)
+    X3 = rng.integers(-7, 8, size=(2 * N, M)).astype(np.int64)
+    bias = rng.integers(-600, 601, size=BIAS_ROWS).astype(np.int64)
+    lut = load_gelu_lut()
+    await write_bytes(dut, BBUF_BASE, bias_image(bias))
+
+    # ---- run 1: out_raw - raw 32-bit sums, one per slot ----
+    await program_act(dut, bias_en=True, out_raw=True)
+    await run_tile(dut, W1, X1, q16, 0, 0, M)
+
+    # ---- run 2: use_prev_out onto run 1's raw sums -> int8 of W1@X1 + W2@X2 ----
+    await program_act(dut)
+    await run_tile(dut, W2, X2, q16, 0, 0, M, use_prev_out=True)
+    y2 = golden_act(np.hstack([W1, W2]), np.vstack([X1, X2]), q16)
+    check_canvas(await read_canvas(dut, K, M), y2,
+                 "out_raw then use_prev_out: int8 of the 32-long contraction")
+
+    # ---- run 3: use_prev_out + prev_int8, bias + GELU ----
+    golden3 = golden_act(W3, X3, q16, bias[:K], lut, prev=y2)
+    assert not np.array_equal(golden3, golden_act(W3, X3, q16, bias[:K], lut)), \
+        "test setup: the previous result changes nothing"
+    await program_act(dut, bias_en=True, gelu_en=True, prev_int8=True)
+    await run_tile(dut, W3, X3, q16, 0, 0, M, use_prev_out=True)
+    check_canvas(await read_canvas(dut, K, M), golden3,
+                 "use_prev_out + prev_int8 (+ bias, GELU, 2 contraction blocks) onto the int8 result")
 
 
 @cocotb.test()

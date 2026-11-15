@@ -22,9 +22,10 @@
 // software programs before writing the buffer.
 //
 // accel_top also uses it on output_buffer's READ address path (host_wren =
-// read fetch enable, data unused), with the canvas width (TILED_MAT_DIM)
-// as the row length, so software reads results back as a contiguous
-// row-major image too; the read FSM absorbs the extra latency.
+// read fetch enable, data unused), with the int8 canvas row pitch latched
+// at matmul_start as the row length, so software reads results back as a
+// contiguous row-major int8 image too; the read FSM absorbs the extra
+// latency.
 //
 // Two register stages: write address/data/enable come out two cycles after
 // they go in. That is safe against matmul_start - the start write is

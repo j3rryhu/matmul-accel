@@ -4,7 +4,19 @@ An int8 weight-stationary systolic matrix-multiply accelerator with an
 Avalon-MM slave interface, targeting a DE1-SoC (Cyclone V). The array is
 `ARRAY_ROWS x ARRAY_COLS` (currently **16x16**, set in
 [`rtl/accel_top.sv`](rtl/accel_top.sv)); larger matrices are tiled into
-blocks and sequenced automatically by hardware.
+blocks and sequenced automatically by hardware. Partial sums are kept at
+full 32-bit precision across contraction blocks; the finished result is
+rescaled to int8 once, with an optional per-row bias and GELU.
+
+Companion docs:
+
+- [`CONTROL_REGISTERS.md`](CONTROL_REGISTERS.md) - what every control
+  register means, the order of operations on each output element, and
+  programming examples
+- [`OUTPUT_BUFFER_LAYOUT.md`](OUTPUT_BUFFER_LAYOUT.md) - how canvas rows,
+  columns and tiles map onto the 16 output banks
+
+Contents:
 
 - [Data flow and axis convention](#data-flow-and-axis-convention) - **read this first**,
   the row/column naming is not what you would guess
@@ -78,31 +90,38 @@ address drives that region's RAM or register file directly.
 | Region | Base | Size | Access | Contents |
 |---|---|---|---|---|
 | `CTRL_BASE` | `0x0000_0000` | `0x100` | R/W, 32-bit words | Control/status register file (`ctrl_rf`) |
+| `BBUF_BASE` | `0x0000_0800` | `0x400` (1 KB) | **write-only**, int32 | `bias_buffer` (banked): one int32 bias per canvas row |
 | `WBUF_BASE` | `0x0000_1000` | `0x4000` (16 KB) | **write-only**, byte | `weight_buffer` (banked) |
 | `IBUF_BASE` | `0x0000_5000` | `0x4000` (16 KB) | **write-only**, byte | `input_buffer` (banked) |
-| `OBUF_BASE` | `0x0000_9000` | `0x10000` (64 KB) | **read-only**, byte | `output_buffer`: the output canvas |
+| `OBUF_BASE` | `0x0000_9000` | `0x10000` (64 KB) | **read-only**, byte | `output_buffer`: the int8 output canvas |
 
 The whole map spans `0x0000_0000`-`0x0001_8FFF`, so the slave needs at
 least a 17-bit byte address (a 128 KB span). `OBUF_BASE` moved from
 `0x7000` to `0x9000` when `IBUF` grew to 16 KB, and the `OBUF` window grew
-from 16 KB to 64 KB for the output canvas, e.g. 256x256.
+from 16 KB to 64 KB for the output canvas, e.g. 256x256. `BBUF` sits in
+the gap below `WBUF`. The 32-bit partial sums live in a separate 256 KB
+`psum_buffer` that is internal to the accelerator and has no window.
 
 Access conventions:
 
-- **All buffer accesses are full 128-bit words.** The buffers are
-  *mixed-width*: the host-facing port is `AVS_DATA_WIDTH` (128) wide, the
-  core-facing port stays byte-wide. So one access moves 16 bytes and the
-  byte address advances by **16**, not 1. `avs_byteenable` is **not**
-  honoured for buffer accesses - there is no byte-granular write.
+- **All buffer accesses are full 128-bit words.** The host-facing port of
+  every buffer is `AVS_DATA_WIDTH` (128) wide; the core-facing port is
+  narrower (a byte for weights, inputs and int8 results, 32 bits for the
+  bias). So one access moves 16 bytes and the byte address
+  advances by **16**, not 1. `avs_byteenable` is **not** honoured for
+  weight and input writes - there is no byte-granular write. The bias
+  buffer honours it per 4-byte entry: an entry is written only when all
+  four of its byte enables are set.
 - **Byte order is little-endian within a word**: byte address `16n+j` sits
   at `avs_writedata[8*j +: 8]`, matching Avalon byte lanes.
 - **Write whole contiguous images.** Write `W` and `X` each as one
   row-major image with every row zero-padded to a multiple of 16 bytes (see
   [Buffer layouts](#buffer-layouts)); hardware scatters the rows to banks.
-- **Results read back as one contiguous canvas.** It is `W` bytes wide,
-  `W = TILED_MAT_DIM` (or `INPUT_COLS` when that is 0), and canvas row `R`
-  starts at `OBUF_BASE + R*pitch(W)`. A matmul writes only its own tile of
-  the canvas; every other byte keeps what it held. See
+- **Results read back as one contiguous int8 canvas.** It is `W` bytes
+  wide, `W = CANVAS_WIDTH` (or `INPUT_COLS` when that is 0), and canvas row
+  `R` starts at `OBUF_BASE + R*pitch(W)`. A matmul writes only its own tile
+  of the canvas; every other byte keeps what it held. Raw 32-bit partial
+  sums are not readable. See
   [Output canvas and tiling](#output-canvas-and-tiling).
 - **Each register is its own 128-bit bus word** at the 16-byte-aligned
   offsets below; its value sits in the low bytes (lanes 0..3), so a write
@@ -117,8 +136,9 @@ Access conventions:
 - **Burst reads are supported** for `CTRL` and `OBUF`: drive
   `avs_burstcount`, hold `avs_read` until `avs_waitrequest` drops, then
   take one beat per `avs_readdatavalid` pulse, address auto-incrementing.
-- At 16x16 the weight and input buffers are 16 banks x 1 KB and the
-  output buffer 16 banks x 4 KB, each filling its window exactly. Growing a bank depth or the array means growing the matching
+- At 16x16 the weight and input buffers are 16 banks x 1 KB, the output
+  buffer 16 banks x 4 KB and the bias buffer 16 banks x 16 int32 entries,
+  each filling its window exactly. Growing a bank depth or the array means growing the matching
   window in `rtl/accel_top.sv`; elaboration fails if a window is too small
   to reach every bank.
 
@@ -128,22 +148,36 @@ Access conventions:
 
 Defined in [`rdl/ctrl_reg.rdl`](rdl/ctrl_reg.rdl), compiled to
 `ctrl_rf_rf.sv` by `rdl/python_gen.py` (PeakRDL). Offsets are relative to
-`CTRL_BASE` (`0x0000_0000`).
+`CTRL_BASE` (`0x0000_0000`). Full descriptions, the order of operations on
+each output element and programming examples are in
+[`CONTROL_REGISTERS.md`](CONTROL_REGISTERS.md).
 
 | Offset | Register | Field | Bits | Access | Description |
 |---|---|---|---|---|---|
-| `0x00` | `CONTROL` | `matmul_start` | `[0]` | W, **self-clearing pulse** | Starts a matmul: latches `WEIGHT_ROWS`/`WEIGHT_COLS` and resets the block position to (0,0). |
+| `0x00` | `CONTROL` | `matmul_start` | `[0]` | W, **self-clearing pulse** | Starts a matmul: latches `WEIGHT_ROWS`/`WEIGHT_COLS`, `TILE_CFG`, `TILE_ROWS`/`TILE_COLS`, `ACT_CFG` and the canvas pitch, and resets the block position to (0,0). |
 | `0x10` | `WEIGHT_ROWS` | `value` | `[15:0]` | W | `K` - **output rows**. May be any value; a non-multiple of `ARRAY_ROWS` is handled by masking. |
 | `0x20` | `WEIGHT_COLS` | `value` | `[15:0]` | W | `N` - **contraction size**. **Must be a multiple of `ARRAY_COLS`** (see [Known issues](#known-issues)). |
 | `0x30` | `INPUT_MAX_ADDR` | `value` | `[9:0]` | W | `M` - number of reads issued per input band. Set equal to `INPUT_COLS`. |
-| `0x40` | `INPUT_COLS` | `value` | `[15:0]` | W | `M` - output/activation column count: the width of this matmul's output tile, and the canvas width when `TILED_MAT_DIM` is 0. |
+| `0x40` | `INPUT_COLS` | `value` | `[15:0]` | W | `M` - output/activation column count of this matmul; also the canvas width when `CANVAS_WIDTH` is 0, and the tile grid width when `TILE_COLS` is 0. |
 | `0x50` | `STATUS` | `busy` | `[0]` | R | Live level. Compute in progress: `weight_ctrl` sequencing **or** `output_loader` still draining. |
 | `0x50` | `STATUS` | `done` | `[1]` | R, **read-to-clear** | Sticky. Set once per matmul, when every block is committed **and** the last one has drained. Cleared by the read that observes it. |
-| `0x60` | `OUTPUT_SCALE` | `value` | `[15:0]` | W | Q0.16 unsigned rescale factor; actual scale = `value/65536`, range `[0,1)`. |
-| `0x70` | `TILE_CFG` | `tile_r` | `[14:0]` | W | Output tile row index: this matmul's result starts at canvas row `tile_r * WEIGHT_ROWS`. |
-| `0x70` | `TILE_CFG` | `tile_c` | `[29:15]` | W | Output tile column index: the result starts at canvas column `tile_c * INPUT_COLS`. |
-| `0x70` | `TILE_CFG` | `use_prev_out` | `[30]` | W | 1 = the first contraction block accumulates onto the canvas instead of overwriting it. See [Output canvas and tiling](#output-canvas-and-tiling). |
-| `0x80` | `TILED_MAT_DIM` | `tiled_c_dim` | `[15:0]` | W | Canvas width `W`: the whole result's column count. 0 = use `INPUT_COLS` (one untiled matmul). Rows are padded to `pitch(W)`. Keep it unchanged from the first tile until the canvas is read. |
+| `0x60` | `OUTPUT_SCALE` | `value` | `[15:0]` | W | Q0.16 unsigned rescale factor; actual scale = `value/65536`, range `[0,1)`. Applied once, to the full 32-bit sum - see below. |
+| `0x70` | `TILE_CFG` | `tile_r` | `[14:0]` | W | Tile row index on the tile grid: this matmul's result starts at canvas row `tile_r * TILE_ROWS`, which must be a multiple of 16. |
+| `0x70` | `TILE_CFG` | `tile_c` | `[29:15]` | W | Tile column index: the result starts at canvas column `tile_c * TILE_COLS`. |
+| `0x70` | `TILE_CFG` | `use_prev_out` | `[30]` | W | 1 = continue what is already at this position (the previous matmul's raw sums, or with `ACT_CFG.prev_int8` its int8 result) instead of starting fresh. See [Output canvas and tiling](#output-canvas-and-tiling). |
+| `0x80` | `CANVAS_WIDTH` | `value` | `[15:0]` | W | Canvas width `W`: the whole result's column count. 0 = use `INPUT_COLS` (one untiled matmul). Rows are padded to `pitch(W)`. Latched at `matmul_start` for both the writes and the host reads; keep it the same for every tile of one result. |
+| `0x90` | `ACT_CFG` | `bias_en` | `[0]` | W | Add the canvas row's int32 bias (bias buffer) to the sum before the rescale. |
+| `0x90` | `ACT_CFG` | `gelu_en` | `[1]` | W | Map the final int8 through the GELU table. |
+| `0x90` | `ACT_CFG` | `prev_int8` | `[2]` | W | With `use_prev_out`: add onto the int8 result already in the output canvas, after the rescale. The raw sums start fresh; any number of contraction blocks. |
+| `0x90` | `ACT_CFG` | `out_raw` | `[3]` | W | Keep the raw 32-bit sums (internal psum buffer): no bias, rescale, GELU or int8 result. For a later `use_prev_out` matmul - raw sums are not host-readable. |
+| `0xA0` | `TILE_ROWS` | `value` | `[15:0]` | W | Tile grid height (the largest tile's row count). 0 = `WEIGHT_ROWS`. |
+| `0xB0` | `TILE_COLS` | `value` | `[15:0]` | W | Tile grid width (the largest tile's column count). 0 = `INPUT_COLS`. |
+
+Every register resets to 0, and only `STATUS` can be read back. Except
+`STATUS`, the registers latched at `matmul_start` (above) can be
+reprogrammed while a matmul runs; `INPUT_COLS`, `INPUT_MAX_ADDR` and
+`OUTPUT_SCALE` are used throughout the matmul and must not change until it
+is done.
 
 The two bits behave differently, and the difference matters:
 
@@ -172,11 +206,14 @@ checks it.
 ### `OUTPUT_SCALE` and the quantization scheme
 
 The array accumulates at `ACC_WIDTH` (32-bit) so a full contraction of
-int8 x int8 products cannot overflow, but `output_buffer` stores int8.
-`output_loader` therefore rescales every psum:
+int8 x int8 products cannot overflow. The output canvas keeps that 32-bit
+sum between contraction blocks, and only after the last block does
+`output_loader` produce the int8 result:
 
 ```
-scaled = saturate_int8( (psum * OUTPUT_SCALE) >>> 16 )
+s      = full 32-bit sum            (+ bias[canvas row]  if ACT_CFG.bias_en)
+scaled = saturate_int8( (s * OUTPUT_SCALE) >>> 16 )
+y      = GELU_table[scaled]         if ACT_CFG.gelu_en, else scaled
 ```
 
 Under per-tensor symmetric int8 quantization with scales `w_scale`,
@@ -187,14 +224,17 @@ OUTPUT_SCALE = round( w_scale * x_scale / y_scale * 65536 )
 ```
 
 which must land in `[0, 65536)` - i.e. the combined scale must be `< 1.0`.
+The bias is int32 in accumulator units, as a standard int8 model export
+provides it: `bias_q = round(b_real / (w_scale * x_scale))`. With GELU,
+`y_scale` must be the GELU table's input scale (1/32 for the example table
+in `rtl/activation/example/`), and the result comes out in its output
+scale (also 1/32).
 
-> When `N` spans more than one contraction block, each block's psum is
-> rescaled and **saturated to int8 before** being accumulated into the
-> previous block's result, which is then saturated again. The accelerator
-> does not carry the full-precision 32-bit accumulator across block
-> boundaries. Requantization error therefore compounds across contraction
-> blocks, and a golden model must reproduce this ordering exactly (see
-> `test_multiblock_matmul`).
+> Earlier versions rescaled and saturated each contraction block's psum to
+> int8 before accumulating it, so requantization error compounded across
+> blocks. With the 32-bit canvas the result is exactly one requantization
+> of the full-precision sum, whatever the number of contraction blocks
+> (`golden_blocked` in the testbench).
 
 ---
 
@@ -208,13 +248,17 @@ which must land in `[0, 65536)` - i.e. the combined scale must be `< 1.0`.
     write INPUT_COLS     = M
     write OUTPUT_SCALE   = round(w_scale * x_scale / y_scale * 65536)
     write TILE_CFG       = tile_r | tile_c << 15 | use_prev_out << 30
-    write TILED_MAT_DIM  = full result width   # both 0 for a single, untiled matmul
+    write TILE_ROWS      = tile grid height  # 0 for a single matmul or equal tiles
+    write TILE_COLS      = tile grid width   # 0 for a single matmul or equal tiles
+    write CANVAS_WIDTH   = full result width # 0 for a single, untiled matmul
+    write ACT_CFG        = bias_en | gelu_en << 1 | prev_int8 << 2 | out_raw << 3
  3. write weight bytes into WBUF  (layout below)
     write input  bytes into IBUF  (layout below)
+    write int32 biases into BBUF  (only with bias_en; layout below)
  4. write CONTROL.matmul_start = 1  # single pulse, self-clearing
  5. poll STATUS until bit[1] (done) reads 1
     # NB: that read consumes done - keep the value, don't re-read
- 6. read result bytes from OBUF   (layout below)
+ 6. read the result from OBUF     (layout below)
     # canvas row R at OBUF_BASE + R*pitch(W); with tiling, after the last tile
 ```
 
@@ -223,8 +267,10 @@ the entire matmul itself - per block it prefetches weights, preloads the
 input band, commits the weights into the array, streams, and advances to the
 next block - with nothing left for software to poke mid-matmul.
 
-Steps 2 and 3 may be done in either order, but both must complete before
-step 4, because `matmul_start` latches the dimension registers.
+Step 2 must come before step 3: the weight and input writes are placed
+using the live `WEIGHT_COLS` and `INPUT_MAX_ADDR`. Both must complete
+before step 4, because `matmul_start` latches the dimension and tile
+registers.
 
 > **Do not skip step 5's poll before reading.** `output_loader` keeps
 > writing `output_buffer` for some cycles after the last block is committed;
@@ -235,9 +281,9 @@ step 4, because `matmul_start` latches the dimension registers.
 
 ## Buffer layouts
 
-`ARRAY_ROWS`/`ARRAY_COLS` below are the array dimensions (16). All three
-buffers have 1024-byte banks. `pitch(c) = roundup(c, 16)` is a row padded
-to whole 128-bit words.
+`ARRAY_ROWS`/`ARRAY_COLS` below are the array dimensions (16). The weight
+and input buffers have 1 KB banks, the output buffer 4 KB banks.
+`pitch(c) = roundup(c, 16)` is a row padded to whole 128-bit words.
 
 All three are contiguous row-major images with padded rows: `W` and `X`
 written, the output canvas read. `W` is stored exactly as written on paper,
@@ -249,53 +295,80 @@ addr(p, m) = IBUF_BASE + p*pitch(M) + m     X: p in [0,N), m in [0,M)    write
 addr(R, C) = OBUF_BASE + R*pitch(W) + C     canvas: C in [0,W)           read
 ```
 
-`W` is the canvas width: `TILED_MAT_DIM`, or `INPUT_COLS` when that is 0.
+`W` is the canvas width: `CANVAS_WIDTH`, or `INPUT_COLS` when that is 0.
 Inside each buffer, [`rtl/buf_addr_remap.v`](rtl/buf_addr_remap.v) maps row
 `r` to bank `r % 16`, at offset `(r / 16) * pitch` within the bank. It uses
-the live `WEIGHT_COLS`, `INPUT_MAX_ADDR` and canvas-width values, so
-program them **before** writing the inputs, and leave the canvas width
-alone until the result has been read. `output_loader` writes each canvas
-row at that same padded pitch.
+the live `WEIGHT_COLS` and `INPUT_MAX_ADDR`, so program them **before**
+writing the inputs; for output reads it uses the canvas pitch latched at
+`matmul_start`, so a result reads back with the layout it was written with.
+`output_loader` writes each canvas row at that same padded pitch.
 
-Results are **int8**; sign-extend the byte you read back.
+Results are **int8**; sign-extend the byte you read back. The raw 32-bit
+partial sums live in the internal `psum_buffer` - the same canvas, `W`
+slots per row - and are not readable.
+[`OUTPUT_BUFFER_LAYOUT.md`](OUTPUT_BUFFER_LAYOUT.md) walks through both
+buffers, tiles included, with a worked example.
 
 ### Output canvas and tiling
 
 The output buffer holds one int8 canvas, `W` bytes wide, where
-`W = TILED_MAT_DIM` is the whole result's column count. Each matmul writes
-its `K x M` result as one tile of it, placed by `TILE_CFG`:
+`W = CANVAS_WIDTH` is the whole result's column count. Each matmul writes
+its `K x M` result as one tile of it. The canvas is divided into a grid of
+`TILE_ROWS x TILE_COLS` cells, and `TILE_CFG` picks the cell:
 
 ```
-result[k][m]  ->  canvas[tile_r*K + k][tile_c*M + m]
+first row     R0 = tile_r * TILE_ROWS     (TILE_ROWS = 0 means K)
+first column  C0 = tile_c * TILE_COLS     (TILE_COLS = 0 means M)
+result[k][m]  ->  canvas[R0 + k][C0 + m]
 ```
 
-With `TILE_CFG = 0` and `TILED_MAT_DIM = 0` that is `canvas[k][m]` with
-`W = M`: a single untiled matmul, read back densely. To build a larger
-result, set `TILED_MAT_DIM` to its full width, run one matmul per tile, and
-read the canvas once at the end - it comes back as one dense row-major
-matrix. With a 128-deep contraction, the weight and input buffers cap one
-matmul's result at 128x128, so the 64 KB buffer holds 2x2 such tiles: `Y`
-(256x256) is `TILED_MAT_DIM = 256` and four matmuls with
-`(tile_r, tile_c)` = (0,0), (0,1), (1,0), (1,1).
+Size the grid to the largest tile. `K` and `M` may be smaller than the
+grid cell, so the edge tiles of a result that doesn't divide evenly
+compute only what they need and still land in place.
+
+With `TILE_CFG = 0` and `CANVAS_WIDTH = 0` that is `canvas[k][m]` with
+`W = M`: a single untiled matmul. To build a larger result, set
+`CANVAS_WIDTH` to its full width and `TILE_ROWS`/`TILE_COLS` to the tile
+size, run one matmul per tile, and read the canvas once at the end - it
+comes back as one dense row-major matrix. With a
+128-deep contraction, the weight and input buffers cap one matmul's result
+at 128x128, so the 64 KB buffer holds 2x2 such tiles: `Y` (256x256) is
+`CANVAS_WIDTH = 256` and four matmuls with `(tile_r, tile_c)` = (0,0),
+(0,1), (1,0), (1,1). A 40x37 result on a 32x22 grid is `TILE_ROWS = 32`,
+`TILE_COLS = 22` and tiles of 32x22, 32x15, 8x22 and 8x15
+(`test_tiled_edge_tiles`).
 
 `use_prev_out` splits a contraction too long for one matmul. With it set,
-the matmul's first contraction block adds onto the canvas instead of
-overwriting it, so the second part of `N` carries on the first part's
-accumulation. It is the same saturating int8 add the hardware uses between
-contraction blocks, so the result is identical to one long matmul.
+the matmul's first contraction block continues the raw 32-bit sums the
+previous matmul left in `psum_buffer` instead of starting fresh. Run every
+part but the last with `ACT_CFG.out_raw = 1`, so it keeps its raw sums;
+the last part (`out_raw = 0`) adds onto them and produces the int8 result,
+identical to one long matmul. Alternatively, `ACT_CFG.prev_int8` adds this
+matmul's result onto the previous **int8** result in the output canvas
+(after the rescale, before GELU), with any number of contraction blocks.
 
 Rules - nothing in hardware checks them:
 
-- Every tile of one result uses the same `K` and `M`. The offsets scale
-  with the current matmul's `K` and `M`, so pad an edge tile with zeros
-  rather than shrinking it.
-- With `tile_r > 0`, `K` must be a multiple of 16, so the tile's rows start
-  on a bank boundary. Column offsets can be anything.
-- The tile must lie inside the canvas width, `(tile_c+1)*M <= W`, and the
-  canvas inside the buffer: `ceil((tile_r+1)*K / 16) * pitch(W) <= 4096`.
-- `TILED_MAT_DIM` stays the same for every tile of one result, and until
-  the canvas has been read.
-- `TILE_CFG` is latched at `matmul_start`, like the dimension registers.
+- `tile_r * TILE_ROWS` must be a multiple of 16, so the tile's rows start
+  on a bank boundary; a `TILE_ROWS` that is a multiple of 16 always works.
+  Column offsets and widths can be anything.
+- A tile must not be larger than its grid cell, or it runs into the next.
+- The tile must lie inside the canvas width, `C0 + M <= W`, and the canvas
+  inside both buffers: `ceil(total rows / 16) * pitch(W) <= 4096` bytes
+  and `ceil(total rows / 16) * W <= 4096` psum slots.
+- `CANVAS_WIDTH` stays the same for every tile of one result.
+- `TILE_CFG`, `TILE_ROWS`, `TILE_COLS`, `CANVAS_WIDTH` and `ACT_CFG` are
+  latched at `matmul_start`, like the dimension registers; host reads use
+  the canvas pitch latched by the last `matmul_start`.
+
+### Bias buffer
+
+256 little-endian int32 entries at `BBUF_BASE`, write-only: the bias for
+canvas row `R` is at `BBUF_BASE + 4*R` (rows past 255 wrap, `R mod 256`).
+It is only read with `ACT_CFG.bias_en`. One 128-bit write carries four
+consecutive rows, and an entry is written only when all four of its byte
+enables are set. Write it before `matmul_start`, not while a matmul that
+uses it runs.
 
 Growing the buffer itself takes `OBUF_BANK_ADDR_WIDTH` and the `OBUF`
 window in [`rtl/accel_top.sv`](rtl/accel_top.sv), a matching
@@ -313,14 +386,17 @@ programming a matmul:
 |---|---|
 | `ceil(K / ARRAY_ROWS) * pitch(N) <= 1024` | weight_buffer per-bank depth |
 | `ceil(N / ARRAY_COLS) * pitch(M) <= 1024` | input_buffer per-bank depth |
-| `(tile_c+1)*M <= W` and `ceil((tile_r+1)*K / 16) * pitch(W) <= 4096` | output canvas, `W` = canvas width |
-| `K % 16 == 0` when `tile_r > 0` | tile rows start on a bank boundary |
+| `C0 + M <= W` and `ceil(total rows / 16) * pitch(W) <= 4096` | output canvas (4096 bytes per bank), `W` = canvas width |
+| `ceil(total rows / 16) * W <= 4096` | psum buffer (4096 32-bit slots per bank) |
+| `(tile_r * TILE_ROWS) % 16 == 0` | tile rows start on a bank boundary |
 | `M <= 1023` | `INPUT_MAX_ADDR` is a 10-bit field |
+| canvas rows using a bias `< 256` | bias buffer depth (rows wrap mod 256) |
 
 `K = N = M = 128` fills the weight and input buffers exactly
 (`test_128x128x128_matmul`); its result fills a quarter of the output buffer. Beyond that the input bounds trade off against
 each other: larger `K` or `N` needs a smaller `M`, and vice versa. Splitting
-the contraction across matmuls with `use_prev_out` removes the limit on `N`.
+the contraction across matmuls with `use_prev_out` (every part but the last
+with `ACT_CFG.out_raw`) removes the limit on `N`.
 
 ---
 
@@ -354,14 +430,20 @@ own start edge and holds them for that block's whole drain.
 
 They then select:
 
-- **`held_k_blk_idx`** - the write address within the bank:
-  `cur_addr = held_k_blk_idx * total_rows + row_count[r]`, i.e. different
-  output-row blocks write **disjoint** segments (concatenation, not
-  accumulation).
-- **`held_n_blk_idx`** - write vs. read-modify-write accumulate:
-  `new_val = (held_n_blk_idx == 0) ? scaled_psum : acc_sat`. The first
-  contraction block writes; every later one accumulates into what is already
-  there, since the contraction may need several passes.
+- **`held_k_blk_idx`** - which canvas row block the pass writes. For a tile
+  starting at row `R0 = tile_r * TILE_ROWS` and column `C0 = tile_c *
+  TILE_COLS`, bank `r` gets canvas row `R0 + 16*k_blk + r`, at
+  `(R0/16 + k_blk) * pitch + C0 + m` in each buffer (pitch in bytes for
+  `output_buffer`, slots for `psum_buffer`): different output-row blocks
+  write **disjoint** segments (concatenation, not accumulation). See
+  [`OUTPUT_BUFFER_LAYOUT.md`](OUTPUT_BUFFER_LAYOUT.md).
+- **`held_n_blk_idx`** - what the pass does:
+  - the first contraction block (`n_blk == 0`, unless `use_prev_out`
+    continues raw sums) writes its raw psum to `psum_buffer`;
+  - every later block read-modify-writes the raw 32-bit running sum there;
+  - the last block (`n_blk == WEIGHT_COLS/16 - 1`, unless `ACT_CFG.out_raw`)
+    instead adds the bias, rescales to int8, applies GELU, and writes the
+    int8 to `output_buffer`.
 
 > `committed_first_k_blk` / `held_first_k_blk` are wired through and latched
 > but **never read** - the accumulate decision uses `held_n_blk_idx == 0`
@@ -371,46 +453,61 @@ They then select:
 
 ## Buffer RAM IPs
 
-`weight_buffer`, `input_buffer`, and `output_buffer` are placeholder leaf
-RAMs (no `rtl/*.v` source checked in - only instantiated) standing in for
-Quartus-generated On-Chip Memory IPs.
+`weight_buffer`, `input_buffer`, `output_buffer`, `psum_buffer` and
+`bias_buffer` are placeholder leaf RAMs (no `rtl/*.v` source checked in -
+only instantiated) standing in for Quartus-generated On-Chip Memory IPs.
 [`tb/models/buffer_ram_models.v`](tb/models/buffer_ram_models.v) provides
 simulation-only behavioral stand-ins with matching names and ports.
 
-All three are **mixed-width simple dual-port** RAMs - independent
+All five are **simple dual-port** RAMs - independent
 `rdaddress`/`wraddress`, each with its own `rden`/`wren`, one cycle of
-registered read latency - with the host-facing port 128 bits wide and the
-core-facing port byte wide. Port shapes below are per bank:
+registered read latency. The first three are **mixed-width**, with the
+host-facing port 128 bits wide and the core-facing port byte wide.
+`psum_buffer` and `bias_buffer` are same-width 32-bit RAMs: `psum_buffer`
+is only ever touched by `output_loader`, and `bias_buffer`'s wrapper
+([`rtl/bias_buffer_32_bank.v`](rtl/bias_buffer_32_bank.v)) splits each
+128-bit host word into four 32-bit entries for four banks. Port shapes
+below are per bank:
 
 | Buffer | Instances | Host port (Avalon) | Core port | Total | AVS region |
 |---|---|---|---|---|---|
 | `weight_buffer` | `ARRAY_ROWS` (16) | **write** 64 x 128, 6-bit | read 1024 x 8, 10-bit (`weight_loader`) | 16 KB | `WBUF_SIZE = 0x4000` |
 | `input_buffer` | `ARRAY_ROWS` (16) | **write** 64 x 128, 6-bit | read 1024 x 8, 10-bit (`input_dispatch`) | 16 KB | `IBUF_SIZE = 0x4000` |
 | `output_buffer` | `ARRAY_COLS` (16) | **read** 256 x 128, 8-bit | write 4096 x 8, 12-bit (`output_loader`) | 64 KB | `OBUF_SIZE = 0x10000` |
+| `psum_buffer` | `ARRAY_COLS` (16) | none | read and write 4096 x 32, 12-bit (`output_loader`) | 256 KB | none |
+| `bias_buffer` | `ARRAY_ROWS` (16) | **write** 16 x 32, 4-bit (via the wrapper) | read 16 x 32, 4-bit (`output_loader`) | 1 KB | `BBUF_SIZE = 0x400` |
 
-> The `input_buffer` IP grew from 256 B to 1024 B per bank, and the
-> `output_buffer` IP from 128 B to 4096 B. Regenerate both On-Chip Memory
-> IPs at the depths above before building in Quartus.
+> `output_buffer` is back to its original int8 shape (4096 x 8 write,
+> 256 x 128 read), and `psum_buffer` and `bias_buffer` are new. Generate
+> all three On-Chip Memory IPs at the shapes above before building in
+> Quartus. A `bias_buffer` bank is only 512 bits - set its memory block
+> type to MLAB, or each of the 16 takes a whole M10K. In total the
+> buffers are about 350 KB of block RAM.
 
-The core side stays byte-wide because `weight_loader` and `input_dispatch`
-consume one byte per cycle and `output_loader` produces one byte per cycle.
-Configure each generated On-Chip Memory with these two port widths; byte
-ordering must be little-endian (narrow address `16n+j` = wide bit `8*j`),
-which is altsyncram's default.
+The core side is narrow because `weight_loader` and `input_dispatch`
+consume one byte per cycle and `output_loader` writes one int8 result per
+cycle. Configure each generated On-Chip Memory with these two port widths;
+byte ordering must be little-endian (narrow address `16n+j` = wide bit
+`8*j`), which is altsyncram's default.
 
-> `output_buffer`'s single read port is shared - `output_loader`'s
-> read-modify-write and the Avalon host both use it, muxed by `busy`. Since
-> that port is 128 bits, `output_loader` reads the *word* containing its
-> byte and selects the lane with the delayed address; its write-back still
-> goes through the byte-wide write port.
+> `output_buffer`'s single read port is shared - `output_loader` (reading
+> a previous int8 result for `ACT_CFG.prev_int8`) and the Avalon host both
+> use it, muxed by `busy`. Since that port is 128 bits, `output_loader`
+> reads the *word* containing its byte and selects the lane with the
+> delayed address; its write goes through the byte-wide write port.
 
 Notes:
 
 - The banked wrappers' flat addresses are derived, not hardcoded:
   `*_ADDR_WIDTH = $clog2(16) + 10` (14 bits at 16 banks), split as
   bank-select in the upper bits and per-bank offset in the lower.
-- The `_32_bank` in `input_buffer_32_bank` / `output_buffer_32_bank` is
-  historical; both are fully parameterized on bank count.
+- The `_32_bank` in the `*_buffer_32_bank` wrappers is historical; all of
+  them are fully parameterized on bank count.
+- The GELU table is not one of these IPs: it is 16 inferred 256 x 8 ROMs
+  (one per output lane, in `rtl/activation/rtl/gelu_int8.sv`), initialised
+  by `$readmemh` from `accel_top`'s `GELU_LUT_FILE` parameter - a path
+  relative to the simulator's or Quartus project's working directory.
+  `tb/Makefile` passes an absolute one.
 - `accel_top` overrides every wrapper's `BANK_ADDR_WIDTH`. Size the
   generated IPs from the `*_BANK_ADDR_WIDTH` localparams there, not from
   the module defaults.
@@ -439,17 +536,21 @@ make clean
 | Test | Covers |
 |---|---|
 | `test_single_block_matmul` | One full block |
-| `test_multiblock_matmul` | 2x2 blocks - multi-contraction-block accumulation and multi-output-block addressing |
+| `test_multiblock_matmul` | 2x2 blocks - multi-contraction-block accumulation (full 32-bit, one rescale) and multi-output-block addressing |
 | `test_partial_row_block_matmul` | Partial last **output-row** block (`K` not a multiple of `ARRAY_ROWS`): `valid_row` masking, `weight_loader` zero-padding, `output_loader` row gating |
 | `test_back_to_back_matmul_no_reset` | Two matmuls with no reset between - regression test for stale `STATUS.done`/`busy` |
-| `test_128x128x128_matmul` | `W` (128x128) @ `X` (128x128): 64 blocks, fills every weight and input bank to its full 1 KB, and is the only test with `M` larger than the 32-entry input FIFOs. Reads the result back in one 2047-beat burst, the 11-bit `avs_burstcount` maximum. Logs cycles from `matmul_start` to `STATUS.done`. Takes about a minute in Icarus. |
-| `test_tiled_canvas_use_prev_out` | `Y` (256x256) as 2x2 tiles of 128x128, each tile's contraction split into two `use_prev_out` matmuls: eight matmuls filling the whole output buffer, read back once. |
-| `test_tiled_unaligned_col_offset` | 2x2 tiles of 16x20 on a 40-wide canvas: rows padded to 48 bytes, not a power of two, and column tiles start mid-word, sharing bus words with their left neighbour |
+| `test_128x128x128_matmul` | `W` (128x128) @ `X` (128x128): 64 blocks, fills every weight and input bank to its full 1 KB, and is the only test with `M` larger than the 32-entry input FIFOs. Reads the result back in one 2047-beat burst, the 11-bit `avs_burstcount` maximum. Logs cycles from `matmul_start` to `STATUS.done`. Takes about half a minute in Icarus. |
+| `test_tiled_canvas_use_prev_out` | `Y` (256x256) as 2x2 tiles of 128x128, each tile's contraction split into two `use_prev_out` matmuls (the first halves with `ACT_CFG.out_raw`): eight matmuls filling the whole output buffer, read back once. |
+| `test_tiled_unaligned_col_offset` | 2x2 tiles of 16x37 (two contraction blocks) on a 74-wide canvas: rows padded to 80 bytes (5 words, not a power of two), and column tiles start mid-word, sharing bus words with their left neighbour |
+| `test_tiled_edge_tiles` | A 40x37 result on a 32x22 tile grid (`TILE_ROWS`/`TILE_COLS`): smaller bottom and right edge tiles land on the grid, and the right tiles start mid-word |
+| `test_bias_gelu` | `ACT_CFG.bias_en` + `gelu_en` on 3 output-row x 3 contraction blocks - every output-row block gets its bias and GELU exactly once, on its last pass - then a bias-only tile at tile row 1, checking the bias is indexed by canvas row |
+| `test_prev_int8_out_raw` | `ACT_CFG.out_raw` (raw 32-bit sums, bias ignored), a `use_prev_out` matmul continuing them to the int8 result of the whole contraction, then a two-contraction-block `use_prev_out` + `prev_int8` (+ bias, GELU) matmul adding onto that int8 result |
 | `test_done_set_wins_over_status_read` | Times a `STATUS` read to land exactly on the done pulse; the done event must survive. Guards the patch `rdl/python_gen.py` applies to the generated register file. |
 
 Test dimensions derive from `ARRAY_ROWS`/`ARRAY_COLS` (top of
 `tb/test_accel_top.py`, which must match `accel_top.sv`), so the suite
-follows an array resize.
+follows an array resize. The GELU tests read the same table the hardware
+loads, `rtl/activation/example/gelu_int8.hex`.
 
 ---
 
@@ -473,6 +574,13 @@ follows an array resize.
   block's weight. Harmless on the output-row axis (a stale row only feeds an
   output lane that `row_live` masks off), but it means the zero-fill cannot
   be relied on if contraction-axis masking is ever added.
+- **Raw 32-bit sums are not host-readable.** They live in the internal
+  `psum_buffer`; a matmul run with `ACT_CFG.out_raw` is only useful to a
+  later `use_prev_out` matmul.
+- **Tile placement is not checked.** A tile whose first row
+  (`tile_r * TILE_ROWS`) is not a multiple of 16 is silently moved up to
+  the previous multiple, and a tile larger than its grid cell overwrites
+  its neighbour.
 - **Stale axis comments.** `rtl/weight_ctrl.v`'s and `rdl/ctrl_reg.rdl`'s
   headers describe `WEIGHT_ROWS` as the contraction dimension. They are
   wrong; see [Data flow and axis convention](#data-flow-and-axis-convention).

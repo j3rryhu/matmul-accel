@@ -36,8 +36,20 @@ module ctrl_rf_rf #(
     output logic                     [14: 0] TILE_CFG_tile_c_q,              //! Current field value
     output logic                     [ 0: 0] TILE_CFG_use_prev_out_q,              //! Current field value
 
-    // Register TILED_MAT_DIM
-    output logic                     [15: 0] TILED_MAT_DIM_tiled_c_dim_q,              //! Current field value
+    // Register CANVAS_WIDTH
+    output logic                     [15: 0] CANVAS_WIDTH_value_q,              //! Current field value
+
+    // Register ACT_CFG
+    output logic                     [ 0: 0] ACT_CFG_bias_en_q,              //! Current field value
+    output logic                     [ 0: 0] ACT_CFG_gelu_en_q,              //! Current field value
+    output logic                     [ 0: 0] ACT_CFG_prev_int8_q,              //! Current field value
+    output logic                     [ 0: 0] ACT_CFG_out_raw_q,              //! Current field value
+
+    // Register TILE_ROWS
+    output logic                     [15: 0] TILE_ROWS_value_q,              //! Current field value
+
+    // Register TILE_COLS
+    output logic                     [15: 0] TILE_COLS_value_q,              //! Current field value
 
     // Register Bus
     input  logic                             valid,    //! Active high valid
@@ -99,10 +111,34 @@ module ctrl_rf_rf #(
     logic                             TILE_CFG_use_prev_out_anded;
     logic                             TILE_CFG_use_prev_out_ored;
     logic                             TILE_CFG_use_prev_out_xored;
-    logic                           [15: 0] TILED_MAT_DIM_tiled_c_dim_next;
-    logic                             TILED_MAT_DIM_tiled_c_dim_anded;
-    logic                             TILED_MAT_DIM_tiled_c_dim_ored;
-    logic                             TILED_MAT_DIM_tiled_c_dim_xored;
+    logic                           [15: 0] CANVAS_WIDTH_value_next;
+    logic                             CANVAS_WIDTH_value_anded;
+    logic                             CANVAS_WIDTH_value_ored;
+    logic                             CANVAS_WIDTH_value_xored;
+    logic                           [ 0: 0] ACT_CFG_bias_en_next;
+    logic                             ACT_CFG_bias_en_anded;
+    logic                             ACT_CFG_bias_en_ored;
+    logic                             ACT_CFG_bias_en_xored;
+    logic                           [ 0: 0] ACT_CFG_gelu_en_next;
+    logic                             ACT_CFG_gelu_en_anded;
+    logic                             ACT_CFG_gelu_en_ored;
+    logic                             ACT_CFG_gelu_en_xored;
+    logic                           [ 0: 0] ACT_CFG_prev_int8_next;
+    logic                             ACT_CFG_prev_int8_anded;
+    logic                             ACT_CFG_prev_int8_ored;
+    logic                             ACT_CFG_prev_int8_xored;
+    logic                           [ 0: 0] ACT_CFG_out_raw_next;
+    logic                             ACT_CFG_out_raw_anded;
+    logic                             ACT_CFG_out_raw_ored;
+    logic                             ACT_CFG_out_raw_xored;
+    logic                           [15: 0] TILE_ROWS_value_next;
+    logic                             TILE_ROWS_value_anded;
+    logic                             TILE_ROWS_value_ored;
+    logic                             TILE_ROWS_value_xored;
+    logic                           [15: 0] TILE_COLS_value_next;
+    logic                             TILE_COLS_value_anded;
+    logic                             TILE_COLS_value_ored;
+    logic                             TILE_COLS_value_xored;
 /* verilator lint_on UNUSED */
 
     // ============================================================
@@ -141,7 +177,10 @@ module ctrl_rf_rf #(
     logic                     [DATA_WIDTH-1:0] STATUS_rdata;
     logic                     [DATA_WIDTH-1:0] OUTPUT_SCALE_rdata;
     logic                     [DATA_WIDTH-1:0] TILE_CFG_rdata;
-    logic                     [DATA_WIDTH-1:0] TILED_MAT_DIM_rdata;
+    logic                     [DATA_WIDTH-1:0] CANVAS_WIDTH_rdata;
+    logic                     [DATA_WIDTH-1:0] ACT_CFG_rdata;
+    logic                     [DATA_WIDTH-1:0] TILE_ROWS_rdata;
+    logic                     [DATA_WIDTH-1:0] TILE_COLS_rdata;
 
     assign sw_rdata = // or of each register return (masked)
                    CONTROL_rdata | 
@@ -152,7 +191,10 @@ module ctrl_rf_rf #(
                    STATUS_rdata | 
                    OUTPUT_SCALE_rdata | 
                    TILE_CFG_rdata | 
-                   TILED_MAT_DIM_rdata;
+                   CANVAS_WIDTH_rdata | 
+                   ACT_CFG_rdata | 
+                   TILE_ROWS_rdata | 
+                   TILE_COLS_rdata;
             
         
     // ============================================================
@@ -559,43 +601,235 @@ module ctrl_rf_rf #(
             
         
     // ============================================================
-    // Register: TILED_MAT_DIM
-    //    [15: 0]          tiled_c_dim: hw=r     sw=w     reset=0x0
+    // Register: CANVAS_WIDTH
+    //    [15: 0]                value: hw=r     sw=w     reset=0x0
     // ============================================================
-    logic                  TILED_MAT_DIM_decode;
-    logic                  TILED_MAT_DIM_sw_wr;
-    logic                  TILED_MAT_DIM_sw_rd;
-    logic [DATA_WIDTH-1:0] TILED_MAT_DIM_q;
+    logic                  CANVAS_WIDTH_decode;
+    logic                  CANVAS_WIDTH_sw_wr;
+    logic                  CANVAS_WIDTH_sw_rd;
+    logic [DATA_WIDTH-1:0] CANVAS_WIDTH_q;
 
-    assign TILED_MAT_DIM_decode = (addr == (ADDR_OFFSET+'h0+'h80));
-    assign TILED_MAT_DIM_sw_wr = sw_wr && TILED_MAT_DIM_decode;
-    assign TILED_MAT_DIM_sw_rd = sw_rd && TILED_MAT_DIM_decode;
+    assign CANVAS_WIDTH_decode = (addr == (ADDR_OFFSET+'h0+'h80));
+    assign CANVAS_WIDTH_sw_wr = sw_wr && CANVAS_WIDTH_decode;
+    assign CANVAS_WIDTH_sw_rd = sw_rd && CANVAS_WIDTH_decode;
 
     always_comb begin
-        TILED_MAT_DIM_q = '0;
-        TILED_MAT_DIM_q[15: 0] = TILED_MAT_DIM_tiled_c_dim_q;
+        CANVAS_WIDTH_q = '0;
+        CANVAS_WIDTH_q[15: 0] = CANVAS_WIDTH_value_q;
     end
 
     // masked version of return data
-    assign TILED_MAT_DIM_rdata = TILED_MAT_DIM_sw_rd ? TILED_MAT_DIM_q : 'b0;
+    assign CANVAS_WIDTH_rdata = CANVAS_WIDTH_sw_rd ? CANVAS_WIDTH_q : 'b0;
 
     // ------------------------------------------------------------
-    // Field: tiled_c_dim
+    // Field: value
     // ------------------------------------------------------------
-    assign TILED_MAT_DIM_tiled_c_dim_anded = & TILED_MAT_DIM_tiled_c_dim_q;
-    assign TILED_MAT_DIM_tiled_c_dim_ored  = | TILED_MAT_DIM_tiled_c_dim_q;
-    assign TILED_MAT_DIM_tiled_c_dim_xored = ^ TILED_MAT_DIM_tiled_c_dim_q;
+    assign CANVAS_WIDTH_value_anded = & CANVAS_WIDTH_value_q;
+    assign CANVAS_WIDTH_value_ored  = | CANVAS_WIDTH_value_q;
+    assign CANVAS_WIDTH_value_xored = ^ CANVAS_WIDTH_value_q;
 
     // next hardware value
 
     //! main storage
     always_ff @ (posedge clk, negedge resetn)
     if (~resetn) begin
-        TILED_MAT_DIM_tiled_c_dim_q <= 0;
+        CANVAS_WIDTH_value_q <= 0;
     end else begin
         // Software write
-        if (TILED_MAT_DIM_sw_wr) begin
-            TILED_MAT_DIM_tiled_c_dim_q <=  sw_masked_data[15: 0] | (TILED_MAT_DIM_tiled_c_dim_q & ~sw_mask[15: 0]);
+        if (CANVAS_WIDTH_sw_wr) begin
+            CANVAS_WIDTH_value_q <=  sw_masked_data[15: 0] | (CANVAS_WIDTH_value_q & ~sw_mask[15: 0]);
+        end
+    end
+            
+        
+    // ============================================================
+    // Register: ACT_CFG
+    //    [ 0: 0]              bias_en: hw=r     sw=w     reset=0x0
+    //    [ 1: 1]              gelu_en: hw=r     sw=w     reset=0x0
+    //    [ 2: 2]            prev_int8: hw=r     sw=w     reset=0x0
+    //    [ 3: 3]              out_raw: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  ACT_CFG_decode;
+    logic                  ACT_CFG_sw_wr;
+    logic                  ACT_CFG_sw_rd;
+    logic [DATA_WIDTH-1:0] ACT_CFG_q;
+
+    assign ACT_CFG_decode = (addr == (ADDR_OFFSET+'h0+'h90));
+    assign ACT_CFG_sw_wr = sw_wr && ACT_CFG_decode;
+    assign ACT_CFG_sw_rd = sw_rd && ACT_CFG_decode;
+
+    always_comb begin
+        ACT_CFG_q = '0;
+        ACT_CFG_q[ 0: 0] = ACT_CFG_bias_en_q;
+        ACT_CFG_q[ 1: 1] = ACT_CFG_gelu_en_q;
+        ACT_CFG_q[ 2: 2] = ACT_CFG_prev_int8_q;
+        ACT_CFG_q[ 3: 3] = ACT_CFG_out_raw_q;
+    end
+
+    // masked version of return data
+    assign ACT_CFG_rdata = ACT_CFG_sw_rd ? ACT_CFG_q : 'b0;
+
+    // ------------------------------------------------------------
+    // Field: bias_en
+    // ------------------------------------------------------------
+    assign ACT_CFG_bias_en_anded = & ACT_CFG_bias_en_q;
+    assign ACT_CFG_bias_en_ored  = | ACT_CFG_bias_en_q;
+    assign ACT_CFG_bias_en_xored = ^ ACT_CFG_bias_en_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        ACT_CFG_bias_en_q <= 0;
+    end else begin
+        // Software write
+        if (ACT_CFG_sw_wr) begin
+            ACT_CFG_bias_en_q <=  sw_masked_data[ 0: 0] | (ACT_CFG_bias_en_q & ~sw_mask[ 0: 0]);
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Field: gelu_en
+    // ------------------------------------------------------------
+    assign ACT_CFG_gelu_en_anded = & ACT_CFG_gelu_en_q;
+    assign ACT_CFG_gelu_en_ored  = | ACT_CFG_gelu_en_q;
+    assign ACT_CFG_gelu_en_xored = ^ ACT_CFG_gelu_en_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        ACT_CFG_gelu_en_q <= 0;
+    end else begin
+        // Software write
+        if (ACT_CFG_sw_wr) begin
+            ACT_CFG_gelu_en_q <=  sw_masked_data[ 1: 1] | (ACT_CFG_gelu_en_q & ~sw_mask[ 1: 1]);
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Field: prev_int8
+    // ------------------------------------------------------------
+    assign ACT_CFG_prev_int8_anded = & ACT_CFG_prev_int8_q;
+    assign ACT_CFG_prev_int8_ored  = | ACT_CFG_prev_int8_q;
+    assign ACT_CFG_prev_int8_xored = ^ ACT_CFG_prev_int8_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        ACT_CFG_prev_int8_q <= 0;
+    end else begin
+        // Software write
+        if (ACT_CFG_sw_wr) begin
+            ACT_CFG_prev_int8_q <=  sw_masked_data[ 2: 2] | (ACT_CFG_prev_int8_q & ~sw_mask[ 2: 2]);
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Field: out_raw
+    // ------------------------------------------------------------
+    assign ACT_CFG_out_raw_anded = & ACT_CFG_out_raw_q;
+    assign ACT_CFG_out_raw_ored  = | ACT_CFG_out_raw_q;
+    assign ACT_CFG_out_raw_xored = ^ ACT_CFG_out_raw_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        ACT_CFG_out_raw_q <= 0;
+    end else begin
+        // Software write
+        if (ACT_CFG_sw_wr) begin
+            ACT_CFG_out_raw_q <=  sw_masked_data[ 3: 3] | (ACT_CFG_out_raw_q & ~sw_mask[ 3: 3]);
+        end
+    end
+            
+        
+    // ============================================================
+    // Register: TILE_ROWS
+    //    [15: 0]                value: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  TILE_ROWS_decode;
+    logic                  TILE_ROWS_sw_wr;
+    logic                  TILE_ROWS_sw_rd;
+    logic [DATA_WIDTH-1:0] TILE_ROWS_q;
+
+    assign TILE_ROWS_decode = (addr == (ADDR_OFFSET+'h0+'ha0));
+    assign TILE_ROWS_sw_wr = sw_wr && TILE_ROWS_decode;
+    assign TILE_ROWS_sw_rd = sw_rd && TILE_ROWS_decode;
+
+    always_comb begin
+        TILE_ROWS_q = '0;
+        TILE_ROWS_q[15: 0] = TILE_ROWS_value_q;
+    end
+
+    // masked version of return data
+    assign TILE_ROWS_rdata = TILE_ROWS_sw_rd ? TILE_ROWS_q : 'b0;
+
+    // ------------------------------------------------------------
+    // Field: value
+    // ------------------------------------------------------------
+    assign TILE_ROWS_value_anded = & TILE_ROWS_value_q;
+    assign TILE_ROWS_value_ored  = | TILE_ROWS_value_q;
+    assign TILE_ROWS_value_xored = ^ TILE_ROWS_value_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        TILE_ROWS_value_q <= 0;
+    end else begin
+        // Software write
+        if (TILE_ROWS_sw_wr) begin
+            TILE_ROWS_value_q <=  sw_masked_data[15: 0] | (TILE_ROWS_value_q & ~sw_mask[15: 0]);
+        end
+    end
+            
+        
+    // ============================================================
+    // Register: TILE_COLS
+    //    [15: 0]                value: hw=r     sw=w     reset=0x0
+    // ============================================================
+    logic                  TILE_COLS_decode;
+    logic                  TILE_COLS_sw_wr;
+    logic                  TILE_COLS_sw_rd;
+    logic [DATA_WIDTH-1:0] TILE_COLS_q;
+
+    assign TILE_COLS_decode = (addr == (ADDR_OFFSET+'h0+'hb0));
+    assign TILE_COLS_sw_wr = sw_wr && TILE_COLS_decode;
+    assign TILE_COLS_sw_rd = sw_rd && TILE_COLS_decode;
+
+    always_comb begin
+        TILE_COLS_q = '0;
+        TILE_COLS_q[15: 0] = TILE_COLS_value_q;
+    end
+
+    // masked version of return data
+    assign TILE_COLS_rdata = TILE_COLS_sw_rd ? TILE_COLS_q : 'b0;
+
+    // ------------------------------------------------------------
+    // Field: value
+    // ------------------------------------------------------------
+    assign TILE_COLS_value_anded = & TILE_COLS_value_q;
+    assign TILE_COLS_value_ored  = | TILE_COLS_value_q;
+    assign TILE_COLS_value_xored = ^ TILE_COLS_value_q;
+
+    // next hardware value
+
+    //! main storage
+    always_ff @ (posedge clk, negedge resetn)
+    if (~resetn) begin
+        TILE_COLS_value_q <= 0;
+    end else begin
+        // Software write
+        if (TILE_COLS_sw_wr) begin
+            TILE_COLS_value_q <=  sw_masked_data[15: 0] | (TILE_COLS_value_q & ~sw_mask[15: 0]);
         end
     end
 

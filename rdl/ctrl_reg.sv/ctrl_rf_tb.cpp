@@ -279,20 +279,128 @@ int main(int argc, char** argv) {
     }
     cycle(top);
     cycle(top);
-    std::cout << main_time << ": Testcase (TILED_MAT_DIM_tiled_c_dim ):\n";
+    std::cout << main_time << ": Testcase (CANVAS_WIDTH_value ):\n";
     std::cout << main_time << ": \tSoftware write test\n";
     for (int IDX = 0; IDX <= 15; ++IDX) {
         int temp, value;
 
-        temp = top->TILED_MAT_DIM_tiled_c_dim_q << 0;
+        temp = top->CANVAS_WIDTH_value_q << 0;
         temp = (1 << IDX);
         value = 0;
 
         SW_WRITE( 128, (1 << IDX) )
-        CHECK_EQUAL(top->TILED_MAT_DIM_tiled_c_dim_q, RANGE(temp, 16, 0))
+        CHECK_EQUAL(top->CANVAS_WIDTH_value_q, RANGE(temp, 16, 0))
 
         SW_WRITE( 128, 0 )
-        CHECK_EQUAL(top->TILED_MAT_DIM_tiled_c_dim_q, RANGE(value, 16, 0))
+        CHECK_EQUAL(top->CANVAS_WIDTH_value_q, RANGE(value, 16, 0))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (ACT_CFG_bias_en ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 0; IDX <= 0; ++IDX) {
+        int temp, value;
+
+        temp = top->ACT_CFG_bias_en_q << 0;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 144, (1 << IDX) )
+        CHECK_EQUAL(top->ACT_CFG_bias_en_q, RANGE(temp, 1, 0))
+
+        SW_WRITE( 144, 0 )
+        CHECK_EQUAL(top->ACT_CFG_bias_en_q, RANGE(value, 1, 0))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (ACT_CFG_gelu_en ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 1; IDX <= 1; ++IDX) {
+        int temp, value;
+
+        temp = top->ACT_CFG_gelu_en_q << 1;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 144, (1 << IDX) )
+        CHECK_EQUAL(top->ACT_CFG_gelu_en_q, RANGE(temp, 1, 1))
+
+        SW_WRITE( 144, 0 )
+        CHECK_EQUAL(top->ACT_CFG_gelu_en_q, RANGE(value, 1, 1))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (ACT_CFG_prev_int8 ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 2; IDX <= 2; ++IDX) {
+        int temp, value;
+
+        temp = top->ACT_CFG_prev_int8_q << 2;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 144, (1 << IDX) )
+        CHECK_EQUAL(top->ACT_CFG_prev_int8_q, RANGE(temp, 1, 2))
+
+        SW_WRITE( 144, 0 )
+        CHECK_EQUAL(top->ACT_CFG_prev_int8_q, RANGE(value, 1, 2))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (ACT_CFG_out_raw ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 3; IDX <= 3; ++IDX) {
+        int temp, value;
+
+        temp = top->ACT_CFG_out_raw_q << 3;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 144, (1 << IDX) )
+        CHECK_EQUAL(top->ACT_CFG_out_raw_q, RANGE(temp, 1, 3))
+
+        SW_WRITE( 144, 0 )
+        CHECK_EQUAL(top->ACT_CFG_out_raw_q, RANGE(value, 1, 3))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (TILE_ROWS_value ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 0; IDX <= 15; ++IDX) {
+        int temp, value;
+
+        temp = top->TILE_ROWS_value_q << 0;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 160, (1 << IDX) )
+        CHECK_EQUAL(top->TILE_ROWS_value_q, RANGE(temp, 16, 0))
+
+        SW_WRITE( 160, 0 )
+        CHECK_EQUAL(top->TILE_ROWS_value_q, RANGE(value, 16, 0))
+
+    }
+    cycle(top);
+    cycle(top);
+    std::cout << main_time << ": Testcase (TILE_COLS_value ):\n";
+    std::cout << main_time << ": \tSoftware write test\n";
+    for (int IDX = 0; IDX <= 15; ++IDX) {
+        int temp, value;
+
+        temp = top->TILE_COLS_value_q << 0;
+        temp = (1 << IDX);
+        value = 0;
+
+        SW_WRITE( 176, (1 << IDX) )
+        CHECK_EQUAL(top->TILE_COLS_value_q, RANGE(temp, 16, 0))
+
+        SW_WRITE( 176, 0 )
+        CHECK_EQUAL(top->TILE_COLS_value_q, RANGE(value, 16, 0))
 
     }
 

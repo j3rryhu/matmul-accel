@@ -1,12 +1,14 @@
 // Simulation-only behavioral stand-ins for the buffer-RAM IP referenced by
-// rtl/accel_top.sv, rtl/input_buffer_32_bank.v, and rtl/output_buffer_32_bank.v
-// (weight_buffer, input_buffer, output_buffer).
+// rtl/accel_top.sv, rtl/input_buffer_32_bank.v, rtl/output_buffer_32_bank.v,
+// rtl/psum_buffer_32_bank.v and rtl/bias_buffer_32_bank.v (weight_buffer,
+// input_buffer, output_buffer, psum_buffer, bias_buffer - psum_buffer and
+// bias_buffer are the same-width RAMs, see their own notes at the bottom).
 //
-// All three are MIXED-WIDTH simple dual-port RAMs: the Avalon-facing port is
-// AVS_DATA_WIDTH (128) wide so a host access moves a full word and the byte
-// address advances by 16, while the core-facing port stays byte-wide because
-// weight_loader/input_dispatch read one byte per cycle and output_loader
-// writes one byte per cycle.
+// The first three are MIXED-WIDTH simple dual-port RAMs: the Avalon-facing
+// port is AVS_DATA_WIDTH (128) wide so a host access moves a full word and
+// the byte address advances by 16, while the core-facing port stays
+// byte-wide because weight_loader/input_dispatch read one byte per cycle
+// and output_loader writes one int8 result per cycle.
 //
 //   weight_buffer : wide WRITE  (Avalon)      / narrow READ  (weight_loader)
 //   input_buffer  : wide WRITE  (Avalon)      / narrow READ  (input_dispatch)
@@ -126,8 +128,9 @@ module input_buffer (
 endmodule
 
 // output_buffer: one bank of output_buffer_32_bank, 4096 bytes (16 rows of
-// the 256x256 output canvas). output_loader writes bytes (4096 x 8, 12-bit);
-// Avalon reads 128-bit words (256 x 128, 8-bit word address).
+// the 256x256 int8 output canvas). output_loader writes one int8 result at
+// a time (4096 x 8, 12-bit); Avalon reads 128-bit words (256 x 128, 8-bit
+// word address).
 module output_buffer (
     input         clock,
     input  [ 7:0] data,
@@ -146,4 +149,51 @@ module output_buffer (
         .rdaddress (rdaddress), .rden (rden),
         .wraddress (wraddress), .wren (wren), .q (q)
     );
+endmodule
+
+// psum_buffer: one bank of psum_buffer_32_bank, 4096 32-bit raw running
+// sums (16 KB: 16 rows of the 256x256 canvas), used only by output_loader.
+// Same-width: 4096 x 32 on both ports, 12-bit address on each side. Same
+// one-cycle registered read as the others.
+module psum_buffer (
+    input         clock,
+    input  [31:0] data,
+    input  [11:0] rdaddress,
+    input         rden,
+    input  [11:0] wraddress,
+    input         wren,
+    output reg [31:0] q
+);
+    reg [31:0] mem [0:4095];
+
+    always @(posedge clock) begin
+        if (wren)
+            mem[wraddress] <= data;
+        if (rden)
+            q <= mem[rdaddress];
+    end
+endmodule
+
+// bias_buffer: one bank of bias_buffer_32_bank, 16 int32 entries (the bias
+// of canvas rows r, r+16, ... for bank r). Unlike the other three this is
+// NOT mixed-width: bias_buffer_32_bank splits each 128-bit host word into
+// one 32-bit entry per bank itself, so both ports are 32 bits (16 x 32,
+// 4-bit address on each side). Same one-cycle registered read as the others.
+module bias_buffer (
+    input         clock,
+    input  [31:0] data,
+    input  [ 3:0] rdaddress,
+    input         rden,
+    input  [ 3:0] wraddress,
+    input         wren,
+    output reg [31:0] q
+);
+    reg [31:0] mem [0:15];
+
+    always @(posedge clock) begin
+        if (wren)
+            mem[wraddress] <= data;
+        if (rden)
+            q <= mem[rdaddress];
+    end
 endmodule

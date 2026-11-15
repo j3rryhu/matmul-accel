@@ -103,12 +103,16 @@ addrmap ctrl_rf {
     } OUTPUT_SCALE @ 0x60;
 
     // Output tile placement (0x70). The output buffer holds one int8 canvas
-    // (width: TILED_MAT_DIM); this matmul's K x M result lands with its top-left corner at
-    // canvas row tile_r*WEIGHT_ROWS, column tile_c*INPUT_COLS. Every tile
-    // of one result must use the same K and M, and with tile_r > 0, K must
-    // be a multiple of 16 (bank boundary). use_prev_out: the first
-    // contraction block accumulates onto the canvas instead of overwriting
-    // it, to split a long contraction across matmuls. Latched at
+    // (width: CANVAS_WIDTH), and the internal psum buffer the same canvas as
+    // raw 32-bit sums (see ACT_CFG); this
+    // matmul's WEIGHT_ROWS x INPUT_COLS result lands with its top-left
+    // corner at canvas row tile_r*TILE_ROWS, column tile_c*TILE_COLS (see
+    // those registers - 0 there means this matmul's own WEIGHT_ROWS /
+    // INPUT_COLS). The first row, tile_r*TILE_ROWS, must be a multiple of
+    // 16 (output bank boundary); the first column can be anything.
+    // use_prev_out: the first contraction block accumulates onto the canvas
+    // instead of overwriting it, to split a long contraction across
+    // matmuls (the format it reads is ACT_CFG.prev_int8). Latched at
     // matmul_start. See rtl/accel_top.sv's TILE_CFG latch.
     reg {
         field {
@@ -130,16 +134,85 @@ addrmap ctrl_rf {
         } use_prev_out;
     } TILE_CFG @ 0x70;
 
-    // Output canvas width (0x80): the whole result's column count when it
-    // is built from tiles, so the canvas reads back as one dense row-major
-    // matrix (rows padded to a 16-byte word). 0 = use INPUT_COLS, for one
-    // untiled matmul. Must stay the same from the first tile until the
-    // canvas has been read.
+    // Output canvas width (0x80), in elements: the whole result's column
+    // count when it is built from tiles. Sets the canvas row pitch - rows of
+    // the int8 output canvas padded to a 16-byte word - for both the result
+    // writes and the host read remap; latched at matmul_start. 0 = use
+    // INPUT_COLS, for one untiled matmul. Keep it the same for every tile of
+    // one result.
     reg {
         field {
             sw = w;
             hw = r;
             reset = 0;
-        } tiled_c_dim[15:0];
-    } TILED_MAT_DIM @ 0x80;
+        } value [15:0];
+    } CANVAS_WIDTH @ 0x80;
+
+    // Output activation / format (0x90), latched at matmul_start. Raw 32-bit
+    // sums live in the internal psum buffer between contraction blocks; the
+    // finished int8 result goes to the output buffer, one byte per element
+    // at its canvas position.
+    //   bias_en:   add the int32 bias of the element's canvas row (bias
+    //              buffer, entry = canvas row mod 256, accumulator units
+    //              i.e. scale input_scale*weight_scale) to the 32-bit sum
+    //              before the OUTPUT_SCALE rescale.
+    //   gelu_en:   pass the rescaled int8 through the GELU lookup table.
+    //   prev_int8: with TILE_CFG.use_prev_out, add onto the int8 result
+    //              already in the output buffer (rather than continuing raw
+    //              sums): this matmul's raw sums start fresh, and the
+    //              previous int8 is added to the rescaled value (saturating,
+    //              before GELU). Any number of contraction blocks.
+    //   out_raw:   keep the raw 32-bit sums in the psum buffer after the
+    //              last contraction block (no bias, rescale, GELU, and no
+    //              int8 result), for a later use_prev_out matmul to continue.
+    // bias_en/gelu_en only act on an int8 result, never with out_raw.
+    reg {
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } bias_en;
+
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } gelu_en;
+
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } prev_int8;
+
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } out_raw;
+    } ACT_CFG @ 0x90;
+
+    // Tile size (0xA0 / 0xB0) - the grid TILE_CFG indexes: a tile's first
+    // canvas row is TILE_CFG.tile_r*TILE_ROWS, its first canvas column
+    // TILE_CFG.tile_c*TILE_COLS. Decoupled from this matmul's own size so
+    // an edge tile can be smaller (its WEIGHT_ROWS / INPUT_COLS) and still
+    // land on the grid; it should not be larger, or it runs into the next
+    // tile. 0 = use this matmul's WEIGHT_ROWS / INPUT_COLS (equal-size
+    // tiles). tile_r*TILE_ROWS must be a multiple of 16 - simplest is a
+    // TILE_ROWS that is one. Latched at matmul_start.
+    reg {
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } value [15:0];
+    } TILE_ROWS @ 0xA0;
+
+    reg {
+        field {
+            sw = w;
+            hw = r;
+            reset = 0;
+        } value [15:0];
+    } TILE_COLS @ 0xB0;
 };
