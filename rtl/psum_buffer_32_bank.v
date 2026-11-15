@@ -7,9 +7,11 @@
 // both one 32-bit slot wide. The host never sees it - finished results go
 // to output_buffer as int8, and that is what the host reads.
 //
-// Layout mirrors output_buffer's: canvas row R in bank R % NUM_BANKS, at
-// slot (R / NUM_BANKS) * pitch + column, pitch = the canvas width rounded up
-// to a multiple of 4 slots.
+// Holds ONE tile (the current matmul's result), relative to the tile, not
+// the canvas: tile row k in bank k % NUM_BANKS, at slot
+// (k / NUM_BANKS) * INPUT_COLS + column (no padding). Every tile reuses the
+// same slots, so the depth only bounds the tile size - 1024 slots per bank
+// is up to 128x128 - not the canvas.
 //
 // NB: the "32" in the module name only mirrors the other *_buffer_32_bank
 // wrappers - the bank count is NUM_BANKS.
@@ -18,7 +20,7 @@
 module psum_buffer_32_bank #(
     parameter DATA_WIDTH      = 32,   // one raw running sum (pe_array ACC_WIDTH)
     parameter NUM_BANKS       = 16,
-    parameter BANK_ADDR_WIDTH = 12    // per-bank address width (slots) - match the generated psum_buffer IP's depth (4096)
+    parameter BANK_ADDR_WIDTH = 10    // per-bank address width (slots) - match the generated psum_buffer IP's depth (1024)
 )(
     input clock,
 

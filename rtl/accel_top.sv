@@ -74,14 +74,15 @@ module accel_top #(
     // weights per weight bank, 8 contraction bands x 128 columns per input
     // bank). The output buffer uses 4KB banks of int8 results, filling its
     // 64KB window: a 256x256 canvas, i.e. 2x2 tiles of 128x128 results (see
-    // below). The psum buffer behind it keeps the same canvas as 32-bit raw
-    // sums: 4096-slot (16KB) banks, 256KB, internal only.
+    // below). The psum buffer behind it holds only the current tile's raw
+    // 32-bit sums, internal only: 1024-slot (4KB) banks, 64KB - one tile of
+    // up to 128x128 (ceil(WEIGHT_ROWS/16) * INPUT_COLS <= 1024).
     // Growing a depth or the array means growing the matching *_SIZE
     // window above (the check below catches a window that is too small).
     localparam int WBUF_BANK_ADDR_WIDTH = 10;  // weight_buffer IP depth = 1024 entries/bank
     localparam int IBUF_BANK_ADDR_WIDTH = 10;  // input_buffer IP depth  = 1024 entries/bank
     localparam int OBUF_BANK_ADDR_WIDTH = 12;  // output_buffer IP depth = 4096 bytes/bank
-    localparam int PSUM_BANK_ADDR_WIDTH = 12;  // psum_buffer IP depth   = 4096 32-bit slots/bank
+    localparam int PSUM_BANK_ADDR_WIDTH = 10;  // psum_buffer IP depth   = 1024 32-bit slots/bank
     localparam int WBUF_ADDR_WIDTH      = $clog2(ARRAY_ROWS) + WBUF_BANK_ADDR_WIDTH;
     localparam int IBUF_ADDR_WIDTH      = $clog2(ARRAY_ROWS) + IBUF_BANK_ADDR_WIDTH;
     localparam int OBUF_ADDR_WIDTH      = $clog2(ARRAY_COLS) + OBUF_BANK_ADDR_WIDTH;
@@ -96,9 +97,9 @@ module accel_top #(
     // ---- output canvas ----
     // output_buffer holds one int8 canvas, CANVAS_WIDTH bytes wide (the
     // whole result's column count; 0 means INPUT_COLS, the untiled case),
-    // rows padded to whole host words; psum_buffer holds the same canvas as
-    // raw 32-bit sums between contraction blocks. See the output_buffer
-    // section.
+    // rows padded to whole host words; psum_buffer holds this matmul's tile
+    // as raw 32-bit sums between contraction blocks. See the output_buffer
+    // and psum_buffer sections.
 
     // Each window must cover every bank, or the top banks are unreachable
     // from the host. Elaboration-time check; fails the build, not the sim.
@@ -449,13 +450,17 @@ module accel_top #(
     );
 
     // ============================================================
-    // psum_buffer - the same canvas as raw 32-bit running sums, banked like
-    // output_buffer (canvas row R in bank R % ARRAY_ROWS, at slot
-    // (R / ARRAY_ROWS)*W + column - no padding, nothing reads it in words).
+    // psum_buffer - this matmul's tile as raw 32-bit running sums, relative
+    // to the tile rather than the canvas: tile row k in bank k % ARRAY_ROWS
+    // (the same bank as its canvas row, since the tile starts on a bank
+    // boundary), at slot (k / ARRAY_ROWS)*INPUT_COLS + column - no padding,
+    // nothing reads it in words. Every tile reuses the same slots, so the
+    // buffer only has to hold one tile, however big the canvas.
     // output_loader is its only reader and writer: every contraction pass
     // but an element's last read-modify-writes it (as does the last with
-    // ACT_CFG.out_raw), and a use_prev_out matmul continues from it. Not
-    // host-visible. See psum_buffer_32_bank.v.
+    // ACT_CFG.out_raw), and a use_prev_out matmul continues from it - which
+    // therefore has to be the same tile, with no matmul that keeps raw sums
+    // in between. Not host-visible. See psum_buffer_32_bank.v.
     // ============================================================
     logic [ARRAY_COLS-1:0]                        psum_bank_rden;
     logic [ARRAY_COLS*PSUM_BANK_ADDR_WIDTH-1:0]   psum_bank_rdaddress;
@@ -609,8 +614,9 @@ module accel_top #(
     // writing bank r (the low bits are dropped). The column offset can be
     // anything: int8 results are written one byte at their exact canvas
     // position, raw sums one slot at theirs. Nothing checks that the tile lies
-    // inside the canvas or its grid cell. The canvas row pitches are latched
-    // here too, for output_loader's write addresses.
+    // inside the canvas or its grid cell. The row pitches are latched here
+    // too, for output_loader's write addresses: the int8 canvas pitch, and
+    // the psum pitch, INPUT_COLS (psum_buffer holds just this tile).
     //
     // use_prev_out makes the matmul's first contraction block accumulate
     // into what the canvas already holds, instead of overwriting it, so a
@@ -635,7 +641,7 @@ module accel_top #(
     logic [OBUF_BANK_ADDR_WIDTH-1:0] tile_col_off;    // first canvas column (elements)
     logic                            use_prev_out;
     logic [OBUF_BANK_ADDR_WIDTH:0]   obuf_row_pitch;  // int8 canvas row pitch (bytes), for output_loader
-    logic [PSUM_BANK_ADDR_WIDTH:0]   psum_row_pitch;  // psum canvas row pitch (slots) = canvas width, for output_loader
+    logic [PSUM_BANK_ADDR_WIDTH:0]   psum_row_pitch;  // psum row pitch (slots) = INPUT_COLS, the tile width, for output_loader
     logic                            bias_en;
     logic                            gelu_en;
     logic                            prev_int8;
@@ -660,7 +666,7 @@ module accel_top #(
             tile_col_off   <= tile_c_cfg[CANVAS_IDX_W-1:0] * tile_cols_eff[CANVAS_IDX_W-1:0];
             use_prev_out   <= use_prev_out_cfg;
             obuf_row_pitch <= obuf_pitch_words << WORD_SHIFT;
-            psum_row_pitch <= obuf_canvas_cols[PSUM_BANK_ADDR_WIDTH:0];
+            psum_row_pitch <= input_cols[PSUM_BANK_ADDR_WIDTH:0];
             obuf_rd_pitch_words <= obuf_pitch_words[OBUF_ROWW_WIDTH-1:0];   // host read remap row length
             bias_en        <= bias_en_cfg;
             gelu_en        <= gelu_en_cfg;

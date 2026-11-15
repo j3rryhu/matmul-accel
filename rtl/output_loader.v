@@ -138,8 +138,9 @@
 //     to int8 through the stage 1-3 pipeline, optionally maps it through
 //     the GELU LUT (gelu_en, one more stage), and writes the int8 as one
 //     byte at its canvas position - no packing, no alignment rules.
-// Both canvases share the row/column placement; only their pitches differ
-// (row_pitch in slots, row_pitch8 in bytes).
+// output_buffer is addressed at the tile's canvas position (pitch
+// row_pitch8, bytes); psum_buffer relative to the tile itself - it holds
+// one tile, every tile reusing the same slots (pitch row_pitch = INPUT_COLS).
 //
 // prev_int8: with use_prev_out, the final pass reads the previous int8
 // result at this position from output_buffer (stage 0, byte selected in
@@ -159,7 +160,7 @@ module output_loader #(
     parameter ARRAY_COLS     = 16,
     parameter ARRAY_ROWS     = 16,
     parameter ROW_ADDR_WIDTH = 16,   // output_buffer per-bank WRITE (byte) address width - spans the bank's share of the int8 canvas
-    parameter PSUM_ADDR_WIDTH = 12,  // psum_buffer per-bank address width (32-bit slots)
+    parameter PSUM_ADDR_WIDTH = 10,  // psum_buffer per-bank address width (32-bit slots)
     parameter RD_DATA_WIDTH  = 128,  // output_buffer read port width (wide, shared with Avalon)
     // The output_buffer read port is wide (one word per access) because the
     // Avalon host reads through it; this module only reads it for
@@ -195,9 +196,9 @@ module output_loader #(
 
     // ---- where this matmul's result goes in the canvas (accel_top's TILE_CFG latch) ----
     input      [DIM_WIDTH-1:0]                      tile_row_blk,   // first canvas row / ARRAY_ROWS
-    input      [ROW_ADDR_WIDTH-1:0]                 tile_col_off,   // first canvas column (slots in psum_buffer, bytes in output_buffer)
+    input      [ROW_ADDR_WIDTH-1:0]                 tile_col_off,   // first canvas column (output_buffer bytes)
     input                                           use_prev_out,   // continue what the canvas holds (format: prev_int8)
-    input      [PSUM_ADDR_WIDTH:0]                  row_pitch,      // psum canvas row pitch in slots
+    input      [PSUM_ADDR_WIDTH:0]                  row_pitch,      // psum row pitch in slots = INPUT_COLS (tile-relative)
     input      [ROW_ADDR_WIDTH:0]                   row_pitch8,     // int8 canvas row pitch in bytes
 
     // ---- rescale factor (from ctrl_rf, see rdl/ctrl_reg.rdl OUTPUT_SCALE) ----
@@ -265,12 +266,13 @@ module output_loader #(
     // committed index - stable long before the pass starts - and latched
     // with the other held_* values, so the multiply never sits on the
     // per-cycle RAM address path.
-    // The same position in both canvases: held_seg_base in psum_buffer
-    // slots (pitch row_pitch), held_seg_base8 in output_buffer bytes (pitch
-    // row_pitch8).
+    // held_seg_base8 is that canvas position in output_buffer bytes (pitch
+    // row_pitch8); held_seg_base is the block's position inside the tile in
+    // psum_buffer slots (pitch row_pitch) - psum_buffer holds one tile, so
+    // no canvas offset.
     (* multstyle = "logic" *)
     wire [PSUM_ADDR_WIDTH-1:0] committed_seg_base =
-        (tile_row_blk + committed_k_blk_idx) * row_pitch + tile_col_off;
+        committed_k_blk_idx * row_pitch;
     (* multstyle = "logic" *)
     wire [ROW_ADDR_WIDTH-1:0]  committed_seg_base8 =
         (tile_row_blk + committed_k_blk_idx) * row_pitch8 + tile_col_off;

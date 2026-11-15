@@ -160,8 +160,11 @@ Rules (not checked by hardware):
 `use_prev_out` - 1 = this matmul continues what is already at its
 position instead of starting fresh. Used to split a contraction too long
 for one matmul: run the first part with `ACT_CFG.out_raw = 1`, then the
-later parts with `use_prev_out = 1`, the last one with `out_raw = 0`. With
-`ACT_CFG.prev_int8` it instead adds onto a previous int8 result.
+later parts with `use_prev_out = 1`, the last one with `out_raw = 0`. The
+raw sums are held for one tile only, so run all parts of a tile back to
+back (same tile, same `WEIGHT_ROWS`/`INPUT_COLS`) before the next tile.
+With `ACT_CFG.prev_int8` it instead adds onto a previous int8 result,
+which stays in the output canvas, so other tiles can run in between.
 
 ### `CANVAS_WIDTH` (0x80)
 
@@ -192,8 +195,9 @@ What happens to each output element after its last contraction block.
 - `out_raw` - after the last contraction block, keep the raw 32-bit sums
   (in the internal psum buffer): no bias, rescale, GELU, and no int8
   result. For a slice of a split contraction that a later `use_prev_out`
-  matmul continues. Raw sums are not readable by the host - only int8
-  results are.
+  matmul on the same tile continues, with no other matmul that keeps raw
+  sums (more than one contraction block, or `out_raw`) in between. Raw
+  sums are not readable by the host - only int8 results are.
 
 ## What happens to each output element
 
@@ -229,13 +233,15 @@ is one contiguous burst. The pitch is the one latched at the last
 `matmul_start`.
 
 The raw 32-bit partial sums live in a separate, internal **psum buffer**
-(256 KB) with the same row/column placement. The host cannot read it.
+(64 KB) that holds only the tile being computed - every tile reuses the
+same slots. The host cannot read it.
 
-Capacity: canvas row R is stored in bank `R mod 16` of both buffers, so
-`ceil(total rows / 16) * roundup(W, 16) <= 4096` bytes (output buffer) and
-`ceil(total rows / 16) * W <= 4096` slots (psum buffer) - for example
-256 x 256. See [`OUTPUT_BUFFER_LAYOUT.md`](OUTPUT_BUFFER_LAYOUT.md) for how
-this maps onto the banks.
+Capacity: canvas row R is stored in bank `R mod 16` of the output buffer,
+so the canvas needs `ceil(total rows / 16) * roundup(W, 16) <= 4096` bytes
+(for example 256 x 256), and each tile `ceil(WEIGHT_ROWS / 16) *
+INPUT_COLS <= 1024` psum slots (for example 128 x 128). See
+[`OUTPUT_BUFFER_LAYOUT.md`](OUTPUT_BUFFER_LAYOUT.md) for how this maps
+onto the banks.
 
 ## Bias buffer
 

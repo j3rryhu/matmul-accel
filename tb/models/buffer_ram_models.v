@@ -151,20 +151,20 @@ module output_buffer (
     );
 endmodule
 
-// psum_buffer: one bank of psum_buffer_32_bank, 4096 32-bit raw running
-// sums (16 KB: 16 rows of the 256x256 canvas), used only by output_loader.
-// Same-width: 4096 x 32 on both ports, 12-bit address on each side. Same
+// psum_buffer: one bank of psum_buffer_32_bank, 1024 32-bit raw running
+// sums (4 KB: 8 rows of a 128x128 tile), used only by output_loader.
+// Same-width: 1024 x 32 on both ports, 10-bit address on each side. Same
 // one-cycle registered read as the others.
 module psum_buffer (
     input         clock,
     input  [31:0] data,
-    input  [11:0] rdaddress,
+    input  [9:0]  rdaddress,
     input         rden,
-    input  [11:0] wraddress,
+    input  [9:0]  wraddress,
     input         wren,
     output reg [31:0] q
 );
-    reg [31:0] mem [0:4095];
+    reg [31:0] mem [0:1023];
 
     always @(posedge clock) begin
         if (wren)

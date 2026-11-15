@@ -103,8 +103,8 @@ addrmap ctrl_rf {
     } OUTPUT_SCALE @ 0x60;
 
     // Output tile placement (0x70). The output buffer holds one int8 canvas
-    // (width: CANVAS_WIDTH), and the internal psum buffer the same canvas as
-    // raw 32-bit sums (see ACT_CFG); this
+    // (width: CANVAS_WIDTH); the internal psum buffer holds only the current
+    // tile's raw 32-bit sums (see ACT_CFG), up to 128x128. This
     // matmul's WEIGHT_ROWS x INPUT_COLS result lands with its top-left
     // corner at canvas row tile_r*TILE_ROWS, column tile_c*TILE_COLS (see
     // those registers - 0 there means this matmul's own WEIGHT_ROWS /
@@ -112,7 +112,9 @@ addrmap ctrl_rf {
     // 16 (output bank boundary); the first column can be anything.
     // use_prev_out: the first contraction block accumulates onto the canvas
     // instead of overwriting it, to split a long contraction across
-    // matmuls (the format it reads is ACT_CFG.prev_int8). Latched at
+    // matmuls (the format it reads is ACT_CFG.prev_int8). Continuing raw
+    // sums needs the same tile as the out_raw matmul before it, with no
+    // other matmul that keeps raw sums in between. Latched at
     // matmul_start. See rtl/accel_top.sv's TILE_CFG latch.
     reg {
         field {
@@ -164,7 +166,8 @@ addrmap ctrl_rf {
     //              before GELU). Any number of contraction blocks.
     //   out_raw:   keep the raw 32-bit sums in the psum buffer after the
     //              last contraction block (no bias, rescale, GELU, and no
-    //              int8 result), for a later use_prev_out matmul to continue.
+    //              int8 result), for a later use_prev_out matmul on the
+    //              same tile to continue (the psum buffer holds one tile).
     // bias_en/gelu_en only act on an int8 result, never with out_raw.
     reg {
         field {

@@ -114,12 +114,12 @@ M = ARRAY_ROWS   # input/output column count (INPUT_COLS == INPUT_MAX_ADDR here)
 REAL_VAL_STD = 1.0
 
 OBUF_BANK_ADDR_WIDTH = 12  # must match accel_top.sv's OBUF_BANK_ADDR_WIDTH (4096 B/bank)
-PSUM_BANK_ADDR_WIDTH = 12  # must match accel_top.sv's PSUM_BANK_ADDR_WIDTH (4096 32-bit slots/bank)
+PSUM_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's PSUM_BANK_ADDR_WIDTH (1024 32-bit slots/bank)
 
 # output canvas: W = CANVAS_WIDTH int8 wide (0 = M), rows padded to
 # row_pitch(W); canvas row R sits in bank R % ARRAY_ROWS, and each bank holds
-# OBUF_BANK_BYTES of rows. psum_buffer keeps the same canvas as raw 32-bit
-# sums, W slots per row, PSUM_BANK_SLOTS per bank (internal only).
+# OBUF_BANK_BYTES of rows. psum_buffer keeps only the current tile as raw
+# 32-bit sums, M slots per row, PSUM_BANK_SLOTS per bank (internal only).
 OBUF_BANK_BYTES = 1 << OBUF_BANK_ADDR_WIDTH
 PSUM_BANK_SLOTS = 1 << PSUM_BANK_ADDR_WIDTH
 IBUF_BANK_ADDR_WIDTH = 10  # must match accel_top.sv's IBUF_BANK_ADDR_WIDTH (1024 B/bank)
@@ -289,7 +289,8 @@ def assert_fits_canvas(K, M, tile_r=0, tile_c=0, width=None, tile_rows=0, tile_c
     """A K x M result placed as tile (tile_r, tile_c) of a canvas `width`
     elements wide (default M: untiled), on a grid of tile_rows x tile_cols
     (TILE_ROWS / TILE_COLS; 0 = K / M), has to lie inside the canvas width
-    and inside the output and psum buffers, and its first canvas row,
+    and inside the output buffer, the tile itself has to fit the psum
+    buffer (it holds one tile, not the canvas), and its first canvas row,
     tile_r*TILE_ROWS, has to be a multiple of ARRAY_ROWS - see the TILE_CFG
     latch in rtl/accel_top.sv."""
     width = M if width is None else width
@@ -302,9 +303,8 @@ def assert_fits_canvas(K, M, tile_r=0, tile_c=0, width=None, tile_rows=0, tile_c
     assert bank_rows * row_pitch(width) <= OBUF_BANK_BYTES, (
         f"{rows} canvas rows at pitch {row_pitch(width)} overflow the "
         f"{OBUF_BANK_BYTES} B output banks")
-    assert bank_rows * width <= PSUM_BANK_SLOTS, (
-        f"{rows} canvas rows of {width} slots overflow the "
-        f"{PSUM_BANK_SLOTS}-slot psum banks")
+    assert -(-K // ARRAY_ROWS) * M <= PSUM_BANK_SLOTS, (
+        f"a {K}x{M} tile overflows the {PSUM_BANK_SLOTS}-slot psum banks")
     assert row0 % ARRAY_ROWS == 0, (
         f"tile's first canvas row {row0} is not a multiple of {ARRAY_ROWS}")
 
@@ -1316,8 +1316,8 @@ async def test_128x128x128_matmul(dut):
     their 1KB per-bank depth:
       - weight bank r: rows r, r+16, ... = 8 rows x 128 B
       - input bank p:  contraction bands 0..7 = 8 bands x 128 B
-    Its result fills a quarter of the output buffer
-    (test_tiled_canvas_use_prev_out fills all of it). This is also the
+    Its result fills a quarter of the output buffer and all of the psum
+    buffer (test_tiled_canvas_use_prev_out fills all of each). This is also the
     only test with M larger than input_dispatch's 32-entry row FIFOs, so
     each band has to be refilled while it streams.
 
@@ -1643,27 +1643,33 @@ def quantized_problem(rng, K, N, M):
 
 @cocotb.test()
 async def test_tiled_canvas_use_prev_out(dut):
-    """Y (256x256) = W (256x32) @ X (32x256) as eight matmuls filling the
-    whole output buffer: a 256-wide canvas (CANVAS_WIDTH = 256) of 2x2
-    output tiles of 128x128, each tile's contraction split into two halves
-    of 16.
+    """Y (256x256) = W (256x32) @ X (32x256), twice, as eight matmuls
+    filling the whole output buffer: a 256-wide canvas (CANVAS_WIDTH =
+    256) of 2x2 output tiles of 128x128, each tile's contraction split into
+    two halves of 16 joined with TILE_CFG.use_prev_out. Each 128x128 tile
+    fills the whole psum buffer by itself.
 
-    The order is half-outer, tile-inner: all four tiles' first halves with
-    use_prev_out = 0, then all four second halves with use_prev_out = 1.
-    That checks three things at once:
-      - tile (tr, tc) lands at canvas rows 128*tr.., columns 128*tc.. - all
-        four quadrants, so every byte of every output bank, read back as
-        one 256x256 image;
-      - a second-half matmul accumulates onto ITS OWN tile's first half,
-        with three other tiles written in between;
-      - a first-half matmul overwrites whatever the canvas held before
-        (earlier tests leave data in it).
-    The first halves set ACT_CFG.out_raw, so they leave raw 32-bit sums;
-    the second halves (use_prev_out, prev_int8 = 0) add onto those and
-    rescale once, exactly as the hardware does between contraction blocks
-    of one matmul - so the expected result is golden_blocked over the full
-    N = 32, read back as one 256x256 int8 image. (Each half is
-    a single contraction block to keep the run short; multi-block
+    Part 1, int8 continuation, half-outer, tile-inner: all four tiles'
+    first halves, then all four second halves with ACT_CFG.prev_int8,
+    adding their rescaled sum to the int8 the first half left in the output
+    buffer. Checks that a second half adds onto ITS OWN tile's int8, with
+    three other tiles written in between.
+
+    Part 2, raw continuation, tile-outer, half-inner - the psum buffer holds
+    one tile, so a raw chain has to finish its tile before the next starts.
+    The first half sets ACT_CFG.out_raw and leaves raw 32-bit sums; the
+    second (prev_int8 = 0) adds onto them and rescales once, exactly as the
+    hardware does between contraction blocks of one matmul - so the
+    expected result is golden_blocked over the full N = 32. Checks that
+    tiles anywhere on a canvas bigger than the psum buffer reuse the same
+    psum slots, and that a first half overwrites the previous tile's raw
+    sums there instead of adding onto them.
+
+    Both check that tile (tr, tc) lands at canvas rows 128*tr.., columns
+    128*tc.. - every byte of every output bank, read back as one 256x256
+    image - and that the first halves overwrite whatever the canvas held
+    before (earlier tests, and part 1, leave data in it). (Each half is a
+    single contraction block to keep the run short; multi-block
     accumulation inside one matmul is covered by the other tests.)
     """
     T = 128                    # tile edge: K = M = T per matmul
@@ -1671,26 +1677,39 @@ async def test_tiled_canvas_use_prev_out(dut):
     K = M = 2 * T
     N = 2 * H
     assert -(-K // ARRAY_ROWS) * row_pitch(M) == OBUF_BANK_BYTES, "test meant to fill the whole output buffer"
+    assert -(-T // ARRAY_ROWS) * T == PSUM_BANK_SLOTS, "each tile meant to fill the whole psum buffer"
+    tiles = [(tr, tc) for tr in range(2) for tc in range(2)]
 
     rng = np.random.default_rng(41)
     await start_clock(dut)
     cocotb.start_soon(watchdog(dut, max_cycles=BIG_MATMUL_WATCHDOG_CYCLES))
     await reset_dut(dut)
 
+    async def run_half(W_int8, X_int8, q16, half, tr, tc):
+        await run_tile(dut,
+                       W_int8[tr * T:(tr + 1) * T, half * H:(half + 1) * H],
+                       X_int8[half * H:(half + 1) * H, tc * T:(tc + 1) * T],
+                       q16, tr, tc, M, use_prev_out=(half == 1))
+
+    # ---- part 1: prev_int8, half-outer ----
     W_int8, X_int8, q16 = quantized_problem(rng, K, N, M)
-    golden = golden_blocked(W_int8, X_int8, q16)
-
     for half in range(2):
-        await program_act(dut, out_raw=(half == 0))
-        for tr in range(2):
-            for tc in range(2):
-                await run_tile(dut,
-                               W_int8[tr * T:(tr + 1) * T, half * H:(half + 1) * H],
-                               X_int8[half * H:(half + 1) * H, tc * T:(tc + 1) * T],
-                               q16, tr, tc, M, use_prev_out=(half == 1))
+        await program_act(dut, prev_int8=(half == 1))
+        for tr, tc in tiles:
+            await run_half(W_int8, X_int8, q16, half, tr, tc)
+    first = golden_act(W_int8[:, :H], X_int8[:H, :], q16)
+    check_canvas(await read_canvas(dut, K, M),
+                 golden_act(W_int8[:, H:], X_int8[H:, :], q16, prev=first),
+                 "part 1: 2x2 tiles of 128x128, halves joined with prev_int8")
 
-    check_canvas(await read_canvas(dut, K, M), golden,
-                 "2x2 tiles of 128x128 x 2 contraction halves on the 256x256 canvas")
+    # ---- part 2: raw sums (out_raw), tile-outer ----
+    W_int8, X_int8, q16 = quantized_problem(rng, K, N, M)
+    for tr, tc in tiles:
+        for half in range(2):
+            await program_act(dut, out_raw=(half == 0))
+            await run_half(W_int8, X_int8, q16, half, tr, tc)
+    check_canvas(await read_canvas(dut, K, M), golden_blocked(W_int8, X_int8, q16),
+                 "part 2: 2x2 tiles of 128x128, halves joined through raw sums")
 
 
 @cocotb.test()

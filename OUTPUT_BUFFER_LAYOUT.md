@@ -5,15 +5,16 @@ a tile's position turns into bank addresses, and how the host reads the
 int8 result back at `OBUF_BASE`. Register meanings are in
 [`CONTROL_REGISTERS.md`](CONTROL_REGISTERS.md).
 
-## Two buffers, one canvas
+## Two buffers: the canvas and the current tile
 
-Both buffers hold the same canvas - `W` columns wide, rows stacked - in
-different formats:
+`output_buffer` holds the whole result as one canvas, `W` columns wide,
+rows stacked; `psum_buffer` holds only the tile the current matmul is
+computing, and every tile reuses the same slots:
 
 | Buffer | Holds | Element | Per bank | Total | Host |
 |---|---|---|---|---|---|
 | `output_buffer` | finished int8 results | 1 byte | 4096 bytes | 64 KB | read at `OBUF_BASE` |
-| `psum_buffer` | raw 32-bit running sums between contraction blocks | 32-bit slot | 4096 slots | 256 KB | not visible |
+| `psum_buffer` | raw 32-bit running sums between contraction blocks | 32-bit slot | 1024 slots | 64 KB | not visible |
 
 ```
 W = CANVAS_WIDTH, or INPUT_COLS when CANVAS_WIDTH is 0
@@ -23,22 +24,30 @@ Every contraction pass but an element's last read-modify-writes its raw sum
 in `psum_buffer`. The last pass rescales (plus bias, GELU) and writes the
 int8 as **one byte at its exact position** in `output_buffer` - no packing,
 no alignment rules. With `ACT_CFG.out_raw` the last pass keeps the raw sum
-in `psum_buffer` instead, for a later `use_prev_out` matmul.
+in `psum_buffer` instead, for a later `use_prev_out` matmul on the same
+tile.
 
 ## Rows to banks
 
-In both buffers canvas row `R` lives in bank `R mod 16`, and each bank
+In `output_buffer` canvas row `R` lives in bank `R mod 16`, and each bank
 stacks its rows back to back, every row holding all `W` columns - every
 tile's columns:
 
 ```
 output_buffer:  byte  (R / 16) * pitch8 + C      pitch8 = roundup(W, 16) bytes
-psum_buffer:    slot  (R / 16) * W      + C      (no padding)
 
 bank 0:  [row 0 ][row 16][row 32] ...
 bank 1:  [row 1 ][row 17][row 33] ...
  ...
 bank 15: [row 15][row 31][row 47] ...
+```
+
+`psum_buffer` is laid out the same way, but for the tile alone: tile row
+`k` (canvas row `R0 + k`) in bank `k mod 16` - the same bank, since `R0`
+is a multiple of 16 - with `M = INPUT_COLS` slots per row:
+
+```
+psum_buffer:    slot  (k / 16) * M + m           (no padding, no canvas offset)
 ```
 
 `output_buffer` rows are padded to whole 128-bit words (16 bytes) because
@@ -66,12 +75,14 @@ because `R0` is a multiple of 16. That is the one placement rule:
 
 ```
 int8 result:   output_buffer byte  (R0/16 + b) * pitch8 + C0 + m
-raw sum:       psum_buffer slot    (R0/16 + b) * W      + C0 + m
+raw sum:       psum_buffer slot    b * M + m                    (M = INPUT_COLS)
 ```
 
 The row offset only picks which stacked row inside each bank; the column
 offset just adds `C0`, so it can be any value - a tile may start mid-word
-and be any width. A tile may be smaller than its grid cell
+and be any width. The raw sum ignores both offsets: wherever the tile sits
+on the canvas, its raw sums use the same slots, so the next tile that
+keeps raw sums overwrites them. A tile may be smaller than its grid cell
 (`WEIGHT_ROWS < TILE_ROWS`, `INPUT_COLS < TILE_COLS`): it starts at the
 same place and simply writes fewer rows and columns.
 
@@ -102,7 +113,8 @@ contiguous burst.
 ## Worked example: `test_tiled_edge_tiles`
 
 A 40 x 37 result: `CANVAS_WIDTH = 37`, `TILE_ROWS = 32`, `TILE_COLS = 22`,
-so `pitch8 = 48` bytes (3 words) and the psum pitch is 37 slots.
+so `pitch8 = 48` bytes (3 words). The psum pitch is each tile's own
+`INPUT_COLS`: 22 slots for the left tiles, 15 for the right.
 
 | Tile | First row | First column | Size |
 |---|---|---|---|
@@ -120,12 +132,12 @@ byte:  0 ── 21 | 22 ── 36 | 37 ─ 47 | 48 ── 69 | 70 ── 84 | 85
        tile(0,0)| tile(0,1)         | tile(0,0)| tile(0,1)          | tile(1,0)  | tile(1,1)
 ```
 
-Element: canvas row 35, column 30 (tile (1,1), tile column 8):
+Element: canvas row 35, column 30 (tile (1,1), tile row 3, tile column 8):
 
 | | Where |
 |---|---|
 | int8 | bank 3, byte `2 * 48 + 30 = 126` = RAM word 7, byte 14 |
-| raw sum (during the matmul) | `psum_buffer` bank 3, slot `2 * 37 + 30 = 104` |
+| raw sum (during the matmul) | `psum_buffer` bank 3, slot `0 * 15 + 8 = 8` (block 0 of the tile) |
 | host address | `OBUF_BASE + 35 * 48 + 30` = `0x96AE` |
 
 Running the host address back through the remap: `0x96AE - 0x9000 =
@@ -134,11 +146,20 @@ Running the host address back through the remap: `0x96AE - 0x9000 =
 
 ## Capacity
 
-`ceil(total canvas rows / 16)` stacked rows per bank in both buffers:
+The output buffer bounds the canvas, the psum buffer one tile:
 
 ```
-ceil(rows / 16) * roundup(W, 16)  <=  4096      output_buffer bytes per bank
-ceil(rows / 16) * W               <=  4096      psum_buffer slots per bank
+ceil(total canvas rows / 16) * roundup(W, 16)   <=  4096   output_buffer bytes per bank   (256 x 256 canvas)
+ceil(WEIGHT_ROWS / 16)       * INPUT_COLS       <=  1024   psum_buffer slots per bank     (128 x 128 tile)
 ```
 
-For example 256 x 256 fills both exactly.
+So a 256 x 256 result is 2x2 tiles of 128x128. Past 1024 slots the psum
+address wraps and rows of the tile share slots; nothing in hardware checks
+for this.
+
+Because every tile reuses the same psum slots, raw sums kept with
+`ACT_CFG.out_raw` only survive until the next matmul that keeps raw sums
+(more than one contraction block, or `out_raw`): continue them with
+`TILE_CFG.use_prev_out` on the same tile, straight after. An int8 result
+continued with `ACT_CFG.prev_int8` stays at its canvas position, so other
+tiles can run in between.

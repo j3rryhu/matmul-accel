@@ -99,8 +99,9 @@ The whole map spans `0x0000_0000`-`0x0001_8FFF`, so the slave needs at
 least a 17-bit byte address (a 128 KB span). `OBUF_BASE` moved from
 `0x7000` to `0x9000` when `IBUF` grew to 16 KB, and the `OBUF` window grew
 from 16 KB to 64 KB for the output canvas, e.g. 256x256. `BBUF` sits in
-the gap below `WBUF`. The 32-bit partial sums live in a separate 256 KB
-`psum_buffer` that is internal to the accelerator and has no window.
+the gap below `WBUF`. The 32-bit partial sums live in a separate 64 KB
+`psum_buffer` (the current tile's raw sums, up to 128x128) that is internal to the
+accelerator and has no window.
 
 Access conventions:
 
@@ -169,7 +170,7 @@ each output element and programming examples are in
 | `0x90` | `ACT_CFG` | `bias_en` | `[0]` | W | Add the canvas row's int32 bias (bias buffer) to the sum before the rescale. |
 | `0x90` | `ACT_CFG` | `gelu_en` | `[1]` | W | Map the final int8 through the GELU table. |
 | `0x90` | `ACT_CFG` | `prev_int8` | `[2]` | W | With `use_prev_out`: add onto the int8 result already in the output canvas, after the rescale. The raw sums start fresh; any number of contraction blocks. |
-| `0x90` | `ACT_CFG` | `out_raw` | `[3]` | W | Keep the raw 32-bit sums (internal psum buffer): no bias, rescale, GELU or int8 result. For a later `use_prev_out` matmul - raw sums are not host-readable. |
+| `0x90` | `ACT_CFG` | `out_raw` | `[3]` | W | Keep the raw 32-bit sums (internal psum buffer): no bias, rescale, GELU or int8 result. For a later `use_prev_out` matmul on the same tile - raw sums are not host-readable. |
 | `0xA0` | `TILE_ROWS` | `value` | `[15:0]` | W | Tile grid height (the largest tile's row count). 0 = `WEIGHT_ROWS`. |
 | `0xB0` | `TILE_COLS` | `value` | `[15:0]` | W | Tile grid width (the largest tile's column count). 0 = `INPUT_COLS`. |
 
@@ -304,8 +305,9 @@ writing the inputs; for output reads it uses the canvas pitch latched at
 `output_loader` writes each canvas row at that same padded pitch.
 
 Results are **int8**; sign-extend the byte you read back. The raw 32-bit
-partial sums live in the internal `psum_buffer` - the same canvas, `W`
-slots per row - and are not readable.
+partial sums live in the internal `psum_buffer` - only the current tile,
+`M` slots per row, every tile reusing the same slots - and are not
+readable.
 [`OUTPUT_BUFFER_LAYOUT.md`](OUTPUT_BUFFER_LAYOUT.md) walks through both
 buffers, tiles included, with a worked example.
 
@@ -330,11 +332,12 @@ With `TILE_CFG = 0` and `CANVAS_WIDTH = 0` that is `canvas[k][m]` with
 `W = M`: a single untiled matmul. To build a larger result, set
 `CANVAS_WIDTH` to its full width and `TILE_ROWS`/`TILE_COLS` to the tile
 size, run one matmul per tile, and read the canvas once at the end - it
-comes back as one dense row-major matrix. With a
-128-deep contraction, the weight and input buffers cap one matmul's result
-at 128x128, so the 64 KB buffer holds 2x2 such tiles: `Y` (256x256) is
-`CANVAS_WIDTH = 256` and four matmuls with `(tile_r, tile_c)` = (0,0),
-(0,1), (1,0), (1,1). A 40x37 result on a 32x22 grid is `TILE_ROWS = 32`,
+comes back as one dense row-major matrix. The psum buffer holds only the
+tile being computed, so it bounds the tile, not the canvas: one tile is at
+most 128x128 (`ceil(K / 16) * M <= 1024`), and the 64 KB output buffer
+holds 2x2 such tiles: `Y` (256x256) is `CANVAS_WIDTH = 256` and four
+matmuls with `(tile_r, tile_c)` = (0,0), (0,1), (1,0), (1,1). A 40x37
+result on a 32x22 grid is `TILE_ROWS = 32`,
 `TILE_COLS = 22` and tiles of 32x22, 32x15, 8x22 and 8x15
 (`test_tiled_edge_tiles`).
 
@@ -343,9 +346,13 @@ the matmul's first contraction block continues the raw 32-bit sums the
 previous matmul left in `psum_buffer` instead of starting fresh. Run every
 part but the last with `ACT_CFG.out_raw = 1`, so it keeps its raw sums;
 the last part (`out_raw = 0`) adds onto them and produces the int8 result,
-identical to one long matmul. Alternatively, `ACT_CFG.prev_int8` adds this
+identical to one long matmul. Every tile uses the same psum slots, so run
+a tile's parts back to back - same tile, same `WEIGHT_ROWS`/`INPUT_COLS` -
+before starting the next tile. Alternatively, `ACT_CFG.prev_int8` adds this
 matmul's result onto the previous **int8** result in the output canvas
-(after the rescale, before GELU), with any number of contraction blocks.
+(after the rescale, before GELU), with any number of contraction blocks;
+that result stays at its canvas position, so other tiles can run in
+between.
 
 Rules - nothing in hardware checks them:
 
@@ -353,9 +360,13 @@ Rules - nothing in hardware checks them:
   on a bank boundary; a `TILE_ROWS` that is a multiple of 16 always works.
   Column offsets and widths can be anything.
 - A tile must not be larger than its grid cell, or it runs into the next.
-- The tile must lie inside the canvas width, `C0 + M <= W`, and the canvas
-  inside both buffers: `ceil(total rows / 16) * pitch(W) <= 4096` bytes
-  and `ceil(total rows / 16) * W <= 4096` psum slots.
+- The tile must lie inside the canvas width, `C0 + M <= W`, the canvas
+  inside the output buffer, `ceil(total rows / 16) * pitch(W) <= 4096`
+  bytes, and the tile itself inside the psum buffer,
+  `ceil(K / 16) * M <= 1024` slots.
+- A `use_prev_out` matmul continuing raw sums must be the same tile as the
+  `out_raw` matmul before it, with no other matmul that keeps raw sums
+  (more than one contraction block, or `out_raw`) in between.
 - `CANVAS_WIDTH` stays the same for every tile of one result.
 - `TILE_CFG`, `TILE_ROWS`, `TILE_COLS`, `CANVAS_WIDTH` and `ACT_CFG` are
   latched at `matmul_start`, like the dimension registers; host reads use
@@ -387,13 +398,13 @@ programming a matmul:
 | `ceil(K / ARRAY_ROWS) * pitch(N) <= 1024` | weight_buffer per-bank depth |
 | `ceil(N / ARRAY_COLS) * pitch(M) <= 1024` | input_buffer per-bank depth |
 | `C0 + M <= W` and `ceil(total rows / 16) * pitch(W) <= 4096` | output canvas (4096 bytes per bank), `W` = canvas width |
-| `ceil(total rows / 16) * W <= 4096` | psum buffer (4096 32-bit slots per bank) |
+| `ceil(K / 16) * M <= 1024` | psum buffer (1024 32-bit slots per bank, one tile) |
 | `(tile_r * TILE_ROWS) % 16 == 0` | tile rows start on a bank boundary |
 | `M <= 1023` | `INPUT_MAX_ADDR` is a 10-bit field |
 | canvas rows using a bias `< 256` | bias buffer depth (rows wrap mod 256) |
 
 `K = N = M = 128` fills the weight and input buffers exactly
-(`test_128x128x128_matmul`); its result fills a quarter of the output buffer. Beyond that the input bounds trade off against
+(`test_128x128x128_matmul`); its result fills a quarter of the output buffer and all of the psum buffer. Beyond that the input bounds trade off against
 each other: larger `K` or `N` needs a smaller `M`, and vice versa. Splitting
 the contraction across matmuls with `use_prev_out` (every part but the last
 with `ACT_CFG.out_raw`) removes the limit on `N`.
@@ -433,8 +444,8 @@ They then select:
 - **`held_k_blk_idx`** - which canvas row block the pass writes. For a tile
   starting at row `R0 = tile_r * TILE_ROWS` and column `C0 = tile_c *
   TILE_COLS`, bank `r` gets canvas row `R0 + 16*k_blk + r`, at
-  `(R0/16 + k_blk) * pitch + C0 + m` in each buffer (pitch in bytes for
-  `output_buffer`, slots for `psum_buffer`): different output-row blocks
+  `output_buffer` byte `(R0/16 + k_blk) * pitch + C0 + m`, and `psum_buffer`
+  slot `k_blk * M + m` (relative to the tile): different output-row blocks
   write **disjoint** segments (concatenation, not accumulation). See
   [`OUTPUT_BUFFER_LAYOUT.md`](OUTPUT_BUFFER_LAYOUT.md).
 - **`held_n_blk_idx`** - what the pass does:
@@ -474,7 +485,7 @@ below are per bank:
 | `weight_buffer` | `ARRAY_ROWS` (16) | **write** 64 x 128, 6-bit | read 1024 x 8, 10-bit (`weight_loader`) | 16 KB | `WBUF_SIZE = 0x4000` |
 | `input_buffer` | `ARRAY_ROWS` (16) | **write** 64 x 128, 6-bit | read 1024 x 8, 10-bit (`input_dispatch`) | 16 KB | `IBUF_SIZE = 0x4000` |
 | `output_buffer` | `ARRAY_COLS` (16) | **read** 256 x 128, 8-bit | write 4096 x 8, 12-bit (`output_loader`) | 64 KB | `OBUF_SIZE = 0x10000` |
-| `psum_buffer` | `ARRAY_COLS` (16) | none | read and write 4096 x 32, 12-bit (`output_loader`) | 256 KB | none |
+| `psum_buffer` | `ARRAY_COLS` (16) | none | read and write 1024 x 32, 10-bit (`output_loader`) | 64 KB | none |
 | `bias_buffer` | `ARRAY_ROWS` (16) | **write** 16 x 32, 4-bit (via the wrapper) | read 16 x 32, 4-bit (`output_loader`) | 1 KB | `BBUF_SIZE = 0x400` |
 
 > `output_buffer` is back to its original int8 shape (4096 x 8 write,
@@ -482,7 +493,8 @@ below are per bank:
 > all three On-Chip Memory IPs at the shapes above before building in
 > Quartus. A `bias_buffer` bank is only 512 bits - set its memory block
 > type to MLAB, or each of the 16 takes a whole M10K. In total the
-> buffers are about 350 KB of block RAM.
+> buffers are about 160 KB of block RAM; `psum_buffer` is 64 M10K
+> (4 per bank).
 
 The core side is narrow because `weight_loader` and `input_dispatch`
 consume one byte per cycle and `output_loader` writes one int8 result per
@@ -540,7 +552,7 @@ make clean
 | `test_partial_row_block_matmul` | Partial last **output-row** block (`K` not a multiple of `ARRAY_ROWS`): `valid_row` masking, `weight_loader` zero-padding, `output_loader` row gating |
 | `test_back_to_back_matmul_no_reset` | Two matmuls with no reset between - regression test for stale `STATUS.done`/`busy` |
 | `test_128x128x128_matmul` | `W` (128x128) @ `X` (128x128): 64 blocks, fills every weight and input bank to its full 1 KB, and is the only test with `M` larger than the 32-entry input FIFOs. Reads the result back in one 2047-beat burst, the 11-bit `avs_burstcount` maximum. Logs cycles from `matmul_start` to `STATUS.done`. Takes about half a minute in Icarus. |
-| `test_tiled_canvas_use_prev_out` | `Y` (256x256) as 2x2 tiles of 128x128, each tile's contraction split into two `use_prev_out` matmuls (the first halves with `ACT_CFG.out_raw`): eight matmuls filling the whole output buffer, read back once. |
+| `test_tiled_canvas_use_prev_out` | `Y` (256x256) twice, as 2x2 tiles of 128x128 filling the whole output buffer, each tile filling the whole psum buffer, every tile's contraction split into two `use_prev_out` matmuls: once joined with `ACT_CFG.prev_int8` (all first halves, then all second halves), once through raw sums with `ACT_CFG.out_raw` (tile by tile). |
 | `test_tiled_unaligned_col_offset` | 2x2 tiles of 16x37 (two contraction blocks) on a 74-wide canvas: rows padded to 80 bytes (5 words, not a power of two), and column tiles start mid-word, sharing bus words with their left neighbour |
 | `test_tiled_edge_tiles` | A 40x37 result on a 32x22 tile grid (`TILE_ROWS`/`TILE_COLS`): smaller bottom and right edge tiles land on the grid, and the right tiles start mid-word |
 | `test_bias_gelu` | `ACT_CFG.bias_en` + `gelu_en` on 3 output-row x 3 contraction blocks - every output-row block gets its bias and GELU exactly once, on its last pass - then a bias-only tile at tile row 1, checking the bias is indexed by canvas row |
@@ -576,7 +588,11 @@ loads, `rtl/activation/example/gelu_int8.hex`.
   be relied on if contraction-axis masking is ever added.
 - **Raw 32-bit sums are not host-readable.** They live in the internal
   `psum_buffer`; a matmul run with `ACT_CFG.out_raw` is only useful to a
-  later `use_prev_out` matmul.
+  later `use_prev_out` matmul on the same tile.
+- **Raw sums don't survive another tile.** Every tile reuses the same
+  `psum_buffer` slots, so a matmul that keeps raw sums (more than one
+  contraction block, or `ACT_CFG.out_raw`) overwrites an earlier tile's
+  `out_raw` sums. Nothing checks the order.
 - **Tile placement is not checked.** A tile whose first row
   (`tile_r * TILE_ROWS`) is not a multiple of 16 is silently moved up to
   the previous multiple, and a tile larger than its grid cell overwrites
