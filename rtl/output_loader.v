@@ -268,6 +268,14 @@ module output_loader #(
     // committed index - stable long before the pass starts - and latched
     // with the other held_* values, so the multiply never sits on the
     // per-cycle RAM address path.
+    // The add-multiply-add itself gets a cycle of its own (timing:
+    // tile_row_blk -> held_seg_base8 failed in one): committed_seg_base*_q
+    // register it every cycle, and held_* latch the registered copy. That
+    // is one cycle late, which is safe: weight_ctrl updates
+    // committed_k_blk_idx on the same edge as input_compute_start, and
+    // input_dispatch's last-row a_en (a_en_last) rises no sooner than
+    // ARRAY_ROWS+2 cycles later; tile_row_blk/tile_col_off/row_pitch*
+    // change only at matmul_start, before the first commit.
     // held_seg_base8 is that canvas position in output_buffer bytes (pitch
     // row_pitch8); held_seg_base is the block's position inside the tile in
     // psum_buffer slots (pitch row_pitch) - psum_buffer holds one tile, so
@@ -278,8 +286,15 @@ module output_loader #(
     (* multstyle = "logic" *)
     wire [ROW_ADDR_WIDTH-1:0]  committed_seg_base8 =
         (tile_row_blk + committed_k_blk_idx) * row_pitch8 + tile_col_off;
+    reg  [PSUM_ADDR_WIDTH-1:0] committed_seg_base_q;
+    reg  [ROW_ADDR_WIDTH-1:0]  committed_seg_base8_q;
     reg  [PSUM_ADDR_WIDTH-1:0] held_seg_base;
     reg  [ROW_ADDR_WIDTH-1:0]  held_seg_base8;
+
+    always @(posedge clock) begin
+        committed_seg_base_q  <= committed_seg_base;
+        committed_seg_base8_q <= committed_seg_base8;
+    end
 
     wire start_edge = armed && a_en_last && !a_en_last_d;
     wire pass_start = !running && a_en_last;   // same condition that sets `running` below
@@ -327,8 +342,8 @@ module output_loader #(
                     held_n_blk_idx   <= committed_n_blk_idx;
                     held_first_k_blk <= committed_first_k_blk;
                     held_final_blk   <= (committed_n_blk_idx == max_n_blk_idx) && !out_raw;
-                    held_seg_base    <= committed_seg_base;
-                    held_seg_base8   <= committed_seg_base8;
+                    held_seg_base    <= committed_seg_base_q;
+                    held_seg_base8   <= committed_seg_base8_q;
                 end
             end
             running_d  <= running;
