@@ -49,7 +49,7 @@ module buf_addr_remap #(
     input      [ROWW_WIDTH-1:0]                      row_words,   // >= 1; 0 is treated as 1
 
     output reg [BANK_SEL_WIDTH+BANK_WADDR_WIDTH-1:0] bank_waddr,  // {bank, word offset}
-    output reg [DATA_WIDTH-1:0]                      bank_wdata,
+    output     [DATA_WIDTH-1:0]                      bank_wdata,  // registered (wdata_2 below)
     output reg                                       bank_wren
 );
 
@@ -93,9 +93,17 @@ module buf_addr_remap #(
     wire [HOST_WADDR_WIDTH-1:0] col_w = w_1 - p_1 * rw_r;
     wire [HOST_WADDR_WIDTH-1:0] off   = (p_1 >> BANK_SEL_WIDTH) * rw_r + col_w;
 
+    // write data, one register copy per RAM it feeds (maxfan = 1). Each
+    // bit goes to one M10K in every bank, and the banks are spread over the
+    // device, so a single register can't sit near all of them (timing: it
+    // missed the far banks). d_1 -> wdata_2 is a pure register hop, so the
+    // fitter can place each copy between d_1 and its bank - same latency.
+    (* maxfan = 1 *) reg [DATA_WIDTH-1:0] wdata_2;
+    assign bank_wdata = wdata_2;
+
     always @(posedge clk) begin
         bank_waddr <= {p_1[BANK_SEL_WIDTH-1:0], off[BANK_WADDR_WIDTH-1:0]};
-        bank_wdata <= d_1;
+        wdata_2    <= d_1;
         bank_wren  <= en_1;
     end
 
